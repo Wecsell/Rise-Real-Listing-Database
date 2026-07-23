@@ -89,7 +89,7 @@ async def parse_message(text: str) -> dict:
 
     try:
         response = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-3.6-flash',
             contents=text,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,

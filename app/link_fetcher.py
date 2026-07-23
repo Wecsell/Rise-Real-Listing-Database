@@ -82,7 +82,7 @@ async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
                 # Парсим шахматку через Gemini
                 if client:
                     response = await client.aio.models.generate_content(
-                        model='gemini-2.0-flash',
+                        model='gemini-3.6-flash',
                         contents=f"Вот содержимое таблицы:\n\n{csv_text}",
                         config=types.GenerateContentConfig(
                             system_instruction=SHEET_SYSTEM_PROMPT,
