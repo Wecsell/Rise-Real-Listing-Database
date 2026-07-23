@@ -20,3 +20,4 @@ data/
 .vscode/
 .idea/
 *.swp
+.env
