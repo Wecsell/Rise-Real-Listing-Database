@@ -12,6 +12,7 @@ from database import init_db, save_message, save_extraction
 from gemini_parser import parse_message
 from link_fetcher import fetch_and_parse_link
 from history_scanner import scan_chat_metadata_and_history
+from telethon.tl.functions.messages import GetDialogFiltersRequest
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -23,6 +24,7 @@ DRY_RUN = os.environ.get('DRY_RUN', '1') == '1'
 ONLY_GROUPS = os.environ.get('ONLY_GROUPS', '1') == '1'
 ALLOWED_KEYWORDS = [kw.strip().lower() for kw in os.environ.get('CHAT_KEYWORDS', '').split(',') if kw.strip()]
 ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if cid.strip()]
+TARGET_FOLDER_NAME = os.environ.get('TARGET_FOLDER_NAME', '').strip()
 SCAN_HISTORY_LIMIT = int(os.environ.get('SCAN_HISTORY_LIMIT', '50'))
 
 session_path = '/data/userbot.session'
@@ -113,6 +115,28 @@ async def main():
 
     await client.start()
     
+    # Если задана папка, найдем ее ID и все чаты внутри
+    if TARGET_FOLDER_NAME:
+        logger.info(f"Looking for Telegram folder named: '{TARGET_FOLDER_NAME}'")
+        try:
+            filters = await client(GetDialogFiltersRequest())
+            folder_id = None
+            for f in filters:
+                if getattr(f, 'title', None) == TARGET_FOLDER_NAME:
+                    folder_id = f.id
+                    break
+                    
+            if folder_id is not None:
+                logger.info(f"✅ Found folder '{TARGET_FOLDER_NAME}' (ID: {folder_id}). Extracting chats...")
+                async for dialog in client.iter_dialogs(folder=folder_id):
+                    if dialog.id not in ALLOWED_CHAT_IDS:
+                        ALLOWED_CHAT_IDS.append(dialog.id)
+                logger.info(f"Loaded {len(ALLOWED_CHAT_IDS)} chats from folder '{TARGET_FOLDER_NAME}'.")
+            else:
+                logger.warning(f"❌ Folder '{TARGET_FOLDER_NAME}' not found in your Telegram account!")
+        except Exception as e:
+            logger.error(f"Failed to fetch folders: {e}")
+
     # Сканирование истории и описаний всех целевых групп при запуске
     logger.info("=== SCANNING TARGET GROUPS (HISTORY + BIO) ===")
     target_chats = []
