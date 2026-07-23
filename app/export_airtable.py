@@ -15,7 +15,7 @@ async def export_data():
         print(f"Error connecting to database: {e}")
         return
 
-    # Запрашиваем извлеченные данные
+    # Запрашиваем сообщения и логи извлечений
     rows = await conn.fetch("""
         SELECT e.id, e.message_id, e.project_recid, e.object_guess, e.confidence, e.why, e.created_at, m.text, m.chat_id
         FROM extractions e
@@ -25,22 +25,49 @@ async def export_data():
 
     print(f"Found {len(rows)} extractions in database.")
 
-    # Файл 1: Для таблицы Projects в Airtable
-    projects_file = f"airtable_projects_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    with open(projects_file, 'w', newline='', encoding='utf-8-sig') as f:
+    # Файл 1: Полный CSV со всеми колонками Airtable
+    export_file = f"airtable_full_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    
+    headers = [
+        'Project Name', 'Developer Name', 'Location Area', 'Property Type', 
+        'Construction Stage', 'Completion Date', 'Ownership Type', 'Leasehold Years',
+        'Yield ROI %', 'Price From (USD)', 'Offers / Discounts', 'Coordinates',
+        'Unit ID', 'Unit Type', 'Bedrooms', 'Bathrooms', 'Area (m²)', 'Price (USD)',
+        'Availability', 'View Type', 'Amenities', 'Extraction Confidence', 'Source Text'
+    ]
+
+    with open(export_file, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.writer(f)
-        writer.writerow(['Project Name', 'Unit type', 'Confidence', 'Extraction Reason', 'Source Message Text', 'Created At'])
+        writer.writerow(headers)
+        
         for r in rows:
             writer.writerow([
-                r['project_recid'],
-                r['object_guess'],
-                r['confidence'],
-                r['why'],
-                r['text'][:200].replace('\n', ' '),
-                r['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                r['project_recid'],               # Project Name
+                '',                               # Developer Name
+                '',                               # Location Area
+                r['object_guess'],                # Property Type / Unit Type
+                '',                               # Construction Stage
+                '',                               # Completion Date
+                '',                               # Ownership Type
+                '',                               # Leasehold Years
+                '',                               # Yield ROI %
+                '',                               # Price From
+                '',                               # Offers
+                '',                               # Coordinates
+                '',                               # Unit ID
+                r['object_guess'],                # Unit Type
+                '',                               # Bedrooms
+                '',                               # Bathrooms
+                '',                               # Area
+                '',                               # Price
+                'On sale',                        # Availability
+                '',                               # View Type
+                '',                               # Amenities
+                r['confidence'],                  # Confidence
+                r['text'][:300].replace('\n', ' ')# Source Text
             ])
 
-    print(f"✅ Success! Exported Airtable CSV: {projects_file}")
+    print(f"✅ Success! Full Airtable CSV exported to: {export_file}")
     await conn.close()
 
 if __name__ == '__main__':
