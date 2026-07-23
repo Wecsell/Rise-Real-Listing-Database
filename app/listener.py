@@ -119,9 +119,13 @@ async def main():
     if TARGET_FOLDER_NAME:
         logger.info(f"Looking for Telegram folder named: '{TARGET_FOLDER_NAME}'")
         try:
-            filters = await client(GetDialogFiltersRequest())
+            filters_response = await client(GetDialogFiltersRequest())
             folder_id = None
-            for f in filters:
+            
+            # В зависимости от версии Telethon, список папок лежит в атрибуте filters
+            filter_list = getattr(filters_response, 'filters', filters_response)
+            
+            for f in filter_list:
                 if getattr(f, 'title', None) == TARGET_FOLDER_NAME:
                     folder_id = f.id
                     break
