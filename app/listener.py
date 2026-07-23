@@ -128,13 +128,21 @@ async def main():
             for f in filter_list:
                 if getattr(f, 'title', None) == TARGET_FOLDER_NAME:
                     folder_id = f.id
+                    folder_obj = f
                     break
                     
             if folder_id is not None:
                 logger.info(f"✅ Found folder '{TARGET_FOLDER_NAME}' (ID: {folder_id}). Extracting chats...")
-                async for dialog in client.iter_dialogs(folder=folder_id):
-                    if dialog.id not in ALLOWED_CHAT_IDS:
-                        ALLOWED_CHAT_IDS.append(dialog.id)
+                
+                if hasattr(folder_obj, 'include_peers'):
+                    for peer in folder_obj.include_peers:
+                        try:
+                            peer_id = telethon.utils.get_peer_id(peer)
+                            if peer_id not in ALLOWED_CHAT_IDS:
+                                ALLOWED_CHAT_IDS.append(peer_id)
+                        except Exception as e:
+                            pass
+                            
                 logger.info(f"Loaded {len(ALLOWED_CHAT_IDS)} chats from folder '{TARGET_FOLDER_NAME}'.")
             else:
                 logger.warning(f"❌ Folder '{TARGET_FOLDER_NAME}' not found in your Telegram account!")
