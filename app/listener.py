@@ -9,6 +9,7 @@ from database import init_db, save_message, save_extraction
 from gemini_parser import parse_message
 from link_fetcher import fetch_and_parse_link
 from history_scanner import scan_chat_metadata_and_history
+from airtable_client import upsert_developer, upsert_project, upsert_unit
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -48,6 +49,8 @@ async def main():
     
     if DRY_RUN:
         logger.info("Running in DRY_RUN mode. Data saved to Postgres only, NOT to Airtable.")
+    else:
+        logger.info("Running in PROD mode. Data WILL be written to Airtable!")
 
     if not API_ID or not API_HASH:
         logger.error("TG_API_ID or TG_API_HASH is missing in .env!")
@@ -77,20 +80,17 @@ async def main():
             parsed_data = await parse_message(text)
             
             if parsed_data.get("is_relevant"):
-                # Извлекаем данные из вложенной структуры JSON
-                project_data = parsed_data.get("project", {})
-                unit_data = parsed_data.get("unit", {})
+                # Сохранение в Postgres (аналитика)
+                proj_data = parsed_data.get("Projects", {})
+                project_name = proj_data.get("Project Name") or "UNKNOWN"
                 
-                project_name = project_data.get("project_name") or "UNKNOWN"
-                unit_type = unit_data.get("unit_type") or project_data.get("property_type") or ""
-                
-                logger.info(f"🎯 [{chat_title}] Project: {project_name}, Type: {unit_type}, Price: {unit_data.get('price_usd')}$")
+                logger.info(f"🎯 [{chat_title}] Found Project: {project_name}")
                 
                 await save_extraction(
                     message_id=event.id,
                     chat_id=chat.id,
                     project_recid=project_name,
-                    object_guess=unit_type,
+                    object_guess="Parsed via new schema",
                     confidence=parsed_data.get("confidence", 0.8),
                     slot="realtime",
                     url_status="none",
@@ -98,6 +98,28 @@ async def main():
                     needs_human=True
                 )
                 
+                # Запись в Airtable (если не DRY_RUN)
+                if not DRY_RUN:
+                    try:
+                        gaps = parsed_data.get("Gaps", [])
+                        dev_id = None
+                        proj_id = None
+                        
+                        dev_data = parsed_data.get("Developer")
+                        if dev_data and dev_data.get("Developer"):
+                            dev_id = await upsert_developer(dev_data)
+                            
+                        if proj_data and proj_data.get("Project Name"):
+                            proj_id = await upsert_project(proj_data, dev_id, gaps)
+                            
+                        units_data = parsed_data.get("Units", [])
+                        for unit in units_data:
+                            if unit.get("Unit type") or unit.get("Bedrooms"):
+                                await upsert_unit(unit, proj_id, project_name, gaps)
+                                
+                    except Exception as e:
+                        logger.error(f"Error saving to Airtable: {e}")
+
             # 3. Переходим по найденным ссылкам
             urls = parsed_data.get("detected_urls", [])
             for url in urls:
