@@ -81,7 +81,7 @@ async def fetch_and_parse_link(url: str, message_id: int):
                 # Парсим шахматку через Gemini 3.6 Flash
                 if client:
                     response = client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model='gemini-2.0-flash',
                         contents=f"Вот содержимое таблицы:\n\n{csv_text}",
                         config=types.GenerateContentConfig(
                             system_instruction=SHEET_SYSTEM_PROMPT,
