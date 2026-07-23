@@ -1,0 +1,10 @@
+telethon==1.35.0
+google-genai==0.3.0
+pyairtable==2.3.3
+asyncpg==0.29.0
+redis==5.0.4
+python-dotenv==1.0.1
+pydantic==2.7.1
+google-api-python-client==2.131.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0
