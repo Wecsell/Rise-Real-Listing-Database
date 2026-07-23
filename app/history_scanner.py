@@ -1,5 +1,6 @@
 import logging
 import re
+import telethon
 from telethon.tl.types import Channel, Chat
 from database import save_message, save_extraction
 from gemini_parser import parse_message
@@ -13,21 +14,36 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
     """
     Сканирует:
     1. Описание/Bio группы.
-    2. Закрепленные сообщения (Pinned messages).
-    3. Последние N сообщений из истории чата.
+    2. Последние N сообщений из истории чата.
     """
     chat_title = getattr(chat_entity, 'title', 'Chat')
     logger.info(f"🔎 Starting deep scan for group: '{chat_title}' (ID: {chat_entity.id})...")
     
     # 1. Сканируем описание группы (Group Description / Bio)
     try:
-        full_chat = await client.get_entity(chat_entity.id)
-        # Получаем подробную информацию о канале/чате
-        full_info = await client(telethon.functions.channels.GetFullChannelRequest(channel=chat_entity)) if isinstance(chat_entity, Channel) else None
+        if isinstance(chat_entity, Channel):
+            full_info = await client(telethon.functions.channels.GetFullChannelRequest(channel=chat_entity))
+            description = getattr(full_info.full_chat, 'about', '') or ''
+        else:
+            description = ''
         
-        description = getattr(full_info.full_chat, 'about', '') if full_info else ''
         if description:
             logger.info(f"📌 Found Group Description in '{chat_title}': {description[:100]}...")
+            # Парсим описание группы как обычное сообщение
+            parsed_bio = await parse_message(description)
+            if parsed_bio.get("is_relevant"):
+                project_data = parsed_bio.get("project", {})
+                await save_extraction(
+                    message_id=0,
+                    project_recid=project_data.get("project_name") or chat_title,
+                    object_guess=project_data.get("property_type") or "",
+                    confidence=parsed_bio.get("confidence", 0.7),
+                    slot="group_bio",
+                    url_status="none",
+                    why=parsed_bio.get("reason", "From group description"),
+                    needs_human=True
+                )
+            # Ищем ссылки в описании
             found_urls = re.findall(URL_REGEX, description)
             for url in found_urls:
                 logger.info(f"🔗 Found URL in Group Bio: {url}")
@@ -56,12 +72,15 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
         
         if parsed_data.get("is_relevant"):
             relevant_count += 1
-            logger.info(f"🎯 [History Match] in '{chat_title}': Project {parsed_data.get('project_name')}, Price: {parsed_data.get('price_usd')}$")
+            project_data = parsed_data.get("project", {})
+            unit_data = parsed_data.get("unit", {})
+            
+            logger.info(f"🎯 [History] in '{chat_title}': Project={project_data.get('project_name')}, Price={unit_data.get('price_usd')}$")
             
             await save_extraction(
                 message_id=message.id,
-                project_recid=parsed_data.get("project_name") or chat_title,
-                object_guess=parsed_data.get("unit_type") or "",
+                project_recid=project_data.get("project_name") or chat_title,
+                object_guess=unit_data.get("unit_type") or project_data.get("property_type") or "",
                 confidence=parsed_data.get("confidence", 0.8),
                 slot="history_backfill",
                 url_status="none",
@@ -74,4 +93,4 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
         for url in urls:
             await fetch_and_parse_link(url, message.id)
 
-    logger.info(f"✅ Finished scan for '{chat_title}'. Scanned {scanned_count} historical messages, found {relevant_count} relevant extractions.")
+    logger.info(f"✅ Finished scan for '{chat_title}'. Scanned {scanned_count} messages, found {relevant_count} relevant.")
