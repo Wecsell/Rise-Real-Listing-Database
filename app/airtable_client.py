@@ -58,6 +58,7 @@ async def upsert_developer(dev_data: dict) -> str:
     # Готовим поля
     fields = {k: v for k, v in dev_data.items() if v and k != "Projects"}
     fields['Listed By'] = "Mikhail"
+    fields['Status'] = "Needs review"
 
     if match:
         rec_id = match['id']
@@ -94,7 +95,7 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
     if dev_id:
         fields['Developer'] = [dev_id]
         
-    fields['Status'] = "Draft"
+    fields['Status'] = "Needs review"
     fields['Source'] = "TG: Rise Real Bali Chat"
     fields['Last updated'] = datetime.now().isoformat()
     if gaps:
@@ -136,7 +137,7 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list)
         fields['Project Name'] = [proj_id]
         
     fields['Key'] = key
-    fields['Status'] = "Draft"
+    fields['Status'] = "Needs review"
     fields['Source'] = "TG: Rise Real Bali Chat"
     fields['Last updated'] = datetime.now().isoformat()
     if gaps:
