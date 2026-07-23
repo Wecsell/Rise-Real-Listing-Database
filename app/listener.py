@@ -2,11 +2,11 @@ import asyncio
 import logging
 import os
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel, Chat, User
 from dotenv import load_dotenv
 
 from database import init_db, save_message, save_extraction
 from gemini_parser import parse_message
+from link_fetcher import fetch_and_parse_link
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -18,13 +18,7 @@ logger = logging.getLogger("Listener")
 API_ID = os.environ.get('TG_API_ID')
 API_HASH = os.environ.get('TG_API_HASH')
 DRY_RUN = os.environ.get('DRY_RUN', '1') == '1'
-
-# Настройки фильтрации чатов:
-# ONLY_GROUPS: если True, игнорируем личные переписки с друзьями (1-on-1 DMs)
 ONLY_GROUPS = os.environ.get('ONLY_GROUPS', '1') == '1'
-
-# Список ключевых слов в названии чата (если пусто — слушает все группы)
-# Пример: ["rise", "magnum", "bali", "villas", "застройщик", "брокер"]
 ALLOWED_KEYWORDS = [kw.strip().lower() for kw in os.environ.get('CHAT_KEYWORDS', '').split(',') if kw.strip()]
 
 session_path = '/data/userbot.session'
@@ -33,14 +27,11 @@ if not os.path.exists('/data'):
     session_path = 'data/userbot.session'
 
 async def is_target_chat(chat) -> bool:
-    """Проверяет, подходит ли чат под наши критерии целевых парсинг-групп."""
-    # 1. Игнорируем личные чаты (DMs), если включен ONLY_GROUPS
-    if ONLY_GROUPS and isinstance(chat, User):
+    if ONLY_GROUPS and getattr(chat, 'title', None) is None:
         return False
         
     chat_title = (getattr(chat, 'title', '') or getattr(chat, 'first_name', '') or '').lower()
     
-    # 2. Если заданы ключевые слова, проверяем совпадение в названии чата
     if ALLOWED_KEYWORDS:
         has_match = any(kw in chat_title for kw in ALLOWED_KEYWORDS)
         if not has_match:
@@ -49,7 +40,7 @@ async def is_target_chat(chat) -> bool:
     return True
 
 async def main():
-    logger.info("Initializing Rise Real Bali Engine...")
+    logger.info("Initializing Rise Real Bali Engine with Link Fetcher...")
     
     await init_db()
     
@@ -66,7 +57,6 @@ async def main():
     async def handle_new_message(event):
         chat = await event.get_chat()
         
-        # Проверяем, целевой ли это чат
         if not await is_target_chat(chat):
             return
             
@@ -77,15 +67,15 @@ async def main():
         
         logger.info(f"📩 [{chat_title}] Message {event.id}: {text[:60]}...")
         
-        # Сохраняем сообщение в базу
+        # 1. Сохраняем сообщение в базу
         await save_message(event.id, chat.id, sender.id if sender else 0, text, has_media)
         
-        # Извлекаем факты через Gemini Flash
+        # 2. Извлекаем факты через Gemini Flash
         if text.strip():
             parsed_data = await parse_message(text)
             
             if parsed_data.get("is_relevant"):
-                logger.info(f"🎯 Relevant info found in [{chat_title}]! Project: {parsed_data.get('project_name')}, Price: {parsed_data.get('price_usd')}$")
+                logger.info(f"🎯 Relevant info found in [{chat_title}]! Project: {parsed_data.get('project_name')}")
                 
                 await save_extraction(
                     message_id=event.id,
@@ -97,19 +87,22 @@ async def main():
                     why=parsed_data.get("reason", ""),
                     needs_human=True
                 )
+                
+            # 3. Если найдены ссылки (например, Google Sheets) — автоматически переходим по ним!
+            urls = parsed_data.get("detected_urls", [])
+            for url in urls:
+                logger.info(f"🔗 Detected URL in message: {url}. Attempting to fetch content...")
+                await fetch_and_parse_link(url, event.id)
 
     await client.start()
     
-    # Дамп всех доступных чатов в лог для удобства настройки
     logger.info("=== SCANNING ALL TELEGRAM DIALOGS ===")
     async for dialog in client.iter_dialogs():
         if await is_target_chat(dialog.entity):
             logger.info(f"✅ Subscribed to Target Chat: '{dialog.name}' (ID: {dialog.id})")
-        else:
-            logger.debug(f"⏭️ Skipped non-target chat: '{dialog.name}' (ID: {dialog.id})")
     logger.info("====================================")
     
-    logger.info("Userbot listening to configured groups!")
+    logger.info("Userbot listening to configured groups with Link Fetcher active!")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
