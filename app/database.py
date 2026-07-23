@@ -27,12 +27,12 @@ async def save_message(msg_id: int, chat_id: int, sender_id: int, text: str, has
             await conn.execute("""
                 INSERT INTO messages (id, chat_id, sender_id, text, has_media)
                 VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (id) DO NOTHING
+                ON CONFLICT (id, chat_id) DO NOTHING
             """, msg_id, chat_id, sender_id or 0, text, has_media)
     except Exception as e:
-        logger.error(f"Error saving message {msg_id} to DB: {e}")
+        logger.error(f"Error saving message {msg_id} (chat {chat_id}) to DB: {e}")
 
-async def save_extraction(message_id: int, project_recid: str, object_guess: str, confidence: float, slot: str, url_status: str, why: str, needs_human: bool):
+async def save_extraction(message_id: int, chat_id: int, project_recid: str, object_guess: str, confidence: float, slot: str, url_status: str, why: str, needs_human: bool):
     """Сохраняет извлечённый факт (результат парсинга) в локальную БД."""
     if not pool:
         return
@@ -45,8 +45,8 @@ async def save_extraction(message_id: int, project_recid: str, object_guess: str
         
         async with pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO extractions (message_id, project_recid, object_guess, confidence, slot, url_status, why, needs_human)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            """, message_id, project_recid, object_guess, confidence, slot, url_status, why, needs_human)
+                INSERT INTO extractions (message_id, chat_id, project_recid, object_guess, confidence, slot, url_status, why, needs_human)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, message_id, chat_id, project_recid, object_guess, confidence, slot, url_status, why, needs_human)
     except Exception as e:
         logger.error(f"Error saving extraction for msg {message_id}: {e}")

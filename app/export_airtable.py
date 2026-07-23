@@ -17,11 +17,11 @@ async def export_data():
 
     # Запрашиваем все извлечённые данные
     rows = await conn.fetch("""
-        SELECT e.id, e.message_id, e.project_recid, e.object_guess, 
+        SELECT e.id, e.message_id, e.chat_id, e.project_recid, e.object_guess, 
                e.confidence, e.slot, e.url_status, e.why, e.created_at, 
-               m.text, m.chat_id
+               m.text
         FROM extractions e
-        LEFT JOIN messages m ON e.message_id = m.id
+        LEFT JOIN messages m ON e.message_id = m.id AND e.chat_id = m.chat_id
         ORDER BY e.created_at DESC
     """)
 

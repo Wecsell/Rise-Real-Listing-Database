@@ -1,11 +1,12 @@
 CREATE TABLE IF NOT EXISTS messages (
-    id BIGINT PRIMARY KEY,
+    id BIGINT,
     chat_id BIGINT NOT NULL,
     sender_id BIGINT DEFAULT 0,
     text TEXT,
     has_media BOOLEAN,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    processed BOOLEAN DEFAULT FALSE
+    processed BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (id, chat_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
@@ -13,6 +14,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
 CREATE TABLE IF NOT EXISTS extractions (
     id SERIAL PRIMARY KEY,
     message_id BIGINT DEFAULT 0,
+    chat_id BIGINT DEFAULT 0,
     project_recid VARCHAR(255),
     object_guess VARCHAR(255),
     confidence REAL,

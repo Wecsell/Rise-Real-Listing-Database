@@ -35,6 +35,7 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
                 project_data = parsed_bio.get("project", {})
                 await save_extraction(
                     message_id=0,
+                    chat_id=chat_entity.id,
                     project_recid=project_data.get("project_name") or chat_title,
                     object_guess=project_data.get("property_type") or "",
                     confidence=parsed_bio.get("confidence", 0.7),
@@ -47,7 +48,7 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
             found_urls = re.findall(URL_REGEX, description)
             for url in found_urls:
                 logger.info(f"🔗 Found URL in Group Bio: {url}")
-                await fetch_and_parse_link(url, message_id=0)
+                await fetch_and_parse_link(url, message_id=0, chat_id=chat_entity.id)
     except Exception as e:
         logger.debug(f"Could not fetch full bio for {chat_title}: {e}")
 
@@ -79,6 +80,7 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
             
             await save_extraction(
                 message_id=message.id,
+                chat_id=chat_entity.id,
                 project_recid=project_data.get("project_name") or chat_title,
                 object_guess=unit_data.get("unit_type") or project_data.get("property_type") or "",
                 confidence=parsed_data.get("confidence", 0.8),
@@ -91,6 +93,6 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
         # Проверяем ссылки из сообщения
         urls = parsed_data.get("detected_urls", [])
         for url in urls:
-            await fetch_and_parse_link(url, message.id)
+            await fetch_and_parse_link(url, message.id, chat_entity.id)
 
     logger.info(f"✅ Finished scan for '{chat_title}'. Scanned {scanned_count} messages, found {relevant_count} relevant.")

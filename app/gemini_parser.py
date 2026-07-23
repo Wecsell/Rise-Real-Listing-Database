@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from google import genai
 from google.genai import types
 
@@ -87,7 +88,7 @@ async def parse_message(text: str) -> dict:
         return {"is_relevant": False, "reason": "Message too short"}
 
     try:
-        response = client.models.generate_content(
+        response = await client.aio.models.generate_content(
             model='gemini-2.0-flash',
             contents=text,
             config=types.GenerateContentConfig(
@@ -96,7 +97,12 @@ async def parse_message(text: str) -> dict:
                 temperature=0.1
             )
         )
-        return json.loads(response.text)
+        
+        text_resp = response.text.strip()
+        if text_resp.startswith("```"):
+            text_resp = re.sub(r"^```(?:json)?\n?|```$", "", text_resp).strip()
+            
+        return json.loads(text_resp)
     except Exception as e:
         logger.error(f"Error calling Gemini API: {e}")
         return {"is_relevant": False, "error": str(e)}

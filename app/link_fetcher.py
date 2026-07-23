@@ -44,7 +44,7 @@ def extract_gsheet_id(url: str) -> str | None:
     match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
     return match.group(1) if match else None
 
-async def fetch_and_parse_link(url: str, message_id: int):
+async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
     """Переходит по ссылке (Google Sheets / Web), выкачивает содержимое и парсит шахматку через Gemini."""
     gsheet_id = extract_gsheet_id(url)
     
@@ -64,6 +64,7 @@ async def fetch_and_parse_link(url: str, message_id: int):
                 # Сохраняем информацию о закрытом доступе
                 await save_extraction(
                     message_id=message_id,
+                    chat_id=chat_id,
                     project_recid="ACCESS_DENIED",
                     object_guess="Google Sheet",
                     confidence=1.0,
@@ -78,9 +79,9 @@ async def fetch_and_parse_link(url: str, message_id: int):
                 csv_text = res.text[:15000] # Берем первые 15кб таблицы
                 logger.info(f"Successfully downloaded Google Sheet CSV ({len(csv_text)} bytes). Parsing with Gemini...")
                 
-                # Парсим шахматку через Gemini 3.6 Flash
+                # Парсим шахматку через Gemini
                 if client:
-                    response = client.models.generate_content(
+                    response = await client.aio.models.generate_content(
                         model='gemini-2.0-flash',
                         contents=f"Вот содержимое таблицы:\n\n{csv_text}",
                         config=types.GenerateContentConfig(
@@ -90,22 +91,29 @@ async def fetch_and_parse_link(url: str, message_id: int):
                         )
                     )
                     
-                    parsed_sheet = json.loads(response.text)
+                    text_resp = response.text.strip()
+                    if text_resp.startswith("```"):
+                        text_resp = re.sub(r"^```(?:json)?\n?|```$", "", text_resp).strip()
+                        
+                    parsed_sheet = json.loads(text_resp)
                     project_name = parsed_sheet.get("project_name", "Unknown Project")
                     units = parsed_sheet.get("units", [])
                     
                     logger.info(f"🎯 Extracted {len(units)} units from Google Sheet for project '{project_name}'!")
                     
-                    for unit in units:
-                        await save_extraction(
-                            message_id=message_id,
-                            project_recid=project_name,
-                            object_guess=f"{unit.get('unit_id')} ({unit.get('bedrooms')} BR)",
-                            confidence=0.95,
-                            slot="unit_price",
-                            url_status="parsed",
-                            why=f"Price: {unit.get('price_usd')}$, Status: {unit.get('status')}",
-                            needs_human=True
-                        )
+                    if isinstance(units, list):
+                        for unit in units:
+                            if isinstance(unit, dict):
+                                await save_extraction(
+                                    message_id=message_id,
+                                    chat_id=chat_id,
+                                    project_recid=project_name,
+                                    object_guess=f"{unit.get('unit_id')} ({unit.get('bedrooms')} BR)",
+                                    confidence=0.95,
+                                    slot="unit_price",
+                                    url_status="parsed",
+                                    why=f"Price: {unit.get('price_usd')}$, Status: {unit.get('status')}",
+                                    needs_human=True
+                                )
         except Exception as e:
             logger.error(f"Error fetching/parsing Google Sheet {url}: {e}")

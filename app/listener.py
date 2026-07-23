@@ -88,6 +88,7 @@ async def main():
                 
                 await save_extraction(
                     message_id=event.id,
+                    chat_id=chat.id,
                     project_recid=project_name,
                     object_guess=unit_type,
                     confidence=parsed_data.get("confidence", 0.8),
@@ -101,7 +102,7 @@ async def main():
             urls = parsed_data.get("detected_urls", [])
             for url in urls:
                 logger.info(f"🔗 Detected URL: {url}")
-                await fetch_and_parse_link(url, event.id)
+                await fetch_and_parse_link(url, event.id, chat.id)
 
     await client.start()
     
