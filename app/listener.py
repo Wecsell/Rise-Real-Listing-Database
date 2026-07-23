@@ -22,6 +22,7 @@ API_HASH = os.environ.get('TG_API_HASH')
 DRY_RUN = os.environ.get('DRY_RUN', '1') == '1'
 ONLY_GROUPS = os.environ.get('ONLY_GROUPS', '1') == '1'
 ALLOWED_KEYWORDS = [kw.strip().lower() for kw in os.environ.get('CHAT_KEYWORDS', '').split(',') if kw.strip()]
+ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if cid.strip()]
 SCAN_HISTORY_LIMIT = int(os.environ.get('SCAN_HISTORY_LIMIT', '50'))
 
 session_path = '/data/userbot.session'
@@ -34,8 +35,14 @@ async def is_target_chat(chat) -> bool:
     if ONLY_GROUPS and getattr(chat, 'title', None) is None:
         return False
         
-    chat_title = (getattr(chat, 'title', '') or getattr(chat, 'first_name', '') or '').lower()
+    chat_id = getattr(chat, 'id', None)
     
+    # Если задан список конкретных ID чатов, используем только его (строгое совпадение)
+    if ALLOWED_CHAT_IDS:
+        return chat_id in ALLOWED_CHAT_IDS
+        
+    # Иначе используем фильтр по ключевым словам
+    chat_title = (getattr(chat, 'title', '') or getattr(chat, 'first_name', '') or '').lower()
     if ALLOWED_KEYWORDS:
         return any(kw in chat_title for kw in ALLOWED_KEYWORDS)
             
