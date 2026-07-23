@@ -21,6 +21,8 @@ services:
   listener:
     build: .
     restart: always
+    stdin_open: true
+    tty: true
     depends_on:
       - postgres
       - redis
