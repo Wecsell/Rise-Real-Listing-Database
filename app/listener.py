@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import os
+import telethon
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
 from database import init_db, save_message, save_extraction
 from gemini_parser import parse_message
 from link_fetcher import fetch_and_parse_link
+from history_scanner import scan_chat_metadata_and_history
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -20,6 +22,7 @@ API_HASH = os.environ.get('TG_API_HASH')
 DRY_RUN = os.environ.get('DRY_RUN', '1') == '1'
 ONLY_GROUPS = os.environ.get('ONLY_GROUPS', '1') == '1'
 ALLOWED_KEYWORDS = [kw.strip().lower() for kw in os.environ.get('CHAT_KEYWORDS', '').split(',') if kw.strip()]
+SCAN_HISTORY_LIMIT = int(os.environ.get('SCAN_HISTORY_LIMIT', '50')) # Сканировать последние 50 сообщений при старте
 
 session_path = '/data/userbot.session'
 if not os.path.exists('/data'):
@@ -40,7 +43,7 @@ async def is_target_chat(chat) -> bool:
     return True
 
 async def main():
-    logger.info("Initializing Rise Real Bali Engine with Link Fetcher...")
+    logger.info("Initializing Rise Real Bali Engine with Deep History & Metadata Scanner...")
     
     await init_db()
     
@@ -67,10 +70,8 @@ async def main():
         
         logger.info(f"📩 [{chat_title}] Message {event.id}: {text[:60]}...")
         
-        # 1. Сохраняем сообщение в базу
         await save_message(event.id, chat.id, sender.id if sender else 0, text, has_media)
         
-        # 2. Извлекаем факты через Gemini Flash
         if text.strip():
             parsed_data = await parse_message(text)
             
@@ -88,21 +89,26 @@ async def main():
                     needs_human=True
                 )
                 
-            # 3. Если найдены ссылки (например, Google Sheets) — автоматически переходим по ним!
             urls = parsed_data.get("detected_urls", [])
             for url in urls:
-                logger.info(f"🔗 Detected URL in message: {url}. Attempting to fetch content...")
                 await fetch_and_parse_link(url, event.id)
 
     await client.start()
     
-    logger.info("=== SCANNING ALL TELEGRAM DIALOGS ===")
+    logger.info("=== STARTING DEEP SCAN OF GROUP DESCRIPTIONS & HISTORY ===")
     async for dialog in client.iter_dialogs():
         if await is_target_chat(dialog.entity):
             logger.info(f"✅ Subscribed to Target Chat: '{dialog.name}' (ID: {dialog.id})")
-    logger.info("====================================")
+            
+            # Фоновый сканер истории и описания группы (по 50 сообщений на группу)
+            try:
+                await scan_chat_metadata_and_history(client, dialog.entity, limit=SCAN_HISTORY_LIMIT)
+            except Exception as scan_err:
+                logger.warning(f"Skipped history scan for {dialog.name}: {scan_err}")
+                
+    logger.info("==========================================================")
     
-    logger.info("Userbot listening to configured groups with Link Fetcher active!")
+    logger.info("Userbot active! Real-time listener and deep history scanner online.")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
