@@ -5,13 +5,13 @@ import telethon
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
+# Загружаем переменные окружения ДО импорта других модулей
+load_dotenv()
+
 from database import init_db, save_message, save_extraction
 from gemini_parser import parse_message
 from link_fetcher import fetch_and_parse_link
 from history_scanner import scan_chat_metadata_and_history
-
-# Загрузка переменных окружения
-load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

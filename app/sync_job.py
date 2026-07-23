@@ -5,9 +5,9 @@ import json
 import asyncpg
 from dotenv import load_dotenv
 
-from airtable_client import upsert_developer, upsert_project, upsert_unit
-
 load_dotenv()
+
+from airtable_client import upsert_developer, upsert_project, upsert_unit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SyncJob")
