@@ -9,7 +9,6 @@ from database import init_db, save_message, save_extraction
 from gemini_parser import parse_message
 from link_fetcher import fetch_and_parse_link
 from history_scanner import scan_chat_metadata_and_history
-from airtable_client import upsert_developer, upsert_project, upsert_unit
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -95,30 +94,9 @@ async def main():
                     slot="realtime",
                     url_status="none",
                     why=parsed_data.get("reason", ""),
-                    needs_human=True
+                    needs_human=True,
+                    raw_json=parsed_data
                 )
-                
-                # Запись в Airtable (если не DRY_RUN)
-                if not DRY_RUN:
-                    try:
-                        gaps = parsed_data.get("Gaps", [])
-                        dev_id = None
-                        proj_id = None
-                        
-                        dev_data = parsed_data.get("Developer")
-                        if dev_data and dev_data.get("Developer"):
-                            dev_id = await upsert_developer(dev_data)
-                            
-                        if proj_data and proj_data.get("Project Name"):
-                            proj_id = await upsert_project(proj_data, dev_id, gaps)
-                            
-                        units_data = parsed_data.get("Units", [])
-                        for unit in units_data:
-                            if unit.get("Unit type") or unit.get("Bedrooms"):
-                                await upsert_unit(unit, proj_id, project_name, gaps)
-                                
-                    except Exception as e:
-                        logger.error(f"Error saving to Airtable: {e}")
 
             # 3. Переходим по найденным ссылкам
             urls = parsed_data.get("detected_urls", [])
