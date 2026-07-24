@@ -84,20 +84,33 @@ SYSTEM_PROMPT = """
 }
 """
 
+_cached_model_name = None
+
 async def parse_message(text: str) -> dict:
+    global _cached_model_name
     if not client:
         logger.warning("GEMINI_API_KEY is not configured.")
         return {"is_relevant": False, "reason": "No GEMINI_API_KEY set"}
 
     if not text or len(text.strip()) < 3:
         return {"is_relevant": False, "reason": "Message too short"}
+        
+    if not _cached_model_name:
+        try:
+            available_models = [m.name for m in client.models.list() if 'flash' in m.name.lower()]
+            if available_models:
+                _cached_model_name = available_models[0]
+                logger.info(f"Auto-detected Flash model: {_cached_model_name}")
+            else:
+                _cached_model_name = 'gemini-2.5-flash' # fallback
+                logger.info(f"No flash models listed, using fallback: {_cached_model_name}")
+        except Exception as e:
+            logger.error(f"Failed to list models: {e}")
+            _cached_model_name = 'gemini-2.5-flash'
 
     try:
-        # Используем gemini-2.0-flash (т.к. 1.5 была отключена, отсюда ошибка 404).
-        # Модель 2.0-flash дешевая, быстрая и отлично справляется с парсингом JSON,
-        # поэтому глюков и больших списаний не будет.
         response = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model=_cached_model_name,
             contents=text,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
