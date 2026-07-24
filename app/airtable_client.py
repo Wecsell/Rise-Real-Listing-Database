@@ -63,49 +63,88 @@ def get_projects_by_developer(chat_or_dev_name: str = None) -> list[str]:
         return []
 
 def fuzzy_match_project(name: str, existing_records: list):
-    """Ищет проект по имени с использованием difflib."""
+    """Ищет проект по имени с использованием difflib и поиска подстрок."""
     if not name or not existing_records:
         return None, 0.0
 
-    names = [r['fields'].get('Project Name', '') for r in existing_records if r.get('fields', {}).get('Project Name')]
-    
-    if not names:
-        return None, 0.0
+    name_clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(name)).lower().strip()
+    name_words = set(name_clean.split())
+    ignore_words = {'villas', 'resort', 'project', 'complex', 'phase', '1', '2', '3', 'очередь', 'фаза'}
 
-    matches = difflib.get_close_matches(name, names, n=1, cutoff=0.65)
-    
-    if matches:
-        best_match = matches[0]
-        score = difflib.SequenceMatcher(None, name.lower(), best_match.lower()).ratio()
+    best_record = None
+    best_score = 0.0
+
+    for r in existing_records:
+        p_name = r['fields'].get('Project Name')
+        if not p_name:
+            continue
+        p_clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(p_name)).lower().strip()
+        p_words = set(p_clean.split())
         
-        for r in existing_records:
-            if r['fields'].get('Project Name') == best_match:
-                return r, score
-                
+        if p_clean in name_clean or name_clean in p_clean:
+            score = 0.85
+            if score > best_score:
+                best_score = score
+                best_record = r
+
+        meaningful_p = p_words - ignore_words
+        if meaningful_p and meaningful_p.issubset(name_words):
+            score = 0.8
+            if score > best_score:
+                best_score = score
+                best_record = r
+
+        diff_score = difflib.SequenceMatcher(None, p_clean, name_clean).ratio()
+        if diff_score > best_score:
+            best_score = diff_score
+            best_record = r
+
+    if best_score >= 0.55:
+        return best_record, best_score
+
     return None, 0.0
 
 def fuzzy_match_developer(name: str, existing_records: list):
-    """Ищет разработчика по имени с использованием difflib."""
+    """Ищет разработчика по имени с использованием поиска подстрок и пересечения слов."""
     if not name or not existing_records:
         return None, 0.0
 
-    names = [r['fields'].get('Developer', '') for r in existing_records if r.get('fields', {}).get('Developer')]
-    
-    if not names:
-        return None, 0.0
+    name_clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(name)).lower().strip()
+    name_words = set(name_clean.split())
+    ignore_words = {'official', 'chat', 'bali', 'real', 'estate', 'channel', 'group', 'news', 'bot', 'villas'}
 
-    matches = difflib.get_close_matches(name, names, n=1, cutoff=0.6)
-    
-    if matches:
-        best_match = matches[0]
-        # Вычисляем точный score
-        score = difflib.SequenceMatcher(None, name.lower(), best_match.lower()).ratio()
+    best_record = None
+    best_score = 0.0
+
+    for r in existing_records:
+        dev_name = r['fields'].get('Developer')
+        if not dev_name:
+            continue
+            
+        dev_clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(dev_name)).lower().strip()
+        dev_words = set(dev_clean.split())
         
-        # Находим запись с этим именем
-        for r in existing_records:
-            if r['fields'].get('Developer') == best_match:
-                return r, score
-                
+        if dev_clean in name_clean or name_clean in dev_clean:
+            score = 0.85
+            if score > best_score:
+                best_score = score
+                best_record = r
+
+        meaningful_dev_words = dev_words - ignore_words
+        if meaningful_dev_words and meaningful_dev_words.issubset(name_words):
+            score = 0.85
+            if score > best_score:
+                best_score = score
+                best_record = r
+
+        diff_score = difflib.SequenceMatcher(None, dev_clean, name_clean).ratio()
+        if diff_score > best_score:
+            best_score = diff_score
+            best_record = r
+
+    if best_score >= 0.5:
+        return best_record, best_score
+
     return None, 0.0
 
 async def upsert_developer(dev_data: dict) -> str:
