@@ -3,7 +3,6 @@ import logging
 import os
 import json
 import telethon
-from aiohttp import web
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
@@ -168,66 +167,6 @@ async def main():
             logger.warning(f"⚠️ Skipped history scan for '{dialog.name}': {scan_err}")
                 
     logger.info("=== SCAN COMPLETE. LISTENING FOR NEW MESSAGES ===")
-    
-    # Запускаем HTTP-сервер для приёма сообщений из WhatsApp
-    async def handle_ingest(request):
-        """Принимает сообщения из WhatsApp-слушателя и обрабатывает их так же, как Telegram."""
-        try:
-            data = await request.json()
-            text = data.get('text', '').strip()
-            chat_title = data.get('chat_title', 'WhatsApp')
-            source = data.get('source', 'whatsapp')
-            
-            if not text:
-                return web.json_response({'status': 'skipped', 'reason': 'empty text'})
-            
-            logger.info(f"📱 [WA:{chat_title}] Received message: {text[:80]}...")
-            
-            # Используем специальный chat_id для WhatsApp (отрицательный чтобы не пересекаться с Telegram)
-            wa_chat_id = abs(hash(chat_title)) % 10**12 * -1
-            
-            # Сохраняем сырое сообщение
-            await save_message(0, wa_chat_id, 0, text, False)
-            
-            # Парсим через Gemini
-            parsed_data = await parse_message(text)
-            
-            if parsed_data.get('is_relevant'):
-                proj_data = parsed_data.get('Projects', {})
-                project_name = proj_data.get('Project Name') or 'UNKNOWN'
-                logger.info(f"🎯 [WA:{chat_title}] Found Project: {project_name}")
-                
-                await save_extraction(
-                    message_id=0,
-                    chat_id=wa_chat_id,
-                    project_recid=project_name,
-                    object_guess='WhatsApp',
-                    confidence=parsed_data.get('confidence', 0.8),
-                    slot='whatsapp_realtime',
-                    url_status='none',
-                    why=parsed_data.get('reason', ''),
-                    needs_human=True,
-                    raw_json=parsed_data
-                )
-            
-            urls = parsed_data.get('detected_urls', [])
-            for url in urls:
-                await fetch_and_parse_link(url, 0, wa_chat_id)
-            
-            return web.json_response({'status': 'ok', 'relevant': parsed_data.get('is_relevant', False)})
-            
-        except Exception as e:
-            logger.error(f"Error in /ingest: {e}")
-            return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
-    
-    app = web.Application()
-    app.router.add_post('/ingest', handle_ingest)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
-    await site.start()
-    logger.info("🌐 HTTP ingest server started on port 8080")
-    
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
