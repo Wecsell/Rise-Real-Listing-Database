@@ -73,21 +73,21 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
         
         if parsed_data.get("is_relevant"):
             relevant_count += 1
-            project_data = parsed_data.get("project", {})
-            unit_data = parsed_data.get("unit", {})
+            proj_data = parsed_data.get("Projects", {})
             
-            logger.info(f"🎯 [History] in '{chat_title}': Project={project_data.get('project_name')}, Price={unit_data.get('price_usd')}$")
+            logger.info(f"🎯 [History] in '{chat_title}': Project={proj_data.get('Project Name')}, Price={proj_data.get('Price From (USD)')}$")
             
             await save_extraction(
                 message_id=message.id,
                 chat_id=chat_entity.id,
-                project_recid=project_data.get("project_name") or chat_title,
-                object_guess=unit_data.get("unit_type") or project_data.get("property_type") or "",
+                project_recid=proj_data.get("Project Name") or chat_title,
+                object_guess="history_backfill",
                 confidence=parsed_data.get("confidence", 0.8),
                 slot="history_backfill",
                 url_status="none",
                 why=parsed_data.get("reason", ""),
-                needs_human=True
+                needs_human=True,
+                raw_json=parsed_data
             )
             
         # Проверяем ссылки из сообщения
