@@ -86,7 +86,7 @@ SYSTEM_PROMPT = """
 
 _cached_model_name = None
 
-async def parse_message(text: str) -> dict:
+async def parse_message(text: str, chat_title: str = None) -> dict:
     global _cached_model_name
     if not client:
         logger.warning("GEMINI_API_KEY is not configured.")
@@ -109,13 +109,16 @@ async def parse_message(text: str) -> dict:
             _cached_model_name = 'gemini-2.5-flash'
 
     try:
-        from app.airtable_client import get_all_projects
-        existing_projects = get_all_projects()
+        from app.airtable_client import get_projects_by_developer
+        existing_projects = get_projects_by_developer(chat_title)
         
         dynamic_prompt = SYSTEM_PROMPT
+        if chat_title:
+            dynamic_prompt += f"\n\nКОНТЕКСТ: Сообщение получено из Telegram-чата/канала: '{chat_title}'."
+
         if existing_projects:
             proj_str = ", ".join([f'"{p}"' for p in existing_projects if p])
-            dynamic_prompt += f"\n\nВНИМАНИЕ! В базе уже существуют следующие проекты: [{proj_str}]. Если из текста очевидно, что речь идет об одном из них (например, это 2-я очередь или сокращенное название), ОБЯЗАТЕЛЬНО используй точное название из этого списка! Не создавай новые названия для существующих проектов."
+            dynamic_prompt += f"\n\nВНИМАНИЕ! У этого застройщика в нашей базе УЖЕ есть проекты: [{proj_str}]. Если в тексте идет речь об одном из них (даже если написано '2 очередь', 'фаза 2' или просто опечатка), ОБЯЗАТЕЛЬНО выбери ТОЧНОЕ название из этого списка!"
             
         response = await client.aio.models.generate_content(
             model=_cached_model_name,

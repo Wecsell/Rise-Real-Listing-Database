@@ -30,17 +30,36 @@ def get_base():
         return None
     return api.base(AIRTABLE_BASE_ID)
 
-def get_all_projects() -> list[str]:
+def get_projects_by_developer(chat_or_dev_name: str = None) -> list[str]:
     base = get_base()
     if not base:
         return []
     try:
         table = base.table('Projects')
-        records = table.all(fields=['Project Name'])
+        records = table.all()
+        
+        if not chat_or_dev_name:
+            names = [r['fields'].get('Project Name') for r in records if r.get('fields', {}).get('Project Name')]
+            return list(set(names))
+            
+        dev_table = base.table('Developer')
+        dev_records = dev_table.all()
+        matched_dev, score = fuzzy_match_developer(chat_or_dev_name, dev_records)
+        
+        if matched_dev and score >= 0.4:
+            dev_id = matched_dev['id']
+            proj_names = []
+            for r in records:
+                devs = r['fields'].get('Developer', [])
+                if dev_id in devs and r['fields'].get('Project Name'):
+                    proj_names.append(r['fields'].get('Project Name'))
+            if proj_names:
+                return list(set(proj_names))
+
         names = [r['fields'].get('Project Name') for r in records if r.get('fields', {}).get('Project Name')]
         return list(set(names))
     except Exception as e:
-        logger.error(f"Error fetching existing projects: {e}")
+        logger.error(f"Error fetching projects by developer: {e}")
         return []
 
 def fuzzy_match_project(name: str, existing_records: list):

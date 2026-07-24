@@ -86,7 +86,7 @@ async def main():
         
         # 2. Парсим через Gemini
         if text.strip():
-            parsed_data = await parse_message(text)
+            parsed_data = await parse_message(text, chat_title=chat_title)
             
             if parsed_data.get("is_relevant"):
                 # Сохранение в Postgres (аналитика)
