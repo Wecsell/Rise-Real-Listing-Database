@@ -123,7 +123,15 @@ async def parse_message(text: str) -> dict:
         if text_resp.startswith("```"):
             text_resp = re.sub(r"^```(?:json)?\n?|```$", "", text_resp).strip()
             
-        return json.loads(text_resp)
+        parsed_json = json.loads(text_resp)
+        if isinstance(parsed_json, list):
+            if len(parsed_json) > 0 and isinstance(parsed_json[0], dict):
+                logger.warning("Gemini returned a list instead of a dict. Taking the first element.")
+                parsed_json = parsed_json[0]
+            else:
+                return {"is_relevant": False, "error": "Gemini returned an invalid list format"}
+                
+        return parsed_json
     except Exception as e:
         logger.error(f"Error calling Gemini API: {e}")
         return {"is_relevant": False, "error": str(e)}
