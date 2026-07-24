@@ -109,11 +109,19 @@ async def parse_message(text: str) -> dict:
             _cached_model_name = 'gemini-2.5-flash'
 
     try:
+        from app.airtable_client import get_all_projects
+        existing_projects = get_all_projects()
+        
+        dynamic_prompt = SYSTEM_PROMPT
+        if existing_projects:
+            proj_str = ", ".join([f'"{p}"' for p in existing_projects if p])
+            dynamic_prompt += f"\n\nВНИМАНИЕ! В базе уже существуют следующие проекты: [{proj_str}]. Если из текста очевидно, что речь идет об одном из них (например, это 2-я очередь или сокращенное название), ОБЯЗАТЕЛЬНО используй точное название из этого списка! Не создавай новые названия для существующих проектов."
+            
         response = await client.aio.models.generate_content(
             model=_cached_model_name,
             contents=text,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=dynamic_prompt,
                 response_mime_type="application/json",
                 temperature=0.1
             )
