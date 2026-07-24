@@ -93,11 +93,11 @@ async def parse_message(text: str) -> dict:
         return {"is_relevant": False, "reason": "Message too short"}
 
     try:
-        # ПРИНУДИТЕЛЬНО используем gemini-1.5-flash.
-        # Модели gemini-3.6-flash не существует в API, и Google, видимо, 
-        # при ошибке имени перенаправляет запрос на дорогую Pro-модель!
+        # Используем gemini-2.0-flash (т.к. 1.5 была отключена, отсюда ошибка 404).
+        # Модель 2.0-flash дешевая, быстрая и отлично справляется с парсингом JSON,
+        # поэтому глюков и больших списаний не будет.
         response = await client.aio.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-2.0-flash',
             contents=text,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
