@@ -31,7 +31,21 @@ services:
     volumes:
       - ./app:/usr/src/app/app
       - ./data:/data
+    ports:
+      - "8080:8080"
     command: python -u app/listener.py
+
+  whatsapp_listener:
+    build: ./whatsapp_listener
+    restart: always
+    depends_on:
+      - listener
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    environment:
+      - INGEST_URL=http://listener:8080/ingest
 
 volumes:
   postgres_data:
