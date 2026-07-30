@@ -25,6 +25,9 @@ from app.gemini_parser import SYSTEM_PROMPT
 from app.priority_parser import build_update_fields
 from app.gaps import project_gaps, unit_gaps, developer_gaps, merge_gaps
 from app.staging import PARSED_JSON_FIELD, load_parsed, should_promote
+from app.dedup import (build_duplicate_notice, describe_duplicate,
+                       extract_phones, find_duplicates, notify_lister)
+from app.airtable_client import field_exists
 
 FIELD_PROMPT = SYSTEM_PROMPT + """
 
@@ -145,6 +148,10 @@ async def parse_new_findings():
 
     logger.info(f"Найдено новых находок: {len(records)}")
 
+    # Для поиска дублей нужны все находки, а не только новые: совпадение
+    # ищется с тем, что уже лежит в базе.
+    all_findings = await asyncio.to_thread(staging_table.all, fields=['Contact', 'Submitted By', 'Id'])
+
     for rec in records:
         rec_id = rec['id']
         fields = rec.get('fields', {})
@@ -254,11 +261,30 @@ async def parse_new_findings():
             )
             update_fields[PARSED_JSON_FIELD] = json.dumps(parsed, ensure_ascii=False)[:95000]
 
+            # Дубль ищем по телефону с баннера: у одного застройщика мы берем
+            # все проекты разом, поэтому второй баннер с тем же номером новой
+            # работы не дает. Координаты для этого не годятся — баннер стоит
+            # не там, где объект.
+            dup_notice = None
+            phones = extract_phones(update_fields.get('Contact'))
+            if phones:
+                matches = find_duplicates(phones, all_findings, exclude_id=rec_id)
+                if matches:
+                    logger.info(f"[{rec_id}] похоже на дубль: {len(matches)} совпадений по телефону")
+                    if field_exists('Field Staging', 'Possible Duplicate Of'):
+                        update_fields['Possible Duplicate Of'] = [m['id'] for m in matches[:5]]
+                    if field_exists('Field Staging', 'Duplicate Reason'):
+                        update_fields['Duplicate Reason'] = describe_duplicate(matches, phones)
+                    dup_notice = build_duplicate_notice(matches, phones)
+
             await asyncio.to_thread(staging_table.update, rec_id, update_fields)
             logger.info(
                 f"Запись {rec_id} разобрана (Status=Processed). "
                 f"Для переноса в основную базу поставьте галочку Confirmed."
             )
+
+            if dup_notice:
+                await notify_lister(fields.get('Telegram Chat ID'), dup_notice)
 
         except Exception as e:
             logger.error(f"Ошибка при обработке: {e}")
