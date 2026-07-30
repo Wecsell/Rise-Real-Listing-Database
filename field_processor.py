@@ -24,6 +24,7 @@ from app.priority_parser import build_update_fields
 from app.gaps import project_gaps, unit_gaps, developer_gaps, merge_gaps
 from app.staging import (PARSED_JSON_FIELD, load_parsed, needs_parsing,
                          promotion_blockers, should_promote)
+from app.naming import swap_coordinates
 from app.dedup import (build_duplicate_notice, describe_duplicate,
                        extract_phones, find_duplicates, notify_lister)
 from app.airtable_client import field_exists
@@ -105,7 +106,9 @@ async def promote_confirmed_findings():
             dev_id = await upsert_developer(dev_data)
 
             if fields.get('Coordinates'):
-                proj_data['Coordinates(for Map)'] = fields['Coordinates']
+                # В Field Staging координаты лежат как их прислал Telegram:
+                # широта, долгота. Карте Airtable нужен обратный порядок.
+                proj_data['Coordinates(for Map)'] = swap_coordinates(fields['Coordinates'])
 
             proj_gaps = merge_gaps(
                 project_gaps(proj_data),
@@ -224,11 +227,14 @@ async def parse_new_findings():
                 else:
                     parsed['Projects'] = {}
 
-            # Programmatically inject coordinates and location link
+            # Координаты подставляем сами, но в двух разных порядках:
+            # карта Airtable ждет "долгота,широта", а ссылка Google Maps —
+            # "широта,долгота", как их и присылает Telegram. Раньше в оба
+            # места писалось одно значение, и карта показывала точки не там.
             if coords:
                 if 'Projects' not in parsed or not isinstance(parsed['Projects'], dict):
                     parsed['Projects'] = {}
-                parsed['Projects']['Coordinates(for Map)'] = coords
+                parsed['Projects']['Coordinates(for Map)'] = swap_coordinates(coords)
                 parsed['Projects']['Location Link'] = f"https://www.google.com/maps?q={coords.replace(' ', '')}"
 
             # Сводка разбора. Раньше это был print для человека у консоли —

@@ -93,6 +93,42 @@ def get_select_options(table: str, field: str, fallback=None) -> list:
 def get_valid_project_areas() -> list:
     return get_select_options('Projects', 'District', FALLBACK_PROJECT_AREAS)
 
+
+_AGENCY_PHONES = None
+_AGENCY_LOADED_AT = 0.0
+
+
+def get_agency_phones() -> set:
+    """
+    Телефоны известных агентств из таблицы Agencies.
+
+    Нужны, чтобы отличить номер агента от номера застройщика. Список заведомо
+    НЕПОЛНЫЙ: в агентстве десяток агентов, а в справочнике обычно один-два
+    номера. Поэтому попадание в список — сильный довод, а отсутствие в нем
+    не значит ничего.
+    """
+    global _AGENCY_PHONES, _AGENCY_LOADED_AT
+    if _AGENCY_PHONES is not None and (time.time() - _AGENCY_LOADED_AT) < CACHE_TTL_SECONDS:
+        return _AGENCY_PHONES
+
+    base = get_base()
+    if not base:
+        return _AGENCY_PHONES or set()
+
+    try:
+        from app.dedup import extract_phones
+        phones = set()
+        for record in base.table('Agencies').all(fields=['Phones']):
+            phones.update(extract_phones(record['fields'].get('Phones')))
+        _AGENCY_PHONES = phones
+        _AGENCY_LOADED_AT = time.time()
+        logger.info(f"Справочник агентств: {len(phones)} телефонов")
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать таблицу Agencies: {e}")
+        _AGENCY_PHONES = _AGENCY_PHONES or set()
+
+    return _AGENCY_PHONES
+
 CACHE_DEVELOPERS = []
 CACHE_PROJECTS = []
 CACHE_UNITS = []

@@ -21,6 +21,7 @@ from app.dedup import (
     describe_duplicate,
     extract_phones,
     find_duplicates,
+    is_known_agency_phone,
     normalize_phone,
 )
 
@@ -190,3 +191,33 @@ class TestAgentPhoneTrap:
         """Пока названий нет, судить не о чем — это обычное совпадение контакта."""
         matches = [finding('rec1', '0813 391 9882'), finding('rec2', '0813 391 9882')]
         assert classify_phone_match(matches, None) == SAME_LEAD
+
+
+class TestKnownAgencyPhones:
+    """
+    Справочник Agencies собран из рабочей воронки партнёров: 328 агентств,
+    телефон распознан у 229. Список заведомо неполный — в агентстве десяток
+    агентов, а номеров записано один-два. Поэтому попадание в него закрывает
+    вопрос сразу, а отсутствие ничего не доказывает и решение принимается по
+    накопленным названиям проектов.
+    """
+
+    def test_known_agency_phone_decides_immediately(self, monkeypatch):
+        monkeypatch.setattr('app.dedup.is_known_agency_phone', lambda phones: True)
+        matches = [finding('rec1', '0813 391 9882', **{'Project Name': 'Rise Villas'})]
+        assert classify_phone_match(matches, 'Rise Villas', ['628133919882']) == POSSIBLE_AGENT
+
+    def test_unknown_phone_falls_back_to_project_count(self, monkeypatch):
+        monkeypatch.setattr('app.dedup.is_known_agency_phone', lambda phones: False)
+        matches = [finding('rec1', '0813 391 9882', **{'Project Name': 'Rise Villas'})]
+        assert classify_phone_match(matches, 'Rise Villas', ['628133919882']) == SAME_LEAD
+
+    def test_lookup_failure_does_not_break_classification(self, monkeypatch):
+        """Недоступный Airtable не должен ронять разбор находки."""
+        def boom():
+            raise RuntimeError('Airtable недоступен')
+        monkeypatch.setattr('app.airtable_client.get_agency_phones', boom)
+        assert is_known_agency_phone(['628133919882']) is False
+
+    def test_no_phones_means_no_agency_hit(self):
+        assert is_known_agency_phone([]) is False

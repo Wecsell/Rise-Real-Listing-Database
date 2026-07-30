@@ -85,8 +85,27 @@ SAME_LEAD = 'same_lead'
 POSSIBLE_AGENT = 'possible_agent'
 
 
+def is_known_agency_phone(phones: List[str]) -> bool:
+    """
+    Числится ли номер за известным агентством.
+
+    Справочник Agencies собран из рабочей воронки партнёров и заведомо неполон:
+    в агентстве работает десяток агентов, а номеров записано один-два. Поэтому
+    попадание — сильный довод в пользу агента, а отсутствие ничего не доказывает.
+    """
+    if not phones:
+        return False
+    try:
+        from app.airtable_client import get_agency_phones
+        known = get_agency_phones()
+    except Exception:
+        return False
+    return bool(known and set(phones) & known)
+
+
 def classify_phone_match(matches: List[Dict[str, Any]],
-                         incoming_project: Optional[str] = None) -> str:
+                         incoming_project: Optional[str] = None,
+                         phones: Optional[List[str]] = None) -> str:
     """
     Один ли это контакт или похоже на номер агента.
 
@@ -96,8 +115,13 @@ def classify_phone_match(matches: List[Dict[str, Any]],
     агент рекламирует объекты разных застройщиков: номер один, проекты разные.
     Случай редкий, однако слить такие записи означало бы потерять проект.
 
-    Признак агента — на номере накопилось несколько РАЗНЫХ названий проектов.
+    Два признака агента, в порядке надёжности:
+    1. номер числится за известным агентством из справочника Agencies;
+    2. на номере накопилось несколько РАЗНЫХ названий проектов.
     """
+    if phones and is_known_agency_phone(phones):
+        return POSSIBLE_AGENT
+
     names = set()
     for m in matches:
         name = (m.get('fields', {}).get('Project Name (from Project)') or
@@ -124,7 +148,7 @@ def describe_duplicate(matches: List[Dict[str, Any]], phones: List[str],
     ids = ", ".join(str(m.get('fields', {}).get('Id') or m.get('id')) for m in matches[:5])
     base = f"Совпал телефон {', '.join(phones)} с находкой: {ids}"
 
-    if classify_phone_match(matches, incoming_project) == POSSIBLE_AGENT:
+    if classify_phone_match(matches, incoming_project, phones) == POSSIBLE_AGENT:
         return (f"{base}. ВНИМАНИЕ: на этом номере уже несколько разных проектов — "
                 f"похоже на телефон агента, а не застройщика. Объединять записи нельзя, "
                 f"проверьте вручную.")
@@ -142,7 +166,7 @@ def build_duplicate_notice(matches: List[Dict[str, Any]], phones: List[str],
     who = f" от {submitted}" if submitted else ""
     date = f" ({when})" if when else ""
 
-    if classify_phone_match(matches, incoming_project) == POSSIBLE_AGENT:
+    if classify_phone_match(matches, incoming_project, phones) == POSSIBLE_AGENT:
         text = (
             f"⚠️ Один телефон, разные проекты\n\n"
             f"Номер {phones[0]} уже встречался в находке #{number}{who}{date}, "

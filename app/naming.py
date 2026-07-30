@@ -144,6 +144,36 @@ def next_placeholder_name(kind: Optional[str], existing_names: Iterable[str]) ->
     return f"{PLACEHOLDER_PREFIX} {number}"
 
 
+def swap_coordinates(coords: Optional[str]) -> Optional[str]:
+    """
+    Меняет порядок пары координат местами.
+
+    Два потребителя ждут разного, и это не ошибка, а два разных стандарта:
+
+    - Google Maps в ссылке `?q=` ждет "широта,долгота" — так их отдает Telegram
+      и так они приходят от полевого бота;
+    - карта в Airtable (поле Coordinates(for Map)) ждет "долгота,широта".
+
+    Поэтому внутри держим порядок Telegram, а переворачиваем только на записи
+    в поле карты. Раньше в оба места писалось одно и то же значение, и карта
+    показывала точки не там.
+    """
+    if not coords or not isinstance(coords, str):
+        return coords
+
+    parts = [p.strip() for p in coords.split(',')]
+    if len(parts) != 2:
+        return coords
+
+    try:
+        float(parts[0])
+        float(parts[1])
+    except ValueError:
+        return coords
+
+    return f"{parts[1]}, {parts[0]}"
+
+
 def placeholders_never_match(name_a: Optional[str], name_b: Optional[str]) -> bool:
     """
     Запрещено ли сопоставлять эти два имени.
