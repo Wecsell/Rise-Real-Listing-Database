@@ -31,7 +31,7 @@ services:
     volumes:
       - ./app:/usr/src/app/app
       - ./data:/data
-    command: python -u app/listener.py
+    command: python -u -m app.listener
 
 volumes:
   postgres_data:

@@ -2,9 +2,9 @@ import logging
 import re
 import telethon
 from telethon.tl.types import Channel, Chat
-from database import save_message, save_extraction
-from gemini_parser import parse_message
-from link_fetcher import fetch_and_parse_link
+from app.database import save_message, save_extraction
+from app.gemini_parser import parse_message
+from app.link_fetcher import process_generic_link
 
 logger = logging.getLogger("HistoryScanner")
 
@@ -48,7 +48,9 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
             found_urls = re.findall(URL_REGEX, description)
             for url in found_urls:
                 logger.info(f"🔗 Found URL in Group Bio: {url}")
-                await fetch_and_parse_link(url, message_id=0, chat_id=chat_entity.id)
+                await process_generic_link(
+                    url, message_id=0, chat_id=chat_entity.id, chat_title=chat_title
+                )
     except Exception as e:
         logger.debug(f"Could not fetch full bio for {chat_title}: {e}")
 
@@ -93,6 +95,8 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
         # Проверяем ссылки из сообщения
         urls = parsed_data.get("detected_urls", [])
         for url in urls:
-            await fetch_and_parse_link(url, message.id, chat_entity.id)
+            await process_generic_link(
+                url, message.id, chat_entity.id, chat_title=chat_title
+            )
 
     logger.info(f"✅ Finished scan for '{chat_title}'. Scanned {scanned_count} messages, found {relevant_count} relevant.")

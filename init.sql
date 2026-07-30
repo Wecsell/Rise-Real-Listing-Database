@@ -40,3 +40,22 @@ CREATE TABLE IF NOT EXISTS facts (
     tokens_out INT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS gpx_tracks (
+    id SERIAL PRIMARY KEY,
+    chat_id BIGINT NOT NULL,
+    file_name VARCHAR(255),
+    total_points INT DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS track_points (
+    id SERIAL PRIMARY KEY,
+    track_id INT REFERENCES gpx_tracks(id) ON DELETE CASCADE,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    point_time TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_track_points_lat_lng ON track_points(latitude, longitude);
