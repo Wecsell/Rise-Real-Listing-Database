@@ -173,6 +173,11 @@ AREA_ALIASES = {
 # на ручную проверку, а не теряем район совсем.
 BUKIT_HINTS = ('букит', 'bukit', 'south kuta', 'badung selatan')
 
+# Значения селектов, которые код умеет отдавать. Держим на уровне модуля,
+# чтобы schema_check сверял их с живой базой, а не со второй копией списка.
+VALID_STAGES = {"Off-plan / Pre-sales", "Foundation", "Structure", "Finishing", "Completed"}
+VALID_POOL_VALUES = {"No", "Yes(Private)", "Yes(Shared)"}
+
 def sanitize_area(raw_area, valid_areas, is_project=False):
     if not raw_area:
         return None
@@ -537,7 +542,7 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
     if 'Notes' in fields:
         fields.pop('Notes')
         
-    VALID_STAGES = {"Off-plan / Pre-sales", "Foundation", "Structure", "Finishing", "Completed"}
+    # Значения вынесены в VALID_STAGES на уровне модуля — их использует schema_check
     if 'Construction stage' in fields:
         if fields['Construction stage'] not in VALID_STAGES:
             stage_str = str(fields['Construction stage']).lower()
