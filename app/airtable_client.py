@@ -84,30 +84,56 @@ CACHE_DEVELOPERS = []
 CACHE_PROJECTS = []
 CACHE_UNITS = []
 CACHE_INITIALIZED = False
+CACHE_LOADED_AT = 0.0
+
+# Кэш живет 10 минут. Раньше он читался один раз за процесс и больше никогда:
+# listener крутится неделями с restart: always, а field_processor и sync_job —
+# отдельные процессы со своими копиями. Записи, созданные другим процессом или
+# добавленные человеком руками, для него не существовали, поиск дубля их не
+# находил и создавался дубль. 10 минут — окно расхождения маленькое, а нагрузка
+# всего 3 запроса с минимумом полей (лимит Airtable — 5 запросов в секунду).
+CACHE_TTL_SECONDS = 600
 
 import asyncio
+import time
 
-def init_cache():
+
+def cache_is_stale() -> bool:
+    """Кэш не загружен или просрочен."""
+    if not CACHE_INITIALIZED:
+        return True
+    return (time.time() - CACHE_LOADED_AT) > CACHE_TTL_SECONDS
+
+
+def invalidate_cache():
+    """Пометить кэш просроченным — следующее обращение перечитает базу."""
+    global CACHE_INITIALIZED
+    CACHE_INITIALIZED = False
+
+
+def init_cache(force: bool = False):
     """Синхронная версия для обратной совместимости (блокирующая)"""
-    global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_INITIALIZED
+    global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_INITIALIZED, CACHE_LOADED_AT
+    if not force and not cache_is_stale():
+        return
     base = get_base()
     if not base:
         return
     logger.info("Initializing Airtable cache (minimal fields)...")
-    
+
     CACHE_DEVELOPERS = base.table('Developer').all(fields=['Developer'])
     CACHE_PROJECTS = base.table('Projects').all(fields=['Project Name', 'Developer', 'District'])
     CACHE_UNITS = base.table('Units').all(fields=['Key'])
-    
+
     CACHE_INITIALIZED = True
+    CACHE_LOADED_AT = time.time()
     logger.info(f"Cache initialized: {len(CACHE_DEVELOPERS)} devs, {len(CACHE_PROJECTS)} projects, {len(CACHE_UNITS)} units.")
 
-async def init_cache_async():
+async def init_cache_async(force: bool = False):
     """Асинхронная инициализация в отдельном потоке (не блокирует event loop)"""
-    global CACHE_INITIALIZED
-    if CACHE_INITIALIZED:
+    if not force and not cache_is_stale():
         return
-    await asyncio.to_thread(init_cache)
+    await asyncio.to_thread(init_cache, True)
 
 # Каждое значение справа обязано существовать в селекте 'District' Airtable.
 # Раньше добрая половина алиасов вела на несуществующие значения (Berawa, Bingin,
@@ -332,7 +358,7 @@ def get_base():
 
 def get_projects_by_developer(chat_or_dev_name: str = None) -> list[str]:
     """Синхронная версия поиска проектов"""
-    if not CACHE_INITIALIZED:
+    if cache_is_stale():
         init_cache()
         
     try:
@@ -464,7 +490,7 @@ async def upsert_developer(dev_data: dict) -> str:
     """Создает или обновляет Developer. Возвращает Record ID."""
     global CACHE_DEVELOPERS
     
-    if not CACHE_INITIALIZED:
+    if cache_is_stale():
         await init_cache_async()
         
     base = get_base()
@@ -523,7 +549,7 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
     """Создает или обновляет Project. Возвращает Record ID."""
     global CACHE_PROJECTS
     
-    if not CACHE_INITIALIZED:
+    if cache_is_stale():
         await init_cache_async()
         
     base = get_base()
@@ -668,7 +694,7 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list)
     """Создает или обновляет Unit."""
     global CACHE_UNITS
     
-    if not CACHE_INITIALIZED:
+    if cache_is_stale():
         await init_cache_async()
         
     base = get_base()
