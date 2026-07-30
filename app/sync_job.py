@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from airtable_client import upsert_developer, upsert_project, upsert_unit
+from app.airtable_client import upsert_developer, upsert_project, upsert_unit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SyncJob")
@@ -34,8 +34,9 @@ async def sync_pending_extractions():
 
     async with pool.acquire() as conn:
         # Получаем все записи со статусом pending и где raw_json не null
+        # Получаем все записи со статусом pending и где raw_json не null (или которые требуют retry)
         records = await conn.fetch("""
-            SELECT id, raw_json 
+            SELECT id, raw_json, retry_count
             FROM extractions 
             WHERE sync_status = 'pending' AND raw_json IS NOT NULL
         """)
@@ -48,53 +49,65 @@ async def sync_pending_extractions():
 
         synced_count = 0
         error_count = 0
+        
+        sem = asyncio.Semaphore(4) # Limit concurrency to 4 requests/sec to Airtable
 
-        for record in records:
+        async def process_record(record):
+            nonlocal synced_count, error_count
             rec_id = record['id']
-            try:
-                # Извлекаем распарсенный JSON
-                raw_json = json.loads(record['raw_json']) if isinstance(record['raw_json'], str) else record['raw_json']
-                
-                if not DRY_RUN:
-                    gaps = raw_json.get("Gaps", [])
-                    dev_id = None
-                    proj_id = None
+            retry_count = record.get('retry_count', 0)
+            
+            async with sem:
+                try:
+                    # Извлекаем распарсенный JSON
+                    raw_json = json.loads(record['raw_json']) if isinstance(record['raw_json'], str) else record['raw_json']
                     
-                    # 1. Developer
-                    dev_data = raw_json.get("Developer")
-                    if dev_data and dev_data.get("Developer"):
-                        dev_id = await upsert_developer(dev_data)
+                    if not DRY_RUN:
+                        gaps = raw_json.get("Gaps", [])
+                        dev_id = None
+                        proj_id = None
                         
-                    # 2. Project
-                    proj_data = raw_json.get("Projects")
-                    if proj_data and proj_data.get("Project Name"):
-                        proj_id = await upsert_project(proj_data, dev_id, gaps)
-                        
-                    # 3. Units
-                    units_data = raw_json.get("Units", [])
-                    project_name = proj_data.get("Project Name") if proj_data else "UNKNOWN"
-                    for unit in units_data:
-                        if unit.get("Unit type") or unit.get("Bedrooms"):
-                            await upsert_unit(unit, proj_id, project_name, gaps)
+                        # 1. Developer
+                        dev_data = raw_json.get("Developer")
+                        if dev_data and dev_data.get("Developer"):
+                            dev_id = await upsert_developer(dev_data)
+                            
+                        # 2. Project
+                        proj_data = raw_json.get("Projects")
+                        if proj_data and proj_data.get("Project Name"):
+                            proj_id = await upsert_project(proj_data, dev_id, gaps)
+                            
+                        # 3. Units
+                        units_data = raw_json.get("Units", [])
+                        project_name = proj_data.get("Project Name") if proj_data else "UNKNOWN"
+                        for unit in units_data:
+                            if unit.get("Unit type") or unit.get("Bedrooms"):
+                                await upsert_unit(unit, proj_id, project_name, gaps)
 
-                # Помечаем как успешно отправленные
-                await conn.execute("""
-                    UPDATE extractions 
-                    SET sync_status = 'synced' 
-                    WHERE id = $1
-                """, rec_id)
-                synced_count += 1
-                logger.info(f"Successfully synced record {rec_id}")
+                    # Помечаем как успешно отправленные
+                    await conn.execute("""
+                        UPDATE extractions 
+                        SET sync_status = 'synced' 
+                        WHERE id = $1
+                    """, rec_id)
+                    synced_count += 1
+                    logger.info(f"Successfully synced record {rec_id}")
 
-            except Exception as e:
-                logger.error(f"Failed to sync record {rec_id}: {e}")
-                error_count += 1
-                # Помечаем как error чтобы не зависали навечно, либо оставляем pending
-                await conn.execute("""
-                    UPDATE extractions 
-                    SET sync_status = 'error' 
-                    WHERE id = $1
-                """, rec_id)
+                except Exception as e:
+                    logger.error(f"Failed to sync record {rec_id} (Attempt {retry_count + 1}): {e}")
+                    error_count += 1
+                    
+                    new_retry = retry_count + 1
+                    new_status = 'failed' if new_retry >= 3 else 'pending'
+                    
+                    await conn.execute("""
+                        UPDATE extractions 
+                        SET sync_status = $1, retry_count = $2
+                        WHERE id = $3
+                    """, new_status, new_retry, rec_id)
+
+        tasks = [process_record(r) for r in records]
+        await asyncio.gather(*tasks)
 
         logger.info(f"Sync complete. Synced: {synced_count}, Errors: {error_count}")
 

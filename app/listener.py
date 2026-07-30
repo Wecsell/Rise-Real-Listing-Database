@@ -3,21 +3,49 @@ import logging
 import os
 import json
 import telethon
+import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения ДО импорта других модулей
 load_dotenv()
 
-from database import init_db, save_message, save_extraction
-from gemini_parser import parse_message
-from link_fetcher import fetch_and_parse_link
-from history_scanner import scan_chat_metadata_and_history
+from app.database import init_db, save_message, save_extraction
+from app.gemini_parser import parse_message
+from app.link_fetcher import process_generic_link
+from app.history_scanner import scan_chat_metadata_and_history
+from app.healthcheck import start_healthcheck_server
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Listener")
+
+PRE_FILTER_KEYWORDS = {"villa", "usd", "$", "спальн", "freehold", "leasehold", "проект", "девелопер", "project", "developer", "цена", "price", "are", "вилла", "апартамент", "apartment", "unit", "rp", "juta"}
+
+def passes_prefilter(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in PRE_FILTER_KEYWORDS)
+
+async def notify_admin(client, message):
+    alert_token = os.environ.get('ALERT_BOT_TOKEN')
+    alert_chat_id = os.environ.get('ALERT_CHAT_ID')
+    
+    if alert_token and alert_chat_id:
+        url = f"https://api.telegram.org/bot{alert_token}/sendMessage"
+        payload = {
+            "chat_id": alert_chat_id,
+            "text": f"🚨 ADMIN ALERT:\n{message}"
+        }
+        try:
+            await asyncio.to_thread(requests.post, url, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"Failed to send admin alert via bot: {e}")
+    else:
+        try:
+            await client.send_message('me', f"🚨 ADMIN ALERT:\n{message}")
+        except Exception as e:
+            logger.error(f"Failed to send admin alert via userbot: {e}")
 
 API_ID = os.environ.get('TG_API_ID')
 API_HASH = os.environ.get('TG_API_HASH')
@@ -28,10 +56,11 @@ ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in os.environ.get('ALLOWED_CHAT_IDS
 TARGET_FOLDER_NAME = os.environ.get('TARGET_FOLDER_NAME', '').strip()
 SCAN_HISTORY_LIMIT = int(os.environ.get('SCAN_HISTORY_LIMIT', '50'))
 
-session_path = '/data/userbot.session'
-if not os.path.exists('/data'):
-    os.makedirs('data', exist_ok=True)
-    session_path = 'data/userbot.session'
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+data_dir = os.path.join(BASE_DIR, 'data')
+if not os.path.exists(data_dir):
+    os.makedirs(data_dir, exist_ok=True)
+session_path = os.path.join(data_dir, 'userbot.session')
 
 async def is_target_chat(chat) -> bool:
     """Проверяет, подходит ли чат под наши критерии."""
@@ -56,16 +85,95 @@ async def main():
     
     await init_db()
     
-    if DRY_RUN:
-        logger.info("Running in DRY_RUN mode. Data saved to Postgres only, NOT to Airtable.")
-    else:
-        logger.info("Running in PROD mode. Data WILL be written to Airtable!")
-
     if not API_ID or not API_HASH:
         logger.error("TG_API_ID or TG_API_HASH is missing in .env!")
         return
 
     client = TelegramClient(session_path, int(API_ID), API_HASH)
+
+    # Очередь для Rate Limiting Gemini (2 запроса в секунду)
+    parse_queue = asyncio.Queue()
+
+    async def check_system_health():
+        tg_connected = client.is_connected()
+        tg_roundtrip_ok = False
+        
+        if tg_connected:
+            try:
+                # Настоящий RPC-запрос get_me() к серверам Telegram с таймаутом 3.0с.
+                # В отличие от is_user_authorized(), он НЕ кешируется в памяти Telethon
+                # и упадет при бане, деактивации аккаунта или FloodWait.
+                me = await asyncio.wait_for(client.get_me(), timeout=3.0)
+                tg_roundtrip_ok = me is not None
+            except Exception as e:
+                logger.warning(f"Telegram real API ping failed: {e}")
+                tg_roundtrip_ok = False
+
+        # Настоящий запрос SELECT 1 к Postgres
+        from app.database import check_db_ping
+        db_ok = await check_db_ping()
+
+        # ИСПРАВЛЕНИЕ БАГА: db_ok ТЕПЕРЬ ОБЯЗАТЕЛЕН для здоровьи сервиса!
+        is_healthy = tg_connected and tg_roundtrip_ok and db_ok
+        details = {
+            "telegram_connected": tg_connected,
+            "telegram_roundtrip_ok": tg_roundtrip_ok,
+            "database_ping_ok": db_ok,
+            "queue_size": parse_queue.qsize()
+        }
+        return is_healthy, details
+
+    # Запуск сервера HealthCheck с передачей реальной проверки состояния
+    port = int(os.environ.get('HEALTHCHECK_PORT', '8080'))
+    await start_healthcheck_server(port=port, health_checker=check_system_health)
+    
+    async def parser_worker():
+        while True:
+            msg_id, chat_id, chat_title, text = await parse_queue.get()
+            try:
+                parsed_data = await parse_message(text, chat_title=chat_title)
+                
+                if parsed_data.get("is_relevant"):
+                    # Сохранение в Postgres (аналитика)
+                    proj_data = parsed_data.get("Projects", {})
+                    project_name = proj_data.get("Project Name") or "UNKNOWN"
+                    
+                    logger.info(f"🎯 [{chat_title}] Found Project: {project_name}")
+                    
+                    await save_extraction(
+                        message_id=msg_id,
+                        chat_id=chat_id,
+                        project_recid=project_name,
+                        object_guess="Parsed via new schema",
+                        confidence=parsed_data.get("confidence", 0.8),
+                        slot="realtime",
+                        url_status="none",
+                        why=parsed_data.get("reason", ""),
+                        needs_human=True,
+                        raw_json=parsed_data
+                    )
+
+                # Переходим по найденным ссылкам
+                urls = parsed_data.get("detected_urls", [])
+                if urls:
+                    for url in urls:
+                        logger.info(f"🔗 Detected URL: {url}")
+                        link_result = await process_generic_link(
+                            url, msg_id, chat_id, chat_title=chat_title
+                        )
+                        if link_result.get("is_private"):
+                            logger.warning(
+                                f"🔒 Ссылка требует доступа: {url} ({link_result.get('gaps')})"
+                            )
+            except Exception as e:
+                logger.error(f"Error in parser worker: {e}")
+                await notify_admin(client, f"Gemini Parser Worker Error:\n{e}")
+            finally:
+                parse_queue.task_done()
+                await asyncio.sleep(0.5) # Максимум 2 запроса в секунду
+
+    # Запускаем воркер в фоне
+    asyncio.create_task(parser_worker())
 
     @client.on(events.NewMessage)
     async def handle_new_message(event):
@@ -84,35 +192,13 @@ async def main():
         # 1. Сохраняем сырое сообщение
         await save_message(event.id, chat.id, sender.id if sender else 0, text, has_media)
         
-        # 2. Парсим через Gemini
+        # 2. Добавляем в очередь на парсинг
         if text.strip():
-            parsed_data = await parse_message(text, chat_title=chat_title)
-            
-            if parsed_data.get("is_relevant"):
-                # Сохранение в Postgres (аналитика)
-                proj_data = parsed_data.get("Projects", {})
-                project_name = proj_data.get("Project Name") or "UNKNOWN"
-                
-                logger.info(f"🎯 [{chat_title}] Found Project: {project_name}")
-                
-                await save_extraction(
-                    message_id=event.id,
-                    chat_id=chat.id,
-                    project_recid=project_name,
-                    object_guess="Parsed via new schema",
-                    confidence=parsed_data.get("confidence", 0.8),
-                    slot="realtime",
-                    url_status="none",
-                    why=parsed_data.get("reason", ""),
-                    needs_human=True,
-                    raw_json=parsed_data
-                )
-
-            # 3. Переходим по найденным ссылкам
-            urls = parsed_data.get("detected_urls", [])
-            for url in urls:
-                logger.info(f"🔗 Detected URL: {url}")
-                await fetch_and_parse_link(url, event.id, chat.id)
+            if passes_prefilter(text):
+                logger.info(f"Putting message {event.id} into Gemini queue. Queue size: {parse_queue.qsize()}")
+                await parse_queue.put((event.id, chat.id, chat_title, text))
+            else:
+                logger.info(f"Skipping message {event.id} due to pre-filter (no real estate keywords).")
 
     await client.start()
     
@@ -122,12 +208,22 @@ async def main():
         try:
             filters_response = await client(GetDialogFiltersRequest())
             folder_id = None
-            
-            # В зависимости от версии Telethon, список папок лежит в атрибуте filters
             filter_list = getattr(filters_response, 'filters', filters_response)
             
+            available_folders = []
             for f in filter_list:
-                if getattr(f, 'title', None) == TARGET_FOLDER_NAME:
+                t = getattr(f, 'title', None)
+                if hasattr(t, 'text'): available_folders.append(t.text)
+                elif t: available_folders.append(str(t))
+                else: available_folders.append('Unnamed')
+                
+            logger.info(f"Available folders in Telegram: {available_folders}")
+            
+            for f in filter_list:
+                t = getattr(f, 'title', None)
+                title_str = t.text if hasattr(t, 'text') else str(t) if t else None
+                
+                if title_str == TARGET_FOLDER_NAME:
                     folder_id = f.id
                     folder_obj = f
                     break
@@ -170,4 +266,9 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
+    # Два слушателя на одной сессии Telethon конфликтуют и дублируют разбор,
+    # а значит и расходы на Gemini.
+    from app.single_instance import acquire
+    acquire('listener')
+
     asyncio.run(main())
