@@ -110,15 +110,6 @@ def check_schema_drift() -> List[str]:
 
 
 def main() -> int:
-    # airtable_client читает токен из окружения на уровне модуля, а load_dotenv()
-    # вызывают только точки входа. При запуске напрямую переменных бы не было.
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-
-    import app.airtable_client as ac
-    ac.AIRTABLE_TOKEN = ac.os.environ.get('AIRTABLE_TOKEN')
-    ac.AIRTABLE_BASE_ID = ac.os.environ.get('AIRTABLE_BASE_ID')
-
     # Консоль Windows по умолчанию cp1251 и падает на 'm²' в именах полей
     try:
         sys.stdout.reconfigure(encoding='utf-8')

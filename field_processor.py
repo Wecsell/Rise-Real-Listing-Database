@@ -19,12 +19,11 @@ staging_table = base.table('Field Staging')
 
 gemini_client = genai.Client(api_key=os.environ.get('GEMINI_API_KEY'))
 
-# Импорт существующей логики для синхронизации и нормализации
-import sync_from_dump
-from app.gemini_parser import SYSTEM_PROMPT
+from app.gemini_parser import SYSTEM_PROMPT, resolve_model_name
 from app.priority_parser import build_update_fields
 from app.gaps import project_gaps, unit_gaps, developer_gaps, merge_gaps
-from app.staging import PARSED_JSON_FIELD, load_parsed, should_promote
+from app.staging import (PARSED_JSON_FIELD, load_parsed, needs_parsing,
+                         promotion_blockers, should_promote)
 from app.dedup import (build_duplicate_notice, describe_duplicate,
                        extract_phones, find_duplicates, notify_lister)
 from app.airtable_client import field_exists
@@ -79,11 +78,13 @@ async def promote_confirmed_findings():
     records = await asyncio.to_thread(staging_table.all, formula="{Confirmed} = 1")
     pending = [r for r in records if should_promote(r)]
 
-    skipped = len(records) - len(pending)
-    if skipped:
-        logger.info(f"Подтвержденных записей: {len(records)}, к переносу: {len(pending)}, пропущено: {skipped}")
+    for rec in records:
+        if rec not in pending:
+            logger.info(f"[{rec['id']}] перенос пропущен: {', '.join(promotion_blockers(rec))}")
     if not pending:
         return
+
+    logger.info(f"Подтвержденных записей: {len(records)}, к переносу: {len(pending)}")
 
     # Свежий кэш перед поиском дублей: иначе проект, созданный другим процессом
     # или добавленный руками, не найдется и продублируется.
@@ -140,8 +141,11 @@ async def promote_confirmed_findings():
 async def parse_new_findings():
     logger.info("Проверяем новые записи в Field Staging...")
     # Берем все записи со Status = New
-    records = await asyncio.to_thread(staging_table.all, formula="{Status} = 'New'")
-    
+    # Формула — первичный фильтр, needs_parsing — страховка на случай, если
+    # статус изменился между запросом и обработкой.
+    records = [r for r in await asyncio.to_thread(staging_table.all, formula="{Status} = 'New'")
+               if needs_parsing(r)]
+
     if not records:
         logger.info("Нет новых записей для обработки.")
         return
@@ -192,9 +196,10 @@ async def parse_new_findings():
             dynamic_prompt = FIELD_PROMPT + f"\n\nGPS Координаты: {coords}"
             contents.append(dynamic_prompt)
             
-            logger.info("Ждем ответа от Gemini 1.5 Pro...")
+            model_name = resolve_model_name()
+            logger.info(f"Ждем ответа от {model_name}...")
             response = await gemini_client.aio.models.generate_content(
-                model='gemini-2.5-flash',
+                model=model_name,
                 contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -226,19 +231,23 @@ async def parse_new_findings():
                 parsed['Projects']['Coordinates(for Map)'] = coords
                 parsed['Projects']['Location Link'] = f"https://www.google.com/maps?q={coords.replace(' ', '')}"
 
-            # Показываем черновик пользователю
+            # Сводка разбора. Раньше это был print для человека у консоли —
+            # процесс интерактивным быть перестал, поэтому пишем в лог.
             dev_name = parsed.get('Developer', {}).get('Developer', 'Неизвестно')
             proj_name = parsed.get('Projects', {}).get('Project Name', 'Неизвестно')
             units = parsed.get('Units', [])
-            
-            print("\n=== ЧЕРНОВИК НАХОДКИ ===")
-            print(f"Застройщик: {dev_name}")
-            print(f"Контакты: {parsed.get('Developer', {}).get('Contacts', 'Нет данных')}")
-            print(f"Проект: {proj_name}")
-            print(f"Юнитов найдено: {len(units)}")
+
+            logger.info(
+                f"[{rec_id}] застройщик: {dev_name} | проект: {proj_name} | юнитов: {len(units)}"
+            )
             for u in units:
-                print(f"  - {u.get('Unit type', 'Unknown')} | {u.get('Bedrooms')} BR | {u.get('Price from (USD)', 'No Price')} USD")
-            
+                # Ключ без пробела — именно так поле называется в схеме парсера.
+                # С пробелом здесь всегда печаталось 'No Price'.
+                logger.info(
+                    f"    {u.get('Unit type', 'Unknown')} | {u.get('Bedrooms')} BR | "
+                    f"{u.get('Price from(USD)', 'цена не указана')} USD"
+                )
+
             # Разбор сохраняем в саму находку. В основную базу отсюда НЕ пишем:
             # фото баннера и голосовая заметка — гипотеза, а не проверенные
             # данные. Перенос делает promote_confirmed_findings() после того,

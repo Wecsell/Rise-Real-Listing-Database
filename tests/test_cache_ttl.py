@@ -72,11 +72,11 @@ class TestStaleness:
                             lambda: loaded_at + ac.CACHE_TTL_SECONDS - 1)
         assert ac.cache_is_stale() is False
 
-    def test_invalidate_forces_staleness(self, fresh_cache):
+    def test_force_reload_ignores_freshness(self, fresh_cache):
         ac.init_cache()
         assert ac.cache_is_stale() is False
-        ac.invalidate_cache()
-        assert ac.cache_is_stale() is True
+        ac.init_cache(force=True)
+        assert ac.cache_is_stale() is False
 
 
 class TestRefetchBehaviour:

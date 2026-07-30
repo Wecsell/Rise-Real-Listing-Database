@@ -7,6 +7,16 @@ from datetime import datetime
 
 logger = logging.getLogger("AirtableClient")
 
+# Токен читается на уровне модуля, а load_dotenv() вызывают только точки входа.
+# Из-за этого любой запуск модуля напрямую (скрипт, проверка схемы, тест)
+# оставался без учетных данных и тихо работал вхолостую. override=False,
+# чтобы явно заданное окружение оставалось главнее файла.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 AIRTABLE_TOKEN = os.environ.get('AIRTABLE_TOKEN')
 AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID')
 
@@ -103,12 +113,6 @@ def cache_is_stale() -> bool:
     if not CACHE_INITIALIZED:
         return True
     return (time.time() - CACHE_LOADED_AT) > CACHE_TTL_SECONDS
-
-
-def invalidate_cache():
-    """Пометить кэш просроченным — следующее обращение перечитает базу."""
-    global CACHE_INITIALIZED
-    CACHE_INITIALIZED = False
 
 
 def init_cache(force: bool = False):

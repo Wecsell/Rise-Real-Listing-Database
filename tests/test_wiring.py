@@ -128,5 +128,100 @@ class TestDependenciesDeclared(unittest.TestCase):
         self.assertEqual(missing, [], f"Не объявлены в requirements.txt: {missing}")
 
 
+class TestFieldProcessorPipeline(unittest.TestCase):
+    """
+    Разбор и перенос должны оставаться разными фазами. Если запись в основную
+    базу снова окажется в фазе разбора, находка с баннера начнет попадать в
+    Projects без подтверждения человека.
+    """
+
+    def setUp(self):
+        self.src = _read(os.path.join(ROOT_DIR, 'field_processor.py'))
+        self.parse_phase = self.src.split('async def promote_confirmed_findings')[0]
+
+    def test_both_phases_are_called(self):
+        entry = self.src.split('async def promote_confirmed_findings')[0]
+        self.assertIn('await parse_new_findings()', entry)
+        self.assertIn('await promote_confirmed_findings()', entry)
+
+    def test_parse_phase_never_writes_to_main_tables(self):
+        for fn in ('upsert_project', 'upsert_unit', 'upsert_developer'):
+            self.assertNotIn(
+                fn, self.parse_phase,
+                f"{fn} не должен вызываться на этапе разбора — перенос идет "
+                f"только по галочке Confirmed"
+            )
+
+    def test_promotion_is_gated_and_guarded(self):
+        self.assertIn('should_promote', self.src,
+                      "перенос обязан проверять Confirmed и признак уже выполненного переноса")
+        self.assertIn("{Confirmed} = 1", self.src)
+
+    def test_cache_is_refreshed_before_duplicate_lookup(self):
+        promote = self.src.split('async def promote_confirmed_findings')[1]
+        self.assertIn('init_cache_async(force=True)', promote,
+                      "без свежего кэша поиск дубля не увидит записи других процессов")
+
+    def test_duplicate_detection_is_wired(self):
+        self.assertIn('find_duplicates', self.parse_phase)
+        self.assertIn('notify_lister', self.parse_phase)
+
+
+class TestFieldBotAttribution(unittest.TestCase):
+
+    def test_bot_records_who_submitted(self):
+        src = _read(os.path.join(ROOT_DIR, 'field_bot.py'))
+        self.assertIn('Submitted By', src)
+        self.assertIn('Telegram Chat ID', src)
+        self.assertIn('is_allowed', src,
+                      "доступ должен идти через белый список, а не сравнение с одним id")
+
+
+class TestNoDeadExports(unittest.TestCase):
+    """
+    Каждая публичная функция должна кем-то вызываться вне своего модуля и вне
+    тестов. Иначе получается то же самое, что уже случилось в этом проекте:
+    код написан, покрыт зелеными тестами и никем не используется.
+    """
+
+    AUTHORED_MODULES = ['staging.py', 'gaps.py', 'dedup.py', 'access.py', 'schema_check.py']
+
+    def test_every_public_function_is_called_somewhere(self):
+        """
+        Мертвой считается функция, на которую в рабочем коде нет ни одной
+        ссылки кроме собственного def. Вызов из соседней функции того же
+        модуля — нормальная композиция, а не мертвый код; поэтому смотрим на
+        любые упоминания, а не только на межмодульные.
+
+        Тесты в подсчет не идут намеренно: покрытая тестами функция, которую
+        никто не вызывает, — это ровно тот случай, который здесь ловится.
+        """
+        sources = []
+        for root, _dirs, files in os.walk(ROOT_DIR):
+            if any(skip in root for skip in ('.git', '__pycache__', 'tests', '.agent')):
+                continue
+            for f in files:
+                if f.endswith('.py'):
+                    sources.append(_read(os.path.join(root, f)))
+
+        orphans = []
+        for module in self.AUTHORED_MODULES:
+            path = os.path.join(APP_DIR, module)
+            tree = ast.parse(_read(path), filename=path)
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name.startswith('_') or node.name == 'main':
+                    continue
+
+                references = sum(src.count(node.name) for src in sources)
+                # Одно упоминание — это сама строка `def name(...)`
+                if references <= 1:
+                    orphans.append(f"{module}:{node.name}")
+
+        self.assertEqual(orphans, [],
+                         f"Функции без единого вызова в рабочем коде: {orphans}")
+
+
 if __name__ == '__main__':
     unittest.main()
