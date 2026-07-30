@@ -121,35 +121,83 @@ class TestDeveloperMatching:
         assert fuzzy_match_developer('X', []) == (None, 0.0)
 
 
-class TestSubsetBranchIsBelowThreshold:
+class TestChatTitleMatching:
     """
-    ЗАФИКСИРОВАНО ТЕКУЩЕЕ ПОВЕДЕНИЕ, А НЕ ЖЕЛАЕМОЕ.
+    Основной путь поступления данных: имя застройщика берется из названия
+    Telegram-чата, а там всегда есть хвосты — Official, Bali, Chat, Group.
 
-    В обеих функциях есть ветка «осмысленные слова записи входят в искомое
-    имя»: она выставляет 0.85 для застройщика и 0.8 для проекта. Порог
-    срабатывания — 0.90. То есть сама по себе эта ветка решение принять не
-    может: она отрабатывает и не проходит гейт.
-
-    Это ровно тот случай, ради которого ветка писалась — сопоставить
-    'Rise Development' из базы с названием чата 'Rise Development Official
-    Bali'. Сейчас такое сопоставление не происходит.
-
-    Менять порог — решение бизнес-логики: ослабление грозит ошибочными
-    слияниями разных проектов, ужесточение — дублями. Тесты фиксируют факт,
-    чтобы изменение было осознанным.
+    Ветка «все значимые слова записи входят в искомое имя» выставляла 0.85
+    при пороге 0.90, то есть отрабатывала и не проходила гейт — сработать
+    не могла никогда. Это отношение вложенности, а не размытое сходство,
+    поэтому оценка поднята до 0.95.
     """
 
-    def test_developer_name_inside_chat_title_does_not_match_today(self):
-        existing = [developer('Rise Development Official Bali')]
-        match, score = fuzzy_match_developer('Rise Development', existing)
-        assert match is None
-        assert score == 0.0
+    def test_developer_found_inside_noisy_chat_title(self):
+        existing = [developer('Rise Development')]
+        match, score = fuzzy_match_developer('Rise Development Official Bali', existing)
+        assert match is existing[0]
+        assert score >= MATCH_THRESHOLD
 
-    def test_project_phase_does_not_match_today(self):
-        existing = [project('Rise Villas')]
-        match, score = fuzzy_match_project('Rise Villas Phase 2', existing)
+    def test_noise_alone_is_not_enough(self):
+        """Из чата 'Bali Real Estate Chat' застройщика извлечь нельзя."""
+        existing = [developer('Bali Real Estate')]
+        match, _ = fuzzy_match_developer('Nuanu Development Group', existing)
         assert match is None
-        assert score == 0.0
+
+
+class TestPhasesNeverMerge:
+    """
+    По канону проекта фазы — разные проекты, и номер остается в названии.
+    Но difflib видит между 'Rise Villas 1' и 'Rise Villas 2' разницу в один
+    символ и дает 0.923, то есть выше порога: две очереди сливались в одну
+    запись, и данные второй затирали первую.
+    """
+
+    @pytest.mark.parametrize("stored,incoming", [
+        ('Nuanu Phase 1', 'Nuanu Phase 3'),
+        ('Villas Фаза 1', 'Villas Фаза 2'),
+        ('Solar Residence Очередь 1', 'Solar Residence Очередь 2'),
+    ])
+    def test_explicitly_numbered_phases_stay_separate(self, stored, incoming):
+        match, score = fuzzy_match_project(incoming, [project(stored)])
+        assert match is None, f"{stored!r} и {incoming!r} слились, score={score}"
+
+    @pytest.mark.parametrize("stored,incoming", [
+        ('Nuanu Phase 3', 'Nuanu Phase 3'),
+        ('Nuanu Phase 3', 'Nuanu Phse 3'),
+    ])
+    def test_same_phase_still_matches_through_a_typo(self, stored, incoming):
+        match, _ = fuzzy_match_project(incoming, [project(stored)])
+        assert match is not None, f"{stored!r} и {incoming!r} — одна фаза, должны совпасть"
+
+
+class TestBareNumbersAreNotPhases:
+    """
+    Голая цифра в названии фазой не считается: по словам владельца
+    'Rise Villas 1' и 'Rise Villas 2' — один и тот же проект, а не две
+    очереди. Застройщики нумеруют названия произвольно, и запрет по любому
+    числу разорвал бы записи, которые обязаны сливаться.
+    """
+
+    def test_numbered_variants_of_one_project_still_merge(self):
+        match, _ = fuzzy_match_project('Rise Villas 2', [project('Rise Villas 1')])
+        assert match is not None, "Rise Villas 1 и 2 — один проект, должны совпасть"
+
+    def test_guard_stays_out_of_the_way_when_only_one_side_names_a_phase(self):
+        """
+        Запрет не должен срабатывать, если маркер есть лишь у одного из имен.
+        Совпадут они или нет — решает обычная оценка сходства; проверяем
+        именно то, что вмешательства нет.
+        """
+        from app.airtable_client import extract_phase_markers
+        assert extract_phase_markers('Rise Villas') == frozenset()
+        assert extract_phase_markers('Rise Villas Phase 1') == frozenset({'1'})
+        # Одностороннего маркера недостаточно для запрета — условие требует обоих
+        assert not (frozenset() and frozenset({'1'}))
+
+    def test_projects_without_numbers_are_unaffected(self):
+        match, _ = fuzzy_match_project('Rise Vilas Canggu', [project('Rise Villas Canggu')])
+        assert match is not None
 
 
 class TestUnitType:

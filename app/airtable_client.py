@@ -409,10 +409,35 @@ def get_projects_by_developer(chat_or_dev_name: str = None) -> list[str]:
         logger.error(f"Error fetching projects by developer: {e}")
         return []
 
+# Только ЯВНЫЙ маркер фазы. Голые цифры в названии фазой не считаются:
+# по словам владельца, 'Rise Villas 1' и 'Rise Villas 2' — это один и тот же
+# проект, а не две очереди. Застройщики нумеруют названия как попало, и
+# запрет по любому числу разорвал бы записи, которые обязаны сливаться.
+_PHASE_WORD = re.compile(
+    r'(?:phase|фаза|фазы|фазе|очередь|очереди|стадия|стадии)\s*[№#]?\s*(\d+|[ivx]+)',
+    re.I,
+)
+
+
+def extract_phase_markers(name: str) -> frozenset:
+    """
+    Номера фаз из названия проекта — только там, где фаза названа словом.
+
+    По канону фазы это разные проекты, и номер остается в названии. difflib
+    между 'Nuanu Phase 1' и 'Nuanu Phase 3' дает 0.923, выше порога 0.90, —
+    без этой проверки вторая очередь затирала первую.
+    """
+    if not name:
+        return frozenset()
+    return frozenset(m.group(1).lower() for m in _PHASE_WORD.finditer(str(name)))
+
+
 def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev_id: str = None):
     """Ищет проект по имени с использованием difflib и поиска подстрок. Учитывает иерархию застройщиков."""
     if not name or str(name).strip().lower() == 'none' or not existing_records:
         return None, 0.0
+
+    name_phases = extract_phase_markers(name)
 
     name_clean = re.sub(r'[^\w\s]', '', str(name)).lower().strip()
     name_words = set(name_clean.split())
@@ -431,6 +456,14 @@ def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev
             # Если у проекта уже есть застройщик, и он не совпадает с текущим dev_id, пропускаем! (Строгая иерархия)
             if dev_id not in r_devs:
                 continue
+
+        # Разные фазы — разные проекты. Запрет срабатывает, только если фаза
+        # явно названа У ОБОИХ и номера различаются. Когда маркер есть лишь
+        # у одного ('Rise Villas' и 'Rise Villas Phase 1'), это чаще всего
+        # одна и та же запись, и мешать сопоставлению не нужно.
+        p_phases = extract_phase_markers(p_name)
+        if p_phases and name_phases and p_phases != name_phases:
+            continue
                 
         p_area = r['fields'].get('District')
         
@@ -491,9 +524,15 @@ def fuzzy_match_developer(name: str, existing_records: list):
         
         # Убрано слабое сравнение через 'in'
         
+        # Все значимые слова застройщика содержатся в искомом имени. Это
+        # отношение вложенности, а не размытое сходство, поэтому оценка выше
+        # порога 0.90. Раньше здесь стояло 0.85 — ветка отрабатывала и не
+        # проходила гейт, то есть не могла сработать никогда. Ровно этот
+        # случай она и обслуживает: название чата 'Rise Development Official
+        # Bali' против записи 'Rise Development' в базе.
         meaningful_dev_words = dev_words - ignore_words
         if meaningful_dev_words and meaningful_dev_words.issubset(name_words):
-            score = 0.85
+            score = 0.95
             if score > best_score:
                 best_score = score
                 best_record = r
