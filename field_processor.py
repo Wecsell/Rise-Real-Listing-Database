@@ -24,6 +24,7 @@ import sync_from_dump
 from app.gemini_parser import SYSTEM_PROMPT
 from app.priority_parser import build_update_fields
 from app.gaps import project_gaps, unit_gaps, developer_gaps, merge_gaps
+from app.staging import PARSED_JSON_FIELD, load_parsed, should_promote
 
 FIELD_PROMPT = SYSTEM_PROMPT + """
 
@@ -54,6 +55,86 @@ def download_file(url: str, suffix: str) -> str:
     return temp.name
 
 async def process_staging_records():
+    """Полный цикл: разбор новых находок, затем перенос подтвержденных."""
+    await parse_new_findings()
+    await promote_confirmed_findings()
+
+
+async def promote_confirmed_findings():
+    """
+    Переносит в Developer/Projects/Units находки с отметкой Confirmed.
+
+    Идемпотентность: признак выполненного переноса — заполненная связь Project.
+    Раньше записи создавались в основной базе и только потом помечались
+    Processed; падение между этими шагами приводило к повторному созданию на
+    следующем тике через 30 секунд. Дубли, с которыми в проекте боролись
+    скриптами merge/check_duplicates, рождались именно здесь.
+    """
+    from app.airtable_client import (init_cache_async, upsert_developer,
+                                     upsert_project, upsert_unit)
+
+    records = await asyncio.to_thread(staging_table.all, formula="{Confirmed} = 1")
+    pending = [r for r in records if should_promote(r)]
+
+    skipped = len(records) - len(pending)
+    if skipped:
+        logger.info(f"Подтвержденных записей: {len(records)}, к переносу: {len(pending)}, пропущено: {skipped}")
+    if not pending:
+        return
+
+    # Свежий кэш перед поиском дублей: иначе проект, созданный другим процессом
+    # или добавленный руками, не найдется и продублируется.
+    await init_cache_async(force=True)
+
+    for rec in pending:
+        rec_id = rec['id']
+        parsed = load_parsed(rec)
+        fields = rec.get('fields', {})
+
+        try:
+            dev_data = parsed.get('Developer', {}) or {}
+            proj_data = parsed.get('Projects', {}) or {}
+            units = parsed.get('Units', []) or []
+
+            if not dev_data.get('Developer'):
+                dev_data['Developer'] = 'Unknown'
+            dev_id = await upsert_developer(dev_data)
+
+            if fields.get('Coordinates'):
+                proj_data['Coordinates(for Map)'] = fields['Coordinates']
+
+            proj_gaps = merge_gaps(
+                project_gaps(proj_data),
+                developer_gaps(dev_data),
+                parsed.get('Gaps'),
+            )
+            logger.info(f"[{rec_id}] незаполненных полей: {len(proj_gaps)} -> {proj_gaps}")
+
+            proj_id = await upsert_project(proj_data, dev_id, gaps=proj_gaps)
+
+            for u in units:
+                await upsert_unit(u, proj_id, proj_data.get('Project Name', 'None'), unit_gaps(u))
+
+            final_proj_id = proj_id[0] if isinstance(proj_id, list) and proj_id else (
+                proj_id if isinstance(proj_id, str) else None)
+
+            # Связи проставляем последним шагом — именно они помечают запись
+            # как перенесенную и не дают обработать ее второй раз.
+            links = {}
+            if dev_id:
+                links['Developer'] = [dev_id]
+            if final_proj_id:
+                links['Project'] = [final_proj_id]
+            if links:
+                await asyncio.to_thread(staging_table.update, rec_id, links)
+
+            logger.info(f"[{rec_id}] перенесена в основную базу (проект {final_proj_id})")
+
+        except Exception as e:
+            logger.error(f"[{rec_id}] перенос не удался: {e}")
+
+
+async def parse_new_findings():
     logger.info("Проверяем новые записи в Field Staging...")
     # Берем все записи со Status = New
     records = await asyncio.to_thread(staging_table.all, formula="{Status} = 'New'")
@@ -151,92 +232,34 @@ async def process_staging_records():
             for u in units:
                 print(f"  - {u.get('Unit type', 'Unknown')} | {u.get('Bedrooms')} BR | {u.get('Price from (USD)', 'No Price')} USD")
             
-            ans = 'y'
-            if ans == 'y':
-                logger.info("Отправляем в Airtable...")
-                # Мокаем структуру dump для нашей функции
-                dump_item = {
-                    'is_relevant': True,
-                    'Developer': parsed.get('Developer', {}),
-                    'Projects': parsed.get('Projects', {}),
-                    'Units': parsed.get('Units', []),
-                    'original_text': f"Imported from Field Staging {rec_id}"
-                }
-                dev_data = dump_item['Developer']
-                contacts = dev_data.get('Contacts', '')
-                if isinstance(contacts, list):
-                    contacts = ", ".join([str(x) for x in contacts if x])
-                audio_notes = dev_data.get('Notes', '')
-                
-                final_notes = audio_notes if audio_notes else ""
-                
-                from app.airtable_client import upsert_developer, upsert_project, upsert_unit
-                if not dev_data.get('Developer'): dev_data['Developer'] = 'Unknown'
-                dev_id = await upsert_developer(dev_data)
-                
-                proj_data = dump_item['Projects']
-                
-                # Подгружаем координаты в проект
-                if 'Coordinates' in fields:
-                    proj_data['Coordinates(for Map)'] = fields['Coordinates']
-                    
-                # Пропуски считаем сами и подмешиваем то, что вернула модель.
-                # Раньше сюда передавался пустой список, из-за чего находка с
-                # баннера — заведомо неполная — уезжала в базу со статусом
-                # Verified, а поле Gaps затиралось.
-                proj_gaps = merge_gaps(
-                    project_gaps(proj_data),
-                    developer_gaps(dev_data),
-                    parsed.get('Gaps'),
-                )
-                logger.info(f"Незаполненных полей по проекту: {len(proj_gaps)} -> {proj_gaps}")
+            # Разбор сохраняем в саму находку. В основную базу отсюда НЕ пишем:
+            # фото баннера и голосовая заметка — гипотеза, а не проверенные
+            # данные. Перенос делает promote_confirmed_findings() после того,
+            # как человек поставит галочку Confirmed.
+            dev_data = parsed.get('Developer', {}) or {}
+            proj_data = parsed.get('Projects', {}) or {}
 
-                proj_id = await upsert_project(proj_data, dev_id, gaps=proj_gaps)
+            contacts = dev_data.get('Contacts', '')
+            if isinstance(contacts, list):
+                contacts = ", ".join([str(x) for x in contacts if x])
 
-                for u in dump_item['Units']:
-                    await upsert_unit(u, proj_id, proj_data.get('Project Name', 'None'), unit_gaps(u))
-                    
-                logger.info("Сохранено в основную базу!")
-                
-                # Ensure proj_id is a string, if it's somehow a list, grab the first element
-                final_proj_id = None
-                if isinstance(proj_id, list) and len(proj_id) > 0:
-                    final_proj_id = proj_id[0]
-                elif isinstance(proj_id, str):
-                    final_proj_id = proj_id
-                else:
-                    final_proj_id = None
-                
-                priority = parsed.get('Priority', 'Средний')
-                update_fields = build_update_fields(
-                    priority=priority,
-                    dev_id=dev_id,
-                    final_proj_id=final_proj_id,
-                    contacts=contacts,
-                    final_notes=final_notes,
-                    coords=coords,
-                    status='Processed',
-                    land_zoning=proj_data.get('Land Zoning Color'),
-                    handover_permits=proj_data.get('Handover Permits'),
-                )
-                
-                logger.info(f"Updating Field Staging with fields: {update_fields}")
-                
-                try:
-                    await asyncio.to_thread(staging_table.update, rec_id, update_fields)
-                except Exception as ex:
-                    logger.error(f"Failed to update Field Staging with linked records: {ex}. Retrying without linked record IDs...")
-                    safe_update = {k: v for k, v in update_fields.items() if k not in ('Developer', 'Project')}
-                    await asyncio.to_thread(staging_table.update, rec_id, safe_update)
-                
-                logger.info(f"Обновлена запись {rec_id} в Field Staging (Status=Processed)!")
-                
-            elif ans == 'n':
-                logger.info("Отклонено. Помечаем как Error.")
-                await asyncio.to_thread(staging_table.update, rec_id, {'Status': 'Error'})
-            else:
-                logger.info("Пропущено.")
-                
+            update_fields = build_update_fields(
+                priority=parsed.get('Priority', 'Средний'),
+                contacts=contacts,
+                final_notes=dev_data.get('Notes', '') or '',
+                coords=coords,
+                status='Processed',
+                land_zoning=proj_data.get('Land Zoning Color'),
+                handover_permits=proj_data.get('Handover Permits'),
+            )
+            update_fields[PARSED_JSON_FIELD] = json.dumps(parsed, ensure_ascii=False)[:95000]
+
+            await asyncio.to_thread(staging_table.update, rec_id, update_fields)
+            logger.info(
+                f"Запись {rec_id} разобрана (Status=Processed). "
+                f"Для переноса в основную базу поставьте галочку Confirmed."
+            )
+
         except Exception as e:
             logger.error(f"Ошибка при обработке: {e}")
             try:

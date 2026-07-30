@@ -57,7 +57,7 @@ REQUIRED_FIELDS = {
     'Field Staging': [
         'Status', 'Developer', 'Project', 'Contact', 'Notes', 'Priority',
         'Coordinates', 'Photo', 'Audio', 'Google Maps Link',
-        'Submitted By', 'Telegram Chat ID', 'Confirmed',
+        'Submitted By', 'Telegram Chat ID', 'Confirmed', 'Parsed JSON',
         'Possible Duplicate Of', 'Duplicate Reason',
     ],
     'Developer': [
