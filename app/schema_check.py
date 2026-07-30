@@ -67,6 +67,10 @@ REQUIRED_FIELDS = {
     ],
 }
 
+# Вторичка повторяет структуру Units — держим списки едиными, чтобы таблицы
+# не разъехались молча.
+REQUIRED_FIELDS['Units (Secondary)'] = list(REQUIRED_FIELDS['Units'])
+
 
 def expected_select_values() -> dict:
     """Значения селектов, которые код может отдать. Источник — сам код."""
@@ -77,6 +81,8 @@ def expected_select_values() -> dict:
         ('Units', 'Pool'): set(VALID_POOL_VALUES),
         # None означает «поле не заполняем» — это не значение селекта
         ('Units', 'Unit type'): {v for v in UNIT_TYPE_ALIASES.values() if v},
+        ('Units (Secondary)', 'Pool'): set(VALID_POOL_VALUES),
+        ('Units (Secondary)', 'Unit type'): {v for v in UNIT_TYPE_ALIASES.values() if v},
     }
 
 

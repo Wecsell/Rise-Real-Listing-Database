@@ -33,11 +33,25 @@ _GENERIC_WORDS = {
     # предлоги и артикли
     'in', 'at', 'on', 'the', 'of', 'for', 'with', 'and', 'by', 'to',
     'в', 'на', 'и', 'с', 'от',
-    # районы: 'Villa in Canggu' — это не название, а место
+}
+
+# Районы — слабый признак. Сами по себе названием быть могут: застройщик
+# CEMAGI существует, у него есть контакты и сайт cemagirock.com. Пустым имя
+# делает только СВЯЗКА типа объекта с районом: 'Villa in Canggu', 'CEMAGI
+# House'. Поэтому район засчитывается в мусор лишь тогда, когда в имени уже
+# есть слово, обозначающее тип.
+_DISTRICT_WORDS = {
     'canggu', 'seminyak', 'kuta', 'ubud', 'uluwatu', 'ungasan', 'jimbaran',
     'sanur', 'denpasar', 'cemagi', 'seseh', 'pererenan', 'umalas', 'kerobokan',
     'nuanu', 'kedungu', 'tabanan', 'bukit', 'bingin', 'berawa', 'bali',
     'чангу', 'семиньяк', 'кута', 'убуд', 'улувату', 'санур', 'бали',
+}
+
+# Слова, обозначающие тип объекта — «сильный» признак пустого имени
+_TYPE_WORDS = {
+    'villa', 'villas', 'apartment', 'apartments', 'studio', 'townhouse',
+    'house', 'land', 'project', 'projects', 'complex', 'property', 'unit',
+    'вилла', 'виллы', 'апартаменты', 'проект', 'студия', 'дом',
 }
 
 # Рекламные и описательные обороты вместо имени
@@ -85,7 +99,11 @@ def is_placeholder_name(name: Optional[str]) -> bool:
     if not words:
         return True
 
-    meaningful = [w for w in words if w not in _GENERIC_WORDS and not w.isdigit()]
+    junk = set(_GENERIC_WORDS)
+    if any(w in _TYPE_WORDS for w in words):
+        junk |= _DISTRICT_WORDS
+
+    meaningful = [w for w in words if w not in junk and not w.isdigit()]
     return not meaningful
 
 
