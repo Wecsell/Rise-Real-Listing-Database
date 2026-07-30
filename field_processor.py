@@ -312,21 +312,10 @@ async def parse_new_findings():
                 except:
                     pass
 
-import socket
-
-def acquire_single_instance_lock():
-    global _lock_socket
-    _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        # Bind to localhost on a specific port. If already bound, another instance is running.
-        _lock_socket.bind(("127.0.0.1", 48210))
-    except socket.error:
-        logger.error("Another instance of field_processor.py is already running. Exiting to prevent zombies!")
-        import sys
-        sys.exit(1)
+from app.single_instance import acquire
 
 if __name__ == '__main__':
-    acquire_single_instance_lock()
+    acquire('field_processor')
     async def main_loop():
         logger.info("Запуск фонового обработчика (проверка каждые 30 секунд)...")
         while True:

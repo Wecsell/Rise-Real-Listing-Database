@@ -20,6 +20,7 @@ except ImportError:
 
 from app.access import describe_user, is_allowed
 from app.airtable_client import field_exists
+from app.single_instance import acquire
 
 load_dotenv(override=True)
 
@@ -236,6 +237,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 if __name__ == '__main__':
+    # Без замка одновременно работали четыре копии бота: экземпляры отбирают
+    # друг у друга getUpdates, и часть находок листеров теряется.
+    acquire('field_bot')
+
     token = os.environ.get('TELEGRAM_FIELD_BOT_TOKEN')
     if not token:
         logger.error("TELEGRAM_FIELD_BOT_TOKEN не задан в .env!")

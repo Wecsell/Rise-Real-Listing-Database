@@ -5,6 +5,9 @@ import difflib
 from pyairtable import Api
 from datetime import datetime
 
+from app.naming import (is_placeholder_name, next_placeholder_name,
+                        placeholders_never_match)
+
 logger = logging.getLogger("AirtableClient")
 
 # Токен читается на уровне модуля, а load_dotenv() вызывают только точки входа.
@@ -126,7 +129,7 @@ def init_cache(force: bool = False):
     logger.info("Initializing Airtable cache (minimal fields)...")
 
     CACHE_DEVELOPERS = base.table('Developer').all(fields=['Developer'])
-    CACHE_PROJECTS = base.table('Projects').all(fields=['Project Name', 'Developer', 'District'])
+    CACHE_PROJECTS = base.table('Projects').all(fields=['Project Name', 'Developer', 'District', 'Aliases'])
     CACHE_UNITS = base.table('Units').all(fields=['Key'])
 
     CACHE_INITIALIZED = True
@@ -432,6 +435,54 @@ def extract_phase_markers(name: str) -> frozenset:
     return frozenset(m.group(1).lower() for m in _PHASE_WORD.finditer(str(name)))
 
 
+def _linked_to_placeholder_developer(dev_ids) -> bool:
+    """
+    Привязан ли проект только к застройщикам-заглушкам ('Unknown 2').
+
+    Такая привязка означает «застройщик пока неизвестен», а не «застройщик
+    другой», поэтому мешать сопоставлению проекта она не должна.
+    """
+    if not dev_ids:
+        return False
+    names = {r['id']: (r['fields'].get('Developer') or '') for r in CACHE_DEVELOPERS}
+    linked = [names.get(d) for d in dev_ids if names.get(d) is not None]
+    if not linked:
+        return False
+    return all(is_placeholder_name(n) for n in linked)
+
+
+def _guess_placeholder_kind(proj_data: dict) -> str:
+    """
+    Что именно нашли, если названия нет: 'Villa', 'Apartment', 'Project'.
+
+    Тип берем из Property Type — он определяется по фото баннера даже тогда,
+    когда название прочитать не удалось.
+    """
+    types = (proj_data or {}).get('Property Type')
+    if isinstance(types, (list, tuple)) and types:
+        return str(types[0])
+    if isinstance(types, str) and types.strip():
+        return types.strip()
+    return 'Project'
+
+
+def _matches_alias(aliases_field, name_clean: str) -> bool:
+    """
+    Совпадает ли имя с одним из псевдонимов записи.
+
+    Колонка Aliases в Projects существовала с самого начала, но код ее не
+    читал ни разу. Это единственный способ склеить написания, которые
+    алгоритмом не сводятся, не трогая порог сопоставления.
+    """
+    if not aliases_field or not name_clean:
+        return False
+    for alias in re.split(r'[,;\n]+', str(aliases_field)):
+        alias_clean = re.sub(r'[^\w\s]', '', alias).lower().strip()
+        if alias_clean and alias_clean == name_clean:
+            return True
+    return False
+
+
 def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev_id: str = None):
     """Ищет проект по имени с использованием difflib и поиска подстрок. Учитывает иерархию застройщиков."""
     if not name or str(name).strip().lower() == 'none' or not existing_records:
@@ -452,9 +503,13 @@ def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev
             continue
             
         r_devs = r['fields'].get('Developer')
-        if r_devs and dev_id:
-            # Если у проекта уже есть застройщик, и он не совпадает с текущим dev_id, пропускаем! (Строгая иерархия)
-            if dev_id not in r_devs:
+        if r_devs and dev_id and dev_id not in r_devs:
+            # Строгая иерархия: проект другого застройщика — другой проект.
+            # Но заглушка застройщиком не считается. Именно эта проверка
+            # порождала дубли: первая находка привязывала проект к 'Unknown',
+            # вторая приносила настоящего застройщика, иерархия видела
+            # несовпадение и создавала вторую запись того же проекта.
+            if not _linked_to_placeholder_developer(r_devs):
                 continue
 
         # Разные фазы — разные проекты. Запрет срабатывает, только если фаза
@@ -464,6 +519,19 @@ def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev
         p_phases = extract_phase_markers(p_name)
         if p_phases and name_phases and p_phases != name_phases:
             continue
+
+        # Две заглушки — это две разные находки, о которых мы ничего не знаем.
+        # Без этого запрета две виллы с именем 'VILLA' с разных концов острова
+        # становились одной записью.
+        if placeholders_never_match(p_name, name):
+            continue
+
+        # Явный псевдоним из колонки Aliases: ручной рычаг для случаев вроде
+        # 'Umalalang Villas' против 'UMA LA LANG VILLAS BALI'. Их сходство
+        # 0.82, а порог 0.90 понижать нельзя — 'Leo Villas' и 'Lumea Villas'
+        # тоже дают 0.82 и при этом являются разными проектами.
+        if _matches_alias(r['fields'].get('Aliases'), name_clean):
+            return r, 1.0
                 
         p_area = r['fields'].get('District')
         
@@ -509,7 +577,15 @@ def fuzzy_match_developer(name: str, existing_records: list):
 
     name_clean = re.sub(r'[^\w\s]', '', str(name)).lower().strip()
     name_words = set(name_clean.split())
-    ignore_words = {'official', 'chat', 'bali', 'real', 'estate', 'channel', 'group', 'news', 'bot', 'villas'}
+    # Имя застройщика извлекается из названия группы, а там по правилам
+    # агентства всегда присутствует НАШЕ имя: 'Rise Real', 'RR', 'risereal'.
+    # Без этих слов в списке шума совместная группа 'Rise Real x Nuanu'
+    # сопоставлялась бы с застройщиком по нашему же названию.
+    ignore_words = {
+        'official', 'chat', 'bali', 'real', 'estate', 'channel', 'group',
+        'news', 'bot', 'villas',
+        'rise', 'rr', 'risereal', 'riserealbali', 'realty',
+    }
 
     best_record = None
     best_score = 0.0
@@ -565,6 +641,20 @@ async def upsert_developer(dev_data: dict) -> str:
     if not dev_name:
         return None
 
+    # Застройщик не определен. Заглушке даем уникальный номер: сейчас в базе
+    # лежат ДВЕ разные записи с именем 'Unknown', под которыми скопилось
+    # 17 проектов — общее имя схлопывает разных застройщиков в одного.
+    # Нумерация делает каждую находку отдельной, а привязка к такой записи
+    # не мешает сопоставлению: fuzzy_match_project пропускает проверку
+    # иерархии, когда у проекта стоит застройщик-заглушка.
+    if is_placeholder_name(dev_name):
+        dev_name = next_placeholder_name(
+            None, [r['fields'].get('Developer') for r in existing]
+        )
+        dev_data = dict(dev_data)
+        dev_data['Developer'] = dev_name
+        logger.info(f"Застройщик не определен — присвоено {dev_name!r}")
+
     match, score = fuzzy_match_developer(dev_name, existing)
     
     # Готовим поля
@@ -619,8 +709,19 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
 
     table = base.table('Projects')
     proj_name = proj_data.get('Project Name')
-    if not proj_name:
-        return None
+
+    # Названия нет или вместо него общее слово ('VILLA', 'Unknown Project',
+    # '1-Bed Villa with Pool'). Даем уникальный номер: одинаковые заглушки
+    # схлопывались между собой, и две разные виллы с разных концов острова
+    # становились одной записью. Настоящее имя подставим, когда оно всплывет
+    # в материалах застройщика.
+    if is_placeholder_name(proj_name):
+        kind = _guess_placeholder_kind(proj_data)
+        existing_names = [r['fields'].get('Project Name') for r in CACHE_PROJECTS]
+        proj_name = next_placeholder_name(kind, existing_names)
+        proj_data = dict(proj_data)
+        proj_data['Project Name'] = proj_name
+        logger.info(f"Название не определено — присвоено {proj_name!r}")
 
     # Сохраняем все значения, кроме None и пустых строк
     fields = {k: v for k, v in proj_data.items() if v is not None and str(v).strip() != ""}

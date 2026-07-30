@@ -266,4 +266,9 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
+    # Два слушателя на одной сессии Telethon конфликтуют и дублируют разбор,
+    # а значит и расходы на Gemini.
+    from app.single_instance import acquire
+    acquire('listener')
+
     asyncio.run(main())
