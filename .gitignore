@@ -21,3 +21,15 @@ data/
 .idea/
 *.swp
 .env
+
+# Выгрузки базы и разовые экспорты: содержат данные клиентов и быстро устаревают.
+# Схему читаем из живой базы (app/schema_check.py), а не из сохраненного файла.
+dump*.json
+schema.json
+notes_export.txt
+project_mapping.json
+out_repr.txt
+
+# Отчеты покрытия
+.coverage
+htmlcov/

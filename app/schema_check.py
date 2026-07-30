@@ -27,6 +27,7 @@ from typing import List
 
 from app.airtable_client import (
     AREA_ALIASES,
+    UNIT_TYPE_ALIASES,
     VALID_POOL_VALUES,
     VALID_STAGES,
     field_exists,
@@ -74,6 +75,8 @@ def expected_select_values() -> dict:
         ('Projects', 'Construction stage'): set(VALID_STAGES),
         ('Field Staging', 'Priority'): set(AIRTABLE_PRIORITY.values()),
         ('Units', 'Pool'): set(VALID_POOL_VALUES),
+        # None означает «поле не заполняем» — это не значение селекта
+        ('Units', 'Unit type'): {v for v in UNIT_TYPE_ALIASES.values() if v},
     }
 
 

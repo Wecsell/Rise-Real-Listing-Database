@@ -262,39 +262,57 @@ UNIT_TYPE_ALIASES = {
     'villa 1br jungle view': 'Villa', '1br jungle view villa': 'Villa',
     'residence': 'Villa',
     'commercial': None,  # Удалять — мы не храним коммерцию
-    'penthouse': 'Apartment',
+    'penthouse': 'Penthouse',  # В селекте базы есть отдельное значение
     'bungalow': 'Villa',
 }
 
+# Запасной список типов юнитов. Боевой источник — селект Units.Unit type,
+# см. get_valid_unit_types(). Значения 'Hotel' и 'Hotel room' раньше жестко
+# возвращались отсюда, хотя из базы их убрали: такой юнит Airtable отвергал.
+FALLBACK_UNIT_TYPES = ['Villa', 'Apartment', 'Loft', 'Studio', 'Townhouse', 'Penthouse']
+
+# Опции-мусор, которые есть в базе, но проставлять их автоматически нельзя
+UNIT_TYPE_JUNK = {'-', "Developer's stock"}
+
+
+def get_valid_unit_types() -> list:
+    options = get_select_options('Units', 'Unit type', FALLBACK_UNIT_TYPES)
+    return [o for o in options if o not in UNIT_TYPE_JUNK]
+
+
 def sanitize_unit_type(raw_type):
-    """Нормализует Unit type до одного из валидных: Villa, Apartment, Loft, Studio, Townhouse, Hotel, Hotel room"""
+    """
+    Нормализует Unit type до значения, которое реально есть в селекте базы.
+
+    Результат сверяется с живой схемой: раньше функция могла вернуть 'Hotel'
+    или 'Hotel room', которых в Units.Unit type нет, и запись юнита падала.
+    """
     if not raw_type:
         return None
     raw_lower = str(raw_type).strip().lower()
-    
-    # Точные валидные значения
-    valid = {'villa': 'Villa', 'apartment': 'Apartment', 'loft': 'Loft', 
-             'studio': 'Studio', 'townhouse': 'Townhouse', 'hotel': 'Hotel', 'hotel room': 'Hotel room'}
-    if raw_lower in valid:
-        return valid[raw_lower]
-    
-    # Алиасы
-    if raw_lower in UNIT_TYPE_ALIASES:
-        return UNIT_TYPE_ALIASES[raw_lower]
-    
-    # Содержит ключевое слово
-    if 'villa' in raw_lower:
-        return 'Villa'
-    if 'apartment' in raw_lower:
-        return 'Apartment'
-    if 'loft' in raw_lower:
-        return 'Loft'
-    if 'studio' in raw_lower:
-        return 'Studio'
-    if 'townhouse' in raw_lower:
-        return 'Townhouse'
-    
-    logger.warning(f"Unit type '{raw_type}' is unknown, stripping it.")
+    valid_types = get_valid_unit_types()
+    by_lower = {v.lower(): v for v in valid_types}
+
+    candidate = None
+
+    if raw_lower in by_lower:
+        candidate = by_lower[raw_lower]
+    elif raw_lower in UNIT_TYPE_ALIASES:
+        candidate = UNIT_TYPE_ALIASES[raw_lower]
+    else:
+        # Тип, упомянутый внутри строки: "2BR villa with pool"
+        for value in valid_types:
+            if value.lower() in raw_lower:
+                candidate = value
+                break
+
+    if candidate and candidate in valid_types:
+        return candidate
+
+    if candidate:
+        logger.warning(f"Unit type '{candidate}' отсутствует в селекте базы, поле не заполняем.")
+    else:
+        logger.warning(f"Unit type '{raw_type}' is unknown, stripping it.")
     return None
 
 def sanitize_pool(raw_pool):
