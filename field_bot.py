@@ -18,6 +18,9 @@ try:
 except ImportError:
     folium = None
 
+from app.access import describe_user, is_allowed
+from app.airtable_client import field_exists
+
 load_dotenv(override=True)
 
 # Настройки логирования
@@ -44,21 +47,24 @@ def get_session(chat_id):
 async def check_access(update: Update) -> bool:
     user_id = update.effective_user.id
     allowed_str = os.environ.get('ALLOWED_TELEGRAM_USER_ID', '')
-    
+
     if not allowed_str:
         await update.message.reply_text(
             f"🔒 Бот работает в приватном режиме, но ваш ID еще не добавлен в белый список!\n"
             f"Ваш Telegram ID: {user_id}\n\n"
             f"Пожалуйста, добавьте в файл .env строку:\n"
             f"ALLOWED_TELEGRAM_USER_ID={user_id}\n\n"
+            f"Если листеров несколько, перечислите ID через запятую.\n"
             f"Затем перезапустите бота."
         )
         return False
-        
-    if str(user_id) != allowed_str.strip():
-        await update.message.reply_text("⛔ Извините, этот бот приватный и доступен только владельцу.")
+
+    if not is_allowed(user_id, allowed_str):
+        await update.message.reply_text(
+            "⛔ Извините, этот бот приватный. Попросите добавить ваш Telegram ID в белый список."
+        )
         return False
-        
+
     return True
 
 KEYBOARD = ReplyKeyboardMarkup([['💾 Сохранить объект']], resize_keyboard=True, is_persistent=True)
@@ -112,7 +118,7 @@ async def save_finding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fields = {
         'Status': 'New'
     }
-    
+
     # Airtable принимает attachments как список словарей с ключом url
     if session['photos']:
         fields['Photo'] = [{'url': p} for p in session['photos']]
@@ -120,6 +126,15 @@ async def save_finding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fields['Audio'] = [{'url': a} for a in session['audios']]
     if session['location']:
         fields['Coordinates'] = session['location']
+
+    # Авторство находки: нужно для контроля покрытия при нескольких листерах
+    # и чтобы уведомление о дубле ушло тому, кто эту находку прислал.
+    # Поля могут отсутствовать в другой базе, поэтому пишем их с проверкой:
+    # запись в несуществующее поле роняет весь запрос с 422.
+    if field_exists('Field Staging', 'Submitted By'):
+        fields['Submitted By'] = describe_user(update.effective_user)
+    if field_exists('Field Staging', 'Telegram Chat ID'):
+        fields['Telegram Chat ID'] = str(chat_id)
         
     try:
         staging_table.create(fields)
