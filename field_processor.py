@@ -282,9 +282,11 @@ async def parse_new_findings():
                     logger.info(f"[{rec_id}] похоже на дубль: {len(matches)} совпадений по телефону")
                     if field_exists('Field Staging', 'Possible Duplicate Of'):
                         update_fields['Possible Duplicate Of'] = [m['id'] for m in matches[:5]]
+                    incoming_project = (parsed.get('Projects') or {}).get('Project Name')
                     if field_exists('Field Staging', 'Duplicate Reason'):
-                        update_fields['Duplicate Reason'] = describe_duplicate(matches, phones)
-                    dup_notice = build_duplicate_notice(matches, phones)
+                        update_fields['Duplicate Reason'] = describe_duplicate(
+                            matches, phones, incoming_project)
+                    dup_notice = build_duplicate_notice(matches, phones, incoming_project)
 
             await asyncio.to_thread(staging_table.update, rec_id, update_fields)
             logger.info(

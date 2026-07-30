@@ -76,15 +76,63 @@ def find_duplicates(
     return matches
 
 
-def describe_duplicate(matches: List[Dict[str, Any]], phones: List[str]) -> str:
+# Сколько разных проектов на одном номере считать признаком агента.
+# У застройщика проектов немного и они его собственные; агент рекламирует
+# чужие, поэтому номер быстро обрастает разными названиями.
+AGENT_PROJECT_THRESHOLD = 3
+
+SAME_LEAD = 'same_lead'
+POSSIBLE_AGENT = 'possible_agent'
+
+
+def classify_phone_match(matches: List[Dict[str, Any]],
+                         incoming_project: Optional[str] = None) -> str:
+    """
+    Один ли это контакт или похоже на номер агента.
+
+    Совпадение телефона отвечает на вопрос «тот же контакт?», но НЕ на вопрос
+    «тот же проект?». У застройщика один номер на все свои проекты — тогда
+    повторная находка работы не добавляет. Но баннер мог поставить агент, а
+    агент рекламирует объекты разных застройщиков: номер один, проекты разные.
+    Случай редкий, однако слить такие записи означало бы потерять проект.
+
+    Признак агента — на номере накопилось несколько РАЗНЫХ названий проектов.
+    """
+    names = set()
+    for m in matches:
+        name = (m.get('fields', {}).get('Project Name (from Project)') or
+                m.get('fields', {}).get('Project Name') or '')
+        if isinstance(name, (list, tuple)):
+            name = name[0] if name else ''
+        name = str(name).strip().lower()
+        if name:
+            names.add(name)
+
+    if incoming_project:
+        incoming = str(incoming_project).strip().lower()
+        if incoming:
+            names.add(incoming)
+
+    return POSSIBLE_AGENT if len(names) >= AGENT_PROJECT_THRESHOLD else SAME_LEAD
+
+
+def describe_duplicate(matches: List[Dict[str, Any]], phones: List[str],
+                       incoming_project: Optional[str] = None) -> str:
     """Причина срабатывания — для поля Duplicate Reason."""
     if not matches:
         return ""
     ids = ", ".join(str(m.get('fields', {}).get('Id') or m.get('id')) for m in matches[:5])
-    return f"Совпал телефон {', '.join(phones)} с находкой: {ids}"
+    base = f"Совпал телефон {', '.join(phones)} с находкой: {ids}"
+
+    if classify_phone_match(matches, incoming_project) == POSSIBLE_AGENT:
+        return (f"{base}. ВНИМАНИЕ: на этом номере уже несколько разных проектов — "
+                f"похоже на телефон агента, а не застройщика. Объединять записи нельзя, "
+                f"проверьте вручную.")
+    return base
 
 
-def build_duplicate_notice(matches: List[Dict[str, Any]], phones: List[str]) -> str:
+def build_duplicate_notice(matches: List[Dict[str, Any]], phones: List[str],
+                           incoming_project: Optional[str] = None) -> str:
     """Текст уведомления листеру в Telegram."""
     first = matches[0].get('fields', {})
     number = first.get('Id') or matches[0].get('id')
@@ -93,6 +141,16 @@ def build_duplicate_notice(matches: List[Dict[str, Any]], phones: List[str]) -> 
 
     who = f" от {submitted}" if submitted else ""
     date = f" ({when})" if when else ""
+
+    if classify_phone_match(matches, incoming_project) == POSSIBLE_AGENT:
+        text = (
+            f"⚠️ Один телефон, разные проекты\n\n"
+            f"Номер {phones[0]} уже встречался в находке #{number}{who}{date}, "
+            f"но проекты разные."
+        )
+        text += ("\n\nПохоже, баннеры ставит агент, а не застройщик. Находку "
+                 "оставляем как отдельный проект — снимай дальше, это не дубль.")
+        return text
 
     text = (
         f"🔁 Похоже на дубль\n\n"

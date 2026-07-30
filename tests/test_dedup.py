@@ -14,7 +14,10 @@ import pytest
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.dedup import (
+    POSSIBLE_AGENT,
+    SAME_LEAD,
     build_duplicate_notice,
+    classify_phone_match,
     describe_duplicate,
     extract_phones,
     find_duplicates,
@@ -130,3 +133,60 @@ class TestMessages:
     def test_notice_survives_missing_metadata(self):
         text = build_duplicate_notice([finding('rec1', '0813 391 9882')], ['628133919882'])
         assert 'rec1' in text
+
+
+class TestAgentPhoneTrap:
+    """
+    Ловушка, на которую указал владелец: листер может снять несколько баннеров,
+    поставленных агентом. Агент рекламирует объекты РАЗНЫХ застройщиков, а
+    телефон у него один. Случай редкий, но слить такие находки означало бы
+    потерять проект.
+
+    Разделение простое: совпадение телефона отвечает на вопрос «тот же
+    контакт?», но не на вопрос «тот же проект?». Признак агента — на одном
+    номере накопилось несколько разных названий проектов.
+    """
+
+    def _match(self, project_name, rec_id='rec1'):
+        return finding(rec_id, '0813 391 9882', **{'Project Name': project_name})
+
+    def test_developer_phone_with_one_project_is_a_plain_duplicate(self):
+        matches = [self._match('Rise Villas')]
+        assert classify_phone_match(matches, 'Rise Villas') == SAME_LEAD
+
+    def test_two_projects_on_one_phone_still_reads_as_one_lead(self):
+        """У застройщика бывает несколько своих проектов — это не агент."""
+        matches = [self._match('Rise Villas', 'rec1'), self._match('Rise Villas 2', 'rec2')]
+        assert classify_phone_match(matches, 'Rise Villas') == SAME_LEAD
+
+    def test_many_different_projects_on_one_phone_looks_like_an_agent(self):
+        matches = [
+            self._match('Alaya Residences', 'rec1'),
+            self._match('Ocean Bay Villas', 'rec2'),
+            self._match('Seven Oceans', 'rec3'),
+        ]
+        assert classify_phone_match(matches, 'CASA OASIS') == POSSIBLE_AGENT
+
+    def test_agent_case_warns_instead_of_calling_it_a_duplicate(self):
+        matches = [
+            self._match('Alaya Residences', 'rec1'),
+            self._match('Ocean Bay Villas', 'rec2'),
+            self._match('Seven Oceans', 'rec3'),
+        ]
+        reason = describe_duplicate(matches, ['628133919882'], 'CASA OASIS')
+        assert 'агент' in reason.lower()
+        assert 'нельзя' in reason.lower()
+
+        notice = build_duplicate_notice(matches, ['628133919882'], 'CASA OASIS')
+        assert 'не дубль' in notice.lower()
+
+    def test_plain_duplicate_keeps_the_calm_wording(self):
+        matches = [self._match('Rise Villas')]
+        notice = build_duplicate_notice(matches, ['628133919882'], 'Rise Villas')
+        assert 'Похоже на дубль' in notice
+        assert 'агент' not in notice.lower()
+
+    def test_unnamed_findings_are_not_mistaken_for_an_agent(self):
+        """Пока названий нет, судить не о чем — это обычное совпадение контакта."""
+        matches = [finding('rec1', '0813 391 9882'), finding('rec2', '0813 391 9882')]
+        assert classify_phone_match(matches, None) == SAME_LEAD
