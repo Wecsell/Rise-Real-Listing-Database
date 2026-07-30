@@ -23,6 +23,7 @@ gemini_client = genai.Client(api_key=os.environ.get('GEMINI_API_KEY'))
 import sync_from_dump
 from app.gemini_parser import SYSTEM_PROMPT
 from app.priority_parser import build_update_fields
+from app.gaps import project_gaps, unit_gaps, developer_gaps, merge_gaps
 
 FIELD_PROMPT = SYSTEM_PROMPT + """
 
@@ -179,10 +180,21 @@ async def process_staging_records():
                 if 'Coordinates' in fields:
                     proj_data['Coordinates(for Map)'] = fields['Coordinates']
                     
-                proj_id = await upsert_project(proj_data, dev_id, gaps=[])
-                
+                # Пропуски считаем сами и подмешиваем то, что вернула модель.
+                # Раньше сюда передавался пустой список, из-за чего находка с
+                # баннера — заведомо неполная — уезжала в базу со статусом
+                # Verified, а поле Gaps затиралось.
+                proj_gaps = merge_gaps(
+                    project_gaps(proj_data),
+                    developer_gaps(dev_data),
+                    parsed.get('Gaps'),
+                )
+                logger.info(f"Незаполненных полей по проекту: {len(proj_gaps)} -> {proj_gaps}")
+
+                proj_id = await upsert_project(proj_data, dev_id, gaps=proj_gaps)
+
                 for u in dump_item['Units']:
-                    await upsert_unit(u, proj_id, proj_data.get('Project Name', 'None'), [])
+                    await upsert_unit(u, proj_id, proj_data.get('Project Name', 'None'), unit_gaps(u))
                     
                 logger.info("Сохранено в основную базу!")
                 
