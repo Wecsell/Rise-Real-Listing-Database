@@ -56,18 +56,47 @@ def cmd_status(_args) -> int:
     return 0
 
 
+LOG_DIR = os.path.join(ROOT, 'logs')
+
+
+def log_path(name: str) -> str:
+    return os.path.join(LOG_DIR, f'{name}.log')
+
+
 def _start_one(name: str) -> bool:
     if is_running(name):
         print(f"  {name}: уже работает, пропускаю")
         return True
 
-    print(f"  {name}: запускаю...")
+    # Процесс отвязывается от терминала, поэтому его вывод надо направить в
+    # файл — иначе после запуска смотреть будет нечего.
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = log_path(name)
+
+    print(f"  {name}: запускаю... лог: {os.path.relpath(path, ROOT)}")
     try:
-        subprocess.Popen(COMMANDS[name], cwd=ROOT)
+        handle = open(path, 'a', encoding='utf-8', buffering=1)
+        handle.write(f"\n===== запуск {name} =====\n")
+        handle.flush()
+        env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+        subprocess.Popen(COMMANDS[name], cwd=ROOT, stdout=handle,
+                         stderr=subprocess.STDOUT, env=env)
     except Exception as e:
         print(f"  {name}: не удалось запустить — {e}")
         return False
     return True
+
+
+def cmd_logs(args) -> int:
+    path = log_path(args.name)
+    if not os.path.exists(path):
+        print(f'Лог {args.name} пока пуст — процесс не запускался.')
+        return 0
+    with open(path, encoding='utf-8', errors='replace') as f:
+        lines = f.readlines()
+    for line in lines[-args.lines:]:
+        print(line.rstrip())
+    return 0
 
 
 def cmd_start(args) -> int:
@@ -120,8 +149,13 @@ def main() -> int:
     p_stop = sub.add_parser('stop', help='остановить процесс')
     p_stop.add_argument('name', choices=choices)
 
+    p_logs = sub.add_parser('logs', help='показать хвост лога')
+    p_logs.add_argument('name', choices=list(COMMANDS))
+    p_logs.add_argument('-n', '--lines', type=int, default=40)
+
     args = parser.parse_args()
-    return {'status': cmd_status, 'start': cmd_start, 'stop': cmd_stop}[args.command](args)
+    return {'status': cmd_status, 'start': cmd_start,
+            'stop': cmd_stop, 'logs': cmd_logs}[args.command](args)
 
 
 if __name__ == '__main__':

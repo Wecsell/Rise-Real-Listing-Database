@@ -163,7 +163,7 @@ class TestFieldProcessorPipeline(unittest.TestCase):
                       "без свежего кэша поиск дубля не увидит записи других процессов")
 
     def test_duplicate_detection_is_wired(self):
-        self.assertIn('find_duplicates', self.parse_phase)
+        self.assertIn('find_matches', self.parse_phase)
         self.assertIn('notify_lister', self.parse_phase)
 
 

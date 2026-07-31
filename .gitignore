@@ -33,3 +33,4 @@ out_repr.txt
 # Отчеты покрытия
 .coverage
 htmlcov/
+logs/

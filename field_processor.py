@@ -11,6 +11,12 @@ from google.genai import types
 
 load_dotenv(override=True)
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# httpx и telethon на уровне INFO пишут полный URL запроса, а токены стоят
+# прямо в пути. При выводе в файл они оказываются на диске открытым текстом.
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+
 logger = logging.getLogger("FieldProcessor")
 
 airtable_api = Api(os.environ.get('AIRTABLE_TOKEN'))
@@ -25,8 +31,9 @@ from app.gaps import project_gaps, unit_gaps, developer_gaps, merge_gaps
 from app.staging import (PARSED_JSON_FIELD, load_parsed, needs_parsing,
                          promotion_blockers, should_promote)
 from app.naming import swap_coordinates
-from app.dedup import (build_duplicate_notice, describe_duplicate,
-                       extract_phones, find_duplicates, notify_lister)
+from app.dedup import (build_contact_notice, classify_contact_match,
+                       describe_contact_match, extract_phones, find_matches,
+                       notify_lister)
 from app.airtable_client import field_exists
 
 FIELD_PROMPT = SYSTEM_PROMPT + """
@@ -281,18 +288,24 @@ async def parse_new_findings():
             # работы не дает. Координаты для этого не годятся — баннер стоит
             # не там, где объект.
             dup_notice = None
-            phones = extract_phones(update_fields.get('Contact'))
-            if phones:
-                matches = find_duplicates(phones, all_findings, exclude_id=rec_id)
-                if matches:
-                    logger.info(f"[{rec_id}] похоже на дубль: {len(matches)} совпадений по телефону")
-                    if field_exists('Field Staging', 'Possible Duplicate Of'):
-                        update_fields['Possible Duplicate Of'] = [m['id'] for m in matches[:5]]
-                    incoming_project = (parsed.get('Projects') or {}).get('Project Name')
-                    if field_exists('Field Staging', 'Duplicate Reason'):
-                        update_fields['Duplicate Reason'] = describe_duplicate(
-                            matches, phones, incoming_project)
-                    dup_notice = build_duplicate_notice(matches, phones, incoming_project)
+            contact_field = update_fields.get('Contact')
+            by_kind = find_matches(contact_field, all_findings, exclude_id=rec_id)
+            matches = by_kind['website'] + by_kind['handle'] + by_kind['phone']
+            if matches:
+                incoming_project = (parsed.get('Projects') or {}).get('Project Name')
+                verdict = classify_contact_match(by_kind, incoming_project,
+                                                 extract_phones(contact_field))
+                logger.info(
+                    f"[{rec_id}] совпадений: сайт={len(by_kind['website'])} "
+                    f"аккаунт={len(by_kind['handle'])} телефон={len(by_kind['phone'])} "
+                    f"-> {verdict}"
+                )
+                if field_exists('Field Staging', 'Possible Duplicate Of'):
+                    update_fields['Possible Duplicate Of'] = [m['id'] for m in matches[:5]]
+                if field_exists('Field Staging', 'Duplicate Reason'):
+                    update_fields['Duplicate Reason'] = describe_contact_match(
+                        by_kind, contact_field, incoming_project)
+                dup_notice = build_contact_notice(by_kind, contact_field, incoming_project)
 
             await asyncio.to_thread(staging_table.update, rec_id, update_fields)
             logger.info(

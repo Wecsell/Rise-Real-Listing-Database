@@ -16,6 +16,26 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from app.single_instance import LOCK_PORTS, acquire, is_running, status
 
 
+@pytest.fixture(autouse=True)
+def isolated_ports(monkeypatch):
+    """
+    Подменяет порты на тестовые.
+
+    Без этого тесты дерутся за замки с реально запущенными ботами: если
+    field_bot работает, тест не может занять его порт и падает — при том что
+    проверяемый код исправен. Тест не должен зависеть от того, поднята ли
+    сейчас боевая система.
+    """
+    import app.single_instance as si
+    monkeypatch.setattr(si, 'LOCK_PORTS', {
+        'field_bot': 48311,
+        'field_processor': 48310,
+        'listener': 48312,
+        'sync_job': 48313,
+    })
+    monkeypatch.setattr(si, '_held_locks', {})
+
+
 @pytest.fixture
 def released():
     """Гарантирует, что после теста замки свободны."""

@@ -28,6 +28,13 @@ load_dotenv(override=True)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# httpx на уровне INFO пишет полный URL запроса, а токен бота стоит прямо в
+# пути: https://api.telegram.org/bot<ТОКЕН>/getMe. При выводе в файл токен
+# оказывается на диске открытым текстом.
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('telegram.ext.Updater').setLevel(logging.WARNING)
+
 # Airtable
 airtable_api = Api(os.environ.get('AIRTABLE_TOKEN'))
 base = airtable_api.base(os.environ.get('AIRTABLE_BASE_ID'))

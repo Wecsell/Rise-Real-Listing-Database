@@ -20,7 +20,7 @@ from app.dedup import (
     classify_phone_match,
     describe_duplicate,
     extract_phones,
-    find_duplicates,
+    find_matches,
     is_known_agency_phone,
     normalize_phone,
 )
@@ -79,37 +79,37 @@ class TestFindDuplicates:
 
     def test_matches_same_phone_across_findings(self):
         existing = [finding('rec1', 'https://wa.me/628133919882')]
-        assert find_duplicates(['628133919882'], existing) == existing
+        assert find_matches('628133919882', existing)['phone'] == existing
 
     def test_different_phone_is_not_a_duplicate(self):
         existing = [finding('rec1', 'https://wa.me/628111111111')]
-        assert find_duplicates(['628133919882'], existing) == []
+        assert find_matches('628133919882', existing)['phone'] == []
 
     def test_excludes_the_record_being_checked(self):
         """Находка не должна находить сама себя."""
         existing = [finding('rec_self', 'https://wa.me/628133919882')]
-        assert find_duplicates(['628133919882'], existing, exclude_id='rec_self') == []
+        assert find_matches('628133919882', existing, exclude_id='rec_self')['phone'] == []
 
     def test_matches_regardless_of_project_name(self):
         """Ключевое правило: имя проекта на решение не влияет."""
         existing = [finding('rec1', 'https://wa.me/628133919882',
                             **{'Project Name': 'Совсем другой проект'})]
-        assert len(find_duplicates(['628133919882'], existing)) == 1
+        assert len(find_matches('628133919882', existing)['phone']) == 1
 
     def test_no_phones_means_no_duplicates(self):
         existing = [finding('rec1', 'https://wa.me/628133919882')]
-        assert find_duplicates([], existing) == []
+        assert find_matches('', existing)['phone'] == []
 
     def test_findings_without_contact_are_skipped(self):
         existing = [finding('rec1'), finding('rec2', 'https://wa.me/628133919882')]
-        assert [m['id'] for m in find_duplicates(['628133919882'], existing)] == ['rec2']
+        assert [m['id'] for m in find_matches('628133919882', existing)['phone']] == ['rec2']
 
     def test_reports_every_match(self):
         existing = [
             finding('rec1', 'https://wa.me/628133919882'),
             finding('rec2', '0813 391 9882'),
         ]
-        assert len(find_duplicates(['628133919882'], existing)) == 2
+        assert len(find_matches('628133919882', existing)['phone']) == 2
 
 
 class TestMessages:

@@ -54,26 +54,71 @@ def extract_phones(contact_field: Optional[str]) -> List[str]:
     return phones
 
 
-def find_duplicates(
-    phones: List[str],
-    records: List[Dict[str, Any]],
-    exclude_id: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+# Домены-площадки: принадлежат не застройщику, а сервису. Совпадение по ним
+# ничего не доказывает — на wa.me и в инстаграме сидят все подряд.
+PLATFORM_DOMAINS = {
+    'wa.me', 'whatsapp.com', 'api.whatsapp.com', 't.me', 'telegram.me',
+    'instagram.com', 'facebook.com', 'fb.com', 'linkedin.com', 'youtube.com',
+    'tiktok.com', 'google.com', 'drive.google.com', 'docs.google.com',
+    'maps.google.com', 'goo.gl', 'bit.ly', 'linktr.ee', 'notion.site',
+    'notion.so', 'airtable.com', 'gmail.com', 'mail.ru', 'yandex.ru',
+}
+
+_URL_RE = re.compile(r'(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)+)', re.I)
+_HANDLE_RE = re.compile(r'@([A-Za-z0-9_]{3,32})')
+_TME_RE = re.compile(r'(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,32})', re.I)
+_IG_RE = re.compile(r'instagram\.com/([A-Za-z0-9_.]{2,40})', re.I)
+
+
+def extract_websites(text: Optional[str]) -> List[str]:
     """
-    Находки с тем же телефоном. Сама проверяемая запись исключается.
+    Собственные домены из строки контактов, в нижнем регистре и без www.
+
+    Совпадение домена — стопроцентный признак того же застройщика: свой сайт
+    не бывает общим, в отличие от телефона, который может принадлежать агенту.
+    Домены площадок отбрасываются: они принадлежат сервису, а не компании.
     """
-    if not phones:
+    if not text or not isinstance(text, str):
         return []
 
-    wanted = set(phones)
-    matches = []
-    for rec in records:
-        if exclude_id and rec.get('id') == exclude_id:
+    sites = []
+    for match in _URL_RE.finditer(text):
+        domain = match.group(1).lower().rstrip('.')
+        if domain in PLATFORM_DOMAINS:
             continue
-        existing = set(extract_phones(rec.get('fields', {}).get('Contact')))
-        if existing & wanted:
-            matches.append(rec)
-    return matches
+        # Отсекаем почтовые адреса: домен уже учтён, а local@ нам не нужен
+        if domain not in sites:
+            sites.append(domain)
+    return sites
+
+
+def extract_social_handles(text: Optional[str]) -> List[str]:
+    """
+    Аккаунты в Telegram и Instagram, приведённые к виду 'tg:name' / 'ig:name'.
+
+    Префикс нужен, чтобы @rise в телеграме и @rise в инстаграме не считались
+    одним контактом.
+    """
+    if not text or not isinstance(text, str):
+        return []
+
+    handles = []
+
+    def add(value):
+        if value and value not in handles:
+            handles.append(value)
+
+    for m in _TME_RE.finditer(text):
+        add(f'tg:{m.group(1).lower()}')
+    for m in _IG_RE.finditer(text):
+        add(f'ig:{m.group(1).lower().rstrip(".")}')
+    # Голый @ник без указания площадки: в этом проекте это почти всегда Telegram
+    for m in _HANDLE_RE.finditer(text):
+        add(f'tg:{m.group(1).lower()}')
+
+    return handles
+
+
 
 
 # Сколько разных проектов на одном номере считать признаком агента.
@@ -83,6 +128,36 @@ AGENT_PROJECT_THRESHOLD = 3
 
 SAME_LEAD = 'same_lead'
 POSSIBLE_AGENT = 'possible_agent'
+SAME_COMPANY = 'same_company'
+
+
+def find_matches(contact_field: Optional[str],
+                 records: List[Dict[str, Any]],
+                 exclude_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Совпадения по всем видам контакта сразу: сайт, аккаунт, телефон.
+
+    Возвращает словарь по видам, потому что вес у них разный. Сайт решает
+    вопрос окончательно — собственный домен не бывает общим. Телефон лишь
+    указывает на один контакт: он может принадлежать агенту, который
+    рекламирует объекты разных застройщиков.
+    """
+    sites = set(extract_websites(contact_field))
+    handles = set(extract_social_handles(contact_field))
+    phones = set(extract_phones(contact_field))
+
+    result = {'website': [], 'handle': [], 'phone': []}
+    for rec in records:
+        if exclude_id and rec.get('id') == exclude_id:
+            continue
+        other = rec.get('fields', {}).get('Contact')
+        if sites and sites & set(extract_websites(other)):
+            result['website'].append(rec)
+        elif handles and handles & set(extract_social_handles(other)):
+            result['handle'].append(rec)
+        elif phones and phones & set(extract_phones(other)):
+            result['phone'].append(rec)
+    return result
 
 
 def is_known_agency_phone(phones: List[str]) -> bool:
@@ -118,6 +193,9 @@ def classify_phone_match(matches: List[Dict[str, Any]],
     Два признака агента, в порядке надёжности:
     1. номер числится за известным агентством из справочника Agencies;
     2. на номере накопилось несколько РАЗНЫХ названий проектов.
+
+    Совпадение по сайту сюда не попадает: оно разбирается раньше и решает
+    вопрос само, см. classify_contact_match().
     """
     if phones and is_known_agency_phone(phones):
         return POSSIBLE_AGENT
@@ -140,9 +218,51 @@ def classify_phone_match(matches: List[Dict[str, Any]],
     return POSSIBLE_AGENT if len(names) >= AGENT_PROJECT_THRESHOLD else SAME_LEAD
 
 
+def classify_contact_match(matches_by_kind: Dict[str, List[Dict[str, Any]]],
+                           incoming_project: Optional[str] = None,
+                           phones: Optional[List[str]] = None) -> str:
+    """
+    Итоговый вывод по всем видам совпадений.
+
+    Порядок жёсткий и отражает разную доказательность:
+
+    1. Сайт — одна и та же компания, без вариантов. Собственный домен не
+       делят между собой разные застройщики.
+    2. Аккаунт в Telegram или Instagram — почти столь же надёжно.
+    3. Телефон — только «тот же контакт». Дальше решает уже проверка на
+       агента: у агента один номер на объекты разных застройщиков.
+    """
+    if matches_by_kind.get('website'):
+        return SAME_COMPANY
+    if matches_by_kind.get('handle'):
+        return SAME_COMPANY
+    return classify_phone_match(matches_by_kind.get('phone', []), incoming_project, phones)
+
+
+def describe_contact_match(matches_by_kind: Dict[str, List[Dict[str, Any]]],
+                           contact_field: Optional[str],
+                           incoming_project: Optional[str] = None) -> str:
+    """Причина срабатывания — для поля Duplicate Reason."""
+    def ids(records):
+        return ", ".join(str(r.get('fields', {}).get('Id') or r.get('id')) for r in records[:5])
+
+    if matches_by_kind.get('website'):
+        sites = ', '.join(extract_websites(contact_field))
+        return (f"Совпал сайт {sites} с находкой: {ids(matches_by_kind['website'])}. "
+                f"Это тот же застройщик — собственный домен не бывает общим.")
+
+    if matches_by_kind.get('handle'):
+        handles = ', '.join(extract_social_handles(contact_field))
+        return (f"Совпал аккаунт {handles} с находкой: {ids(matches_by_kind['handle'])}.")
+
+    phone_matches = matches_by_kind.get('phone') or []
+    return describe_duplicate(phone_matches, extract_phones(contact_field),
+                              incoming_project)
+
+
 def describe_duplicate(matches: List[Dict[str, Any]], phones: List[str],
                        incoming_project: Optional[str] = None) -> str:
-    """Причина срабатывания — для поля Duplicate Reason."""
+    """Причина срабатывания по телефону — для поля Duplicate Reason."""
     if not matches:
         return ""
     ids = ", ".join(str(m.get('fields', {}).get('Id') or m.get('id')) for m in matches[:5])
@@ -184,6 +304,32 @@ def build_duplicate_notice(matches: List[Dict[str, Any]], phones: List[str],
         text += f"\nВсего совпадений: {len(matches)}."
     text += "\n\nЭто нормально: контакты застройщика мы запрашиваем один раз, а проекты он присылает все сразу. Ехать дальше."
     return text
+
+
+def build_contact_notice(matches_by_kind: Dict[str, List[Dict[str, Any]]],
+                         contact_field: Optional[str],
+                         incoming_project: Optional[str] = None) -> str:
+    """Текст уведомления листеру с учётом того, ЧЕМ именно совпало."""
+    verdict = classify_contact_match(matches_by_kind, incoming_project,
+                                     extract_phones(contact_field))
+
+    if verdict == SAME_COMPANY:
+        records = matches_by_kind.get('website') or matches_by_kind.get('handle')
+        first = records[0].get('fields', {})
+        number = first.get('Id') or records[0].get('id')
+        what = (', '.join(extract_websites(contact_field))
+                if matches_by_kind.get('website')
+                else ', '.join(extract_social_handles(contact_field)))
+        return (f"🔁 Точно дубль\n\n"
+                f"Совпал {what} с находкой #{number}.\n\n"
+                f"Это тот же застройщик — собственный сайт и аккаунт не бывают общими. "
+                f"Ехать дальше.")
+
+    phone_matches = matches_by_kind.get('phone') or []
+    if not phone_matches:
+        return ""
+    return build_duplicate_notice(phone_matches, extract_phones(contact_field),
+                                  incoming_project)
 
 
 async def notify_lister(chat_id: Optional[str], text: str) -> bool:

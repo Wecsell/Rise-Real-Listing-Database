@@ -19,6 +19,12 @@ from telethon.tl.functions.messages import GetDialogFiltersRequest
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# httpx и telethon на уровне INFO пишут полный URL запроса, а токены стоят
+# прямо в пути. При выводе в файл они оказываются на диске открытым текстом.
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+
 logger = logging.getLogger("Listener")
 
 PRE_FILTER_KEYWORDS = {"villa", "usd", "$", "спальн", "freehold", "leasehold", "проект", "девелопер", "project", "developer", "цена", "price", "are", "вилла", "апартамент", "apartment", "unit", "rp", "juta"}
