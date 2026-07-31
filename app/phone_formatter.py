@@ -57,7 +57,7 @@ def format_whatsapp_link(contact_input: Optional[str]) -> Optional[str]:
     if not s:
         return s
         
-    parts = re.split(r'[,;\n]+', s)
+    parts = re.split(r'[,;\n\|]+|(?<=\d|\))\s*/\s*(?=\+|\d|\()|(?<=\d)(?=\+)', s)
     wa_links = []
     other_contacts = []
     

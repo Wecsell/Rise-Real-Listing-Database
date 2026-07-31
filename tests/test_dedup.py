@@ -69,6 +69,11 @@ class TestExtractPhones:
         assert extract_phones(None) == []
         assert extract_phones('') == []
 
+    def test_merged_agency_numbers_with_slashes_and_pipes(self):
+        assert extract_phones('+628133919882 / +628111234567') == ['628133919882', '628111234567']
+        assert extract_phones('08133919882 | 08111234567') == ['628133919882', '628111234567']
+        assert extract_phones('+628133919882+628111234567') == ['628133919882', '628111234567']
+
 
 class TestFindDuplicates:
 

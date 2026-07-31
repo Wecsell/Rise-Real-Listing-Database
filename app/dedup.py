@@ -36,18 +36,18 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
         return None
     if digits.startswith('0'):
         digits = '62' + digits[1:]
-    if len(digits) < MIN_PHONE_DIGITS:
+    if len(digits) < MIN_PHONE_DIGITS or len(digits) > 15:
         return None
     return digits
 
 
 def extract_phones(contact_field: Optional[str]) -> List[str]:
-    """Все нормализованные номера из строки контактов (их бывает несколько)."""
+    """Все нормализованные номера из строки контактов (их бывает несколько, в т.ч. слипшиеся через / или |)."""
     if not contact_field or not isinstance(contact_field, str):
         return []
 
     phones = []
-    for part in re.split(r'[,;\n]+', contact_field):
+    for part in re.split(r'[,;\n\|]+|(?<=\d|\))\s*/\s*(?=\+|\d|\()|(?<=\d)(?=\+)', contact_field):
         normalized = normalize_phone(part)
         if normalized and normalized not in phones:
             phones.append(normalized)
