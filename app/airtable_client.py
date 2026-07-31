@@ -164,9 +164,9 @@ def init_cache(force: bool = False):
         return
     logger.info("Initializing Airtable cache (minimal fields)...")
 
-    CACHE_DEVELOPERS = base.table('Developer').all(fields=['Developer'])
-    CACHE_PROJECTS = base.table('Projects').all(fields=['Project Name', 'Developer', 'District', 'Aliases'])
-    CACHE_UNITS = base.table('Units').all(fields=['Key'])
+    CACHE_DEVELOPERS = base.table('Developer').all()
+    CACHE_PROJECTS = base.table('Projects').all()
+    CACHE_UNITS = base.table('Units').all()
 
     CACHE_INITIALIZED = True
     CACHE_LOADED_AT = time.time()
@@ -384,9 +384,11 @@ def safe_float(val):
     if val is None:
         return None
     try:
-        # Убираем пробелы и запятые (частая проблема, когда ИИ пишет "120,000" вместо 120000)
-        clean_val = str(val).replace(',', '').replace(' ', '').replace('$', '')
-        return float(clean_val)
+        s_val = str(val).strip()
+        clean_val = re.sub(r'[^\d.]', '', s_val.replace(',', ''))
+        if clean_val:
+            return float(clean_val)
+        return val
     except (ValueError, TypeError):
         return val
 
@@ -606,6 +608,57 @@ def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev
 
     return None, 0.0
 
+
+def find_project_by_query(query: str, records: list):
+    """
+    Ищет проект по пользовательскому запросу (для команд /card и поиска).
+    Сначала проверяет подстроку в имени или Aliases, затем использует fuzzy_match.
+    """
+    if not query or not records:
+        return None
+    q_clean = str(query).strip().lower()
+    if not q_clean:
+        return None
+
+    q_normalized = re.sub(r'[^\w\s]', ' ', q_clean)
+    q_normalized = ' '.join(q_normalized.split())
+
+    # 1. Точное совпадение по имени
+    for r in records:
+        p_name = r.get('fields', {}).get('Project Name', '')
+        if str(p_name).strip().lower() == q_clean:
+            return r
+
+    # 2. Подстрока в имени
+    for r in records:
+        p_name = str(r.get('fields', {}).get('Project Name', '')).lower()
+        if q_clean in p_name:
+            return r
+
+    # 3. Подстрока в Aliases
+    for r in records:
+        aliases = str(r.get('fields', {}).get('Aliases', '')).lower()
+        if aliases and q_clean in aliases:
+            return r
+
+    # 4. Сопоставление с нормализацией пунктуации/дефисов
+    if q_normalized:
+        for r in records:
+            p_name = str(r.get('fields', {}).get('Project Name', '')).lower()
+            p_norm = ' '.join(re.sub(r'[^\w\s]', ' ', p_name).split())
+            if q_normalized in p_norm or p_norm in q_normalized:
+                return r
+
+            aliases = str(r.get('fields', {}).get('Aliases', '')).lower()
+            if aliases:
+                a_norm = ' '.join(re.sub(r'[^\w\s]', ' ', aliases).split())
+                if q_normalized in a_norm:
+                    return r
+
+    # 5. Нечеткий поиск (fuzzy match)
+    match, score = fuzzy_match_project(query, records)
+    return match
+
 def fuzzy_match_developer(name: str, existing_records: list):
     """Ищет разработчика по имени с использованием поиска подстрок и пересечения слов."""
     if not name or str(name).strip().lower() == 'none' or not existing_records:
@@ -765,6 +818,8 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
     # Таблица Projects не содержит поля Notes, удаляем его во избежание ошибки 422
     if 'Notes' in fields:
         fields.pop('Notes')
+    if 'Priority' in fields:
+        fields.pop('Priority')
         
     # Значения вынесены в VALID_STAGES на уровне модуля — их использует schema_check
     if 'Construction stage' in fields:
@@ -836,10 +891,13 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
                     formatted_imgs.append(item)
             fields['Img'] = formatted_imgs
 
-    numeric_fields = ['Price From (USD)', 'Price To (USD)', 'Total Units', 'Lease Term (years)', 'Extension Term (years)']
+    numeric_fields = ['Price From (USD)', 'Price To (USD)', 'Total Units', 'Lease Term (years)', 'Distance to the beach, m2']
     for f in numeric_fields:
         if f in fields:
             fields[f] = safe_float(fields[f])
+
+    if 'Extension Term (years)' in fields and fields['Extension Term (years)'] is not None:
+        fields['Extension Term (years)'] = str(fields['Extension Term (years)'])
 
     if 'Downpayment' in fields:
         try:
@@ -888,8 +946,44 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
         CACHE_PROJECTS.append(record)
         return record['id']
 
-async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list) -> str:
-    """Создает или обновляет Unit."""
+async def mark_project_units_sold(proj_id: str):
+    """
+    Помечает все первичные юниты проекта в 'Units' как 'Sold', когда проект распродан.
+    Также дублирует их в 'Units (Secondary)' со статусом 'Needs data'
+    (требуют ручного подтверждения человеком перед выходом в общий доступ).
+    """
+    global CACHE_UNITS
+    if not proj_id:
+        return
+    if cache_is_stale():
+        await init_cache_async()
+    base = get_base()
+    if not base:
+        return
+        
+    table_primary = base.table('Units')
+    table_secondary = base.table('Units (Secondary)')
+    
+    for u in list(CACHE_UNITS):
+        p_links = u.get('fields', {}).get('Project Name', [])
+        if proj_id == p_links or (isinstance(p_links, (list, tuple)) and proj_id in p_links):
+            rec_id = u['id']
+            fields = dict(u.get('fields', {}))
+            
+            # 1. Первичка маркируется как Sold
+            await robust_airtable_op_async(table_primary.update, rec_id, fields={'Status': 'Sold'})
+
+            # 2. Во вторичку дублируется заготовка со статусом "Needs data" (требует подтверждения человека)
+            sec_fields = {k: v for k, v in fields.items() if k not in ('Unit ID', 'Price per m²')}
+            sec_fields['Status'] = 'Needs data'
+            sec_fields['Source'] = 'Auto-duplicated on Sold Out (Needs manual confirmation)'
+            if proj_id:
+                sec_fields['Project Name'] = [proj_id]
+
+            await robust_airtable_op_async(table_secondary.create, fields=sec_fields)
+
+async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list, is_secondary: bool = False) -> str:
+    """Создает или обновляет Unit (в первичном 'Units' или во вторичном 'Units (Secondary)')."""
     global CACHE_UNITS
     
     if cache_is_stale():
@@ -899,7 +993,8 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list)
     if not base:
         return None
 
-    table = base.table('Units')
+    table_name = 'Units (Secondary)' if is_secondary else 'Units'
+    table = base.table(table_name)
     
     # Нормализуем Unit type ДО генерации ключа, чтобы ключи были стабильными
     raw_unit_type = unit_data.get('Unit type')

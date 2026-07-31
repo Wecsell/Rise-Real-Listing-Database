@@ -1,4 +1,17 @@
 import os
+import sys
+
+# На Windows 3.14 фоновые процессы требовательны к пути к OpenSSL DLL (_ssl)
+if sys.platform == 'win32':
+    py_dir = os.path.dirname(sys.executable)
+    dll_dir = os.path.join(py_dir, 'DLLs')
+    if os.path.exists(dll_dir):
+        os.environ['PATH'] = dll_dir + os.pathsep + os.environ.get('PATH', '')
+        try:
+            os.add_dll_directory(dll_dir)
+        except Exception:
+            pass
+
 import time
 import logging
 from dotenv import load_dotenv
@@ -145,9 +158,9 @@ async def save_finding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fields['Telegram Chat ID'] = str(chat_id)
         
     try:
-        staging_table.create(fields)
+        await asyncio.to_thread(staging_table.create, fields)
         # Очищаем сессию
-        sessions[chat_id] = {'photo': None, 'audio': None, 'location': None}
+        sessions[chat_id] = {'photos': [], 'audios': [], 'location': None}
         await update.message.reply_text("🎉 Успешно сохранено в Field Staging! Можно ехать к следующему билборду.", reply_markup=KEYBOARD)
     except Exception as e:
         logger.error(f"Ошибка Airtable: {e}")
@@ -235,8 +248,78 @@ async def handle_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"🗺️ Карта маршрутов на основе {len(gpx_files)} треков. Скачайте и откройте в браузере."
         )
 
+from app.access import describe_user, is_allowed, register_human_intervention, clear_human_pause, get_human_pause_remaining
+from app.card_generator import format_telegram_project_post, generate_pdf_project_card
+import app.airtable_client as _ac
+
+async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    chat_id = update.effective_chat.id
+    clear_human_pause(chat_id)
+    await update.message.reply_text("▶️ Автоответы бота возобновлены!", reply_markup=KEYBOARD)
+
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    chat_id = update.effective_chat.id
+    rem = get_human_pause_remaining(chat_id)
+    if rem > 0:
+        mins = rem // 60
+        secs = rem % 60
+        await update.message.reply_text(f"⏸ Автоответы в паузе (осталось {mins} мин {secs} сек). Отвечает человек.", reply_markup=KEYBOARD)
+    else:
+        await update.message.reply_text("🟢 Бот в активном режиме, автоответы включены.", reply_markup=KEYBOARD)
+
+async def handle_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("💡 Использование: `/card <Название проекта>`\nПример: `/card CEMAGI`", reply_markup=KEYBOARD)
+        return
+
+    proj_query = " ".join(args).strip()
+    await update.message.reply_text(f"⏳ Формирую карточку для '{proj_query}'...", reply_markup=KEYBOARD)
+
+    # Всегда принудительно обновляем кэш и используем живую ссылку на модуль
+    _ac.init_cache(force=True)
+    match = _ac.find_project_by_query(proj_query, _ac.CACHE_PROJECTS)
+    if not match:
+        await update.message.reply_text(f"❌ Проект '{proj_query}' не найден в базе.", reply_markup=KEYBOARD)
+        return
+
+    proj_fields = match.get('fields', {})
+    proj_id = match['id']
+
+    # Находим юниты проекта (через живую ссылку на модуль)
+    units = [
+        u['fields'] for u in _ac.CACHE_UNITS
+        if proj_id in (u.get('fields', {}).get('Project Name') or [])
+    ]
+
+    post_text = format_telegram_project_post(proj_fields, units=units)
+    try:
+        await update.message.reply_text(post_text, parse_mode='Markdown', reply_markup=KEYBOARD)
+    except Exception as parse_err:
+        logger.warning(f"Markdown parse error in handle_card: {parse_err}, sending plain text")
+        await update.message.reply_text(post_text, reply_markup=KEYBOARD)
+
+    try:
+        pdf_path = generate_pdf_project_card(proj_fields, units=units)
+        proj_name_safe = proj_fields.get('Project Name', 'Project').replace(' ', '_')
+        with open(pdf_path, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"{proj_name_safe}_Card.pdf",
+                caption=f"📄 PDF-карточка объекта {proj_fields.get('Project Name')}"
+            )
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+    except Exception as e:
+        logger.error(f"Ошибка при создании PDF карточки: {e}")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update): return
+    chat_id = update.effective_chat.id
+    register_human_intervention(chat_id)
     await update.message.reply_text(
         "Я готов принимать объекты! Пришли мне Фото, Голосовое сообщение или Координаты.\n"
         "Как только всё загрузишь — нажми кнопку ниже 👇",
@@ -257,6 +340,9 @@ if __name__ == '__main__':
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('map', handle_map))
+    application.add_handler(CommandHandler('card', handle_card))
+    application.add_handler(CommandHandler('resume', handle_resume))
+    application.add_handler(CommandHandler('status', handle_status))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_gpx))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))

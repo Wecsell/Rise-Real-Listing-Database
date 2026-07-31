@@ -22,6 +22,17 @@ import os
 import subprocess
 import sys
 
+# На Windows 3.14 фоновые процессы требовательны к пути к OpenSSL DLL (_ssl)
+if sys.platform == 'win32':
+    py_dir = os.path.dirname(sys.executable)
+    dll_dir = os.path.join(py_dir, 'DLLs')
+    if os.path.exists(dll_dir):
+        os.environ['PATH'] = dll_dir + os.pathsep + os.environ.get('PATH', '')
+        try:
+            os.add_dll_directory(dll_dir)
+        except Exception:
+            pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.single_instance import LOCK_PORTS, is_running
@@ -80,7 +91,7 @@ def _start_one(name: str) -> bool:
         handle.flush()
         env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
         subprocess.Popen(COMMANDS[name], cwd=ROOT, stdout=handle,
-                         stderr=subprocess.STDOUT, env=env)
+                         stderr=subprocess.STDOUT, env=env, shell=(sys.platform == 'win32'))
     except Exception as e:
         print(f"  {name}: не удалось запустить — {e}")
         return False

@@ -198,6 +198,35 @@ async def main():
         # 1. Сохраняем сырое сообщение
         await save_message(event.id, chat.id, sender.id if sender else 0, text, has_media)
         
+        # 1.5. Проверяем команду /card <Название проекта>
+        if text.strip().startswith("/card"):
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) > 1:
+                proj_query = parts[1].strip()
+                try:
+                    from app.card_generator import format_telegram_project_post, generate_pdf_project_card
+                    import app.airtable_client as _ac
+                    _ac.init_cache(force=True)
+                    match = _ac.find_project_by_query(proj_query, _ac.CACHE_PROJECTS)
+                    if match:
+                        proj_fields = match.get('fields', {})
+                        proj_id = match['id']
+                        units = [
+                            u['fields'] for u in _ac.CACHE_UNITS
+                            if proj_id in (u.get('fields', {}).get('Project Name') or [])
+                        ]
+                        post_text = format_telegram_project_post(proj_fields, units=units)
+                        await event.reply(post_text)
+                        pdf_path = generate_pdf_project_card(proj_fields, units=units)
+                        await event.reply(file=pdf_path)
+                        if os.path.exists(pdf_path):
+                            os.remove(pdf_path)
+                    else:
+                        await event.reply(f"❌ Проект '{proj_query}' не найден в базе.")
+                except Exception as card_err:
+                    logger.error(f"Ошибка обработки /card в listener: {card_err}")
+            return
+
         # 2. Добавляем в очередь на парсинг
         if text.strip():
             if passes_prefilter(text):

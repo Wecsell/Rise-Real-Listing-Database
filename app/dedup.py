@@ -338,11 +338,16 @@ async def notify_lister(chat_id: Optional[str], text: str) -> bool:
 
     Уведомление приходит вдогонку, а не в момент сохранения: телефон
     появляется только после разбора фото, то есть примерно через минуту.
-    Листер к этому моменту уже едет дальше, и это нормально.
+    Если менеджер ответил в чате, активна 60-минутная пауза автоответов.
     """
     token = os.environ.get('TELEGRAM_FIELD_BOT_TOKEN')
     if not token or not chat_id:
         logger.info(f"Уведомление о дубле не отправлено (нет токена или chat_id): {text[:60]}")
+        return False
+
+    from app.access import is_human_paused
+    if is_human_paused(chat_id):
+        logger.info(f"Уведомление не отправлено: в чате [{chat_id}] активна 60-мин пауза человека.")
         return False
 
     import httpx

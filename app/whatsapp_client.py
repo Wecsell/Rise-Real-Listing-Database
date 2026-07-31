@@ -57,6 +57,11 @@ def send_whatsapp_message(phone: str, text: str) -> Dict[str, Any]:
         logger.warning(f"Invalid phone for WhatsApp sending: {phone}")
         return {"success": False, "reason": "Invalid phone format"}
         
+    from app.access import is_human_paused
+    if is_human_paused(formatted_phone) or is_human_paused(f"{formatted_phone}@c.us"):
+        logger.info(f"WhatsApp сообщение не отправлено: на номере {formatted_phone} активна 60-мин пауза ответа человека.")
+        return {"success": False, "reason": "Human intervention pause active"}
+        
     if not GREENAPI_INSTANCE_ID or not GREENAPI_API_TOKEN:
         logger.info(f"[SIMULATION] WhatsApp outreach message to {formatted_phone}: \n{text}")
         return {

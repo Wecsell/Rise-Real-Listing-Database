@@ -18,6 +18,7 @@ requests
 pypdf
 pandas
 python-telegram-bot
+reportlab
 
 # Тесты
 pytest

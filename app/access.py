@@ -71,3 +71,54 @@ def describe_user(user) -> str:
 
     user_id = getattr(user, 'id', None)
     return str(user_id) if user_id is not None else 'unknown'
+
+
+# --- Human-in-the-loop: Пауза автоответов бота при ответе менеджера (60 минут) ---
+import time
+
+HUMAN_PAUSE_SECONDS = 3600  # 60 минут
+_HUMAN_INTERVENTIONS = {}  # chat_id -> timestamp
+
+
+def register_human_intervention(chat_id: Any) -> None:
+    """Фиксирует сообщение менеджера в чате и ставит паузу автоответов бота на 60 минут."""
+    if chat_id is None:
+        return
+    s_id = str(chat_id)
+    _HUMAN_INTERVENTIONS[s_id] = time.time()
+    logger.info(f"Человек ответил в чате [{s_id}] — автоответы бота заморожены на 60 минут.")
+
+
+def is_human_paused(chat_id: Any) -> bool:
+    """Проверяет, активна ли пауза автоответов для данного чата."""
+    if chat_id is None:
+        return False
+    s_id = str(chat_id)
+    last_time = _HUMAN_INTERVENTIONS.get(s_id, 0)
+    if not last_time:
+        return False
+    elapsed = time.time() - last_time
+    if elapsed < HUMAN_PAUSE_SECONDS:
+        return True
+    # Срок паузы истек
+    _HUMAN_INTERVENTIONS.pop(s_id, None)
+    return False
+
+
+def clear_human_pause(chat_id: Any) -> None:
+    """Снимает паузу для чата (например по команде /resume)."""
+    if chat_id is not None:
+        _HUMAN_INTERVENTIONS.pop(str(chat_id), None)
+
+
+def get_human_pause_remaining(chat_id: Any) -> int:
+    """Возвращает оставшееся количество секунд паузы (или 0)."""
+    if chat_id is None:
+        return 0
+    s_id = str(chat_id)
+    last_time = _HUMAN_INTERVENTIONS.get(s_id, 0)
+    if not last_time:
+        return 0
+    remaining = int(HUMAN_PAUSE_SECONDS - (time.time() - last_time))
+    return max(0, remaining)
+
