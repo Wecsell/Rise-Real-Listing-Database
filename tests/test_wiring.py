@@ -184,7 +184,7 @@ class TestNoDeadExports(unittest.TestCase):
     код написан, покрыт зелеными тестами и никем не используется.
     """
 
-    AUTHORED_MODULES = ['staging.py', 'gaps.py', 'dedup.py', 'access.py', 'schema_check.py']
+    AUTHORED_MODULES = ['staging.py', 'gaps.py', 'dedup.py', 'access.py', 'schema_check.py', 'content_cache.py']
 
     def test_every_public_function_is_called_somewhere(self):
         """

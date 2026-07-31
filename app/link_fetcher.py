@@ -4,10 +4,13 @@ import urllib.parse
 import httpx
 import json
 import os
+import asyncio
 import tempfile
 from typing import Dict, Any, List, Optional, Tuple
 from google import genai
 from google.genai import types
+
+from app import content_cache
 
 try:
     from app.database import save_extraction
@@ -290,9 +293,18 @@ async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
                 
             if res.status_code == 200:
                 csv_text = res.text[:15000]
-                logger.info(f"Successfully downloaded Google Sheet CSV ({len(csv_text)} bytes). Parsing with Gemini...")
-                
-                if client:
+                logger.info(f"Successfully downloaded Google Sheet CSV ({len(csv_text)} bytes).")
+
+                # Одну и ту же шахматку слушатель встречает повторно — на
+                # каждом рескане истории чата и при каждом повторном упоминании
+                # ссылки. Ключ по содержимому CSV, без привязки к чату:
+                # SHEET_SYSTEM_PROMPT статичен и не зависит от контекста.
+                cache_key = content_cache.hash_text(csv_text)
+                parsed_sheet = await asyncio.to_thread(content_cache.get, cache_key)
+                if parsed_sheet is not None:
+                    logger.info(f"💾 Cache hit for Google Sheet {gsheet_id}, skipping Gemini call")
+                elif client:
+                    logger.info(f"Cache miss for Google Sheet {gsheet_id}, parsing with Gemini...")
                     from app.gemini_parser import resolve_model_name
                     response = await client.aio.models.generate_content(
                         model=resolve_model_name(),
@@ -303,15 +315,21 @@ async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
                             temperature=0.1
                         )
                     )
-                    
+
                     text_resp = response.text.strip()
                     if text_resp.startswith("```"):
                         text_resp = re.sub(r"^```(?:json)?\n?|```$", "", text_resp).strip()
-                        
+
                     parsed_sheet = json.loads(text_resp)
+                    if content_cache.is_cacheable(parsed_sheet):
+                        await asyncio.to_thread(content_cache.put, cache_key, 'sheet', parsed_sheet)
+                else:
+                    parsed_sheet = None
+
+                if parsed_sheet:
                     project_name = parsed_sheet.get("project_name", "Unknown Project")
                     units = parsed_sheet.get("units", [])
-                    
+
                     logger.info(f"🎯 Extracted {len(units)} units from Google Sheet for project '{project_name}'!")
                     if save_extraction and isinstance(units, list):
                         for unit in units:

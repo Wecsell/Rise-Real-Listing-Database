@@ -1,0 +1,219 @@
+"""
+Проверка, что кэш реально не даёт Gemini разбирать один и тот же контент
+дважды.
+
+Postgres в этом окружении не поднят (нет asyncpg, нет Docker — init_db() в
+app/database.py молча ничего не делает), поэтому кэш живёт в отдельном
+SQLite-файле и не зависит от инфраструктуры. Каждый тест изолирует этот файл
+через GEMINI_CACHE_DB_PATH, чтобы не трогать боевой data/gemini_cache.db и не
+делить состояние между тестами.
+
+Ассерты — по числу вызовов замоканного клиента Gemini, а не по внутреннему
+состоянию content_cache: важно доказанное поведение («второй вызов не бьёт
+в API»), а не факт, что где-то в sqlite появилась строка.
+"""
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+
+class _IsolatedCacheDB(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._tmpdir.name, 'test_cache.db')
+        self._env_patch = patch.dict(os.environ, {'GEMINI_CACHE_DB_PATH': self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+
+def _make_pdf(size_bytes: int = 64) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(b"%PDF-1.4" + b"\0" * max(0, size_bytes - 8))
+    tmp.close()
+    return tmp.name
+
+
+class TestParseMessageCaching(_IsolatedCacheDB):
+
+    def _fake_response(self, payload='{"is_relevant": true, "confidence": 0.9}'):
+        resp = MagicMock()
+        resp.text = payload
+        return resp
+
+    def test_second_identical_call_hits_cache_not_gemini(self):
+        from app import gemini_parser
+
+        fake_client = MagicMock()
+        fake_client.aio.models.generate_content = AsyncMock(return_value=self._fake_response())
+
+        async def run():
+            with patch.object(gemini_parser, 'client', fake_client), \
+                 patch.object(gemini_parser, 'resolve_model_name', return_value='gemini-2.5-flash'), \
+                 patch('app.airtable_client.get_projects_by_developer', return_value=[]):
+                first = await gemini_parser.parse_message("Rise Villas Canggu, 2BR, 250000 USD", chat_title="Test Chat")
+                second = await gemini_parser.parse_message("Rise Villas Canggu, 2BR, 250000 USD", chat_title="Test Chat")
+                return first, second
+
+        import asyncio
+        first, second = asyncio.run(run())
+
+        fake_client.aio.models.generate_content.assert_awaited_once()
+        self.assertEqual(first, second)
+        self.assertTrue(first['is_relevant'])
+
+    def test_different_chat_title_is_a_cache_miss(self):
+        from app import gemini_parser
+
+        fake_client = MagicMock()
+        fake_client.aio.models.generate_content = AsyncMock(return_value=self._fake_response())
+
+        async def run():
+            with patch.object(gemini_parser, 'client', fake_client), \
+                 patch.object(gemini_parser, 'resolve_model_name', return_value='gemini-2.5-flash'), \
+                 patch('app.airtable_client.get_projects_by_developer', return_value=[]):
+                await gemini_parser.parse_message("Rise Villas Canggu", chat_title="Chat A")
+                await gemini_parser.parse_message("Rise Villas Canggu", chat_title="Chat B")
+
+        import asyncio
+        asyncio.run(run())
+
+        self.assertEqual(fake_client.aio.models.generate_content.await_count, 2)
+
+    def test_error_result_is_not_cached(self):
+        from app import gemini_parser
+
+        fake_client = MagicMock()
+        fake_client.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("API down"))
+
+        async def run():
+            with patch.object(gemini_parser, 'client', fake_client), \
+                 patch.object(gemini_parser, 'resolve_model_name', return_value='gemini-2.5-flash'), \
+                 patch('app.airtable_client.get_projects_by_developer', return_value=[]):
+                first = await gemini_parser.parse_message("Broken listing text", chat_title="Chat")
+                second = await gemini_parser.parse_message("Broken listing text", chat_title="Chat")
+                return first, second
+
+        import asyncio
+        first, second = asyncio.run(run())
+
+        self.assertEqual(fake_client.aio.models.generate_content.await_count, 2)
+        self.assertIn('error', first)
+        self.assertIn('error', second)
+
+
+class TestPdfGraphicCaching(_IsolatedCacheDB):
+    """
+    Ветка Files API — самый дорогой вызов в проекте (загрузка файла +
+    мультимодальный разбор), и единственный путь parse_pdf_document, который
+    не проходит через parse_message.
+    """
+
+    def _fake_response(self):
+        resp = MagicMock()
+        resp.text = '{"is_relevant": true, "confidence": 0.9}'
+        return resp
+
+    def test_second_call_with_same_pdf_bytes_hits_cache(self):
+        from app import doc_parser
+
+        path = _make_pdf()
+        try:
+            fake_client = MagicMock()
+            fake_client.files.upload.return_value = "uploaded-file-handle"
+            fake_client.aio.models.generate_content = AsyncMock(return_value=self._fake_response())
+
+            async def run():
+                with patch.object(doc_parser, 'extract_text_from_pdf', return_value=''), \
+                     patch.object(doc_parser, 'client', fake_client), \
+                     patch.object(doc_parser, 'resolve_model_name', return_value='gemini-2.5-flash'):
+                    first = await doc_parser.parse_pdf_document(path)
+                    second = await doc_parser.parse_pdf_document(path)
+                    return first, second
+
+            import asyncio
+            first, second = asyncio.run(run())
+
+            fake_client.files.upload.assert_called_once()
+            fake_client.aio.models.generate_content.assert_awaited_once()
+            self.assertEqual(first, second)
+        finally:
+            os.remove(path)
+
+    def test_two_pdfs_with_different_bytes_are_not_conflated(self):
+        from app import doc_parser
+
+        path_a = _make_pdf(size_bytes=64)
+        path_b = _make_pdf(size_bytes=128)
+        try:
+            fake_client = MagicMock()
+            fake_client.files.upload.return_value = "uploaded-file-handle"
+            fake_client.aio.models.generate_content = AsyncMock(return_value=self._fake_response())
+
+            async def run():
+                with patch.object(doc_parser, 'extract_text_from_pdf', return_value=''), \
+                     patch.object(doc_parser, 'client', fake_client), \
+                     patch.object(doc_parser, 'resolve_model_name', return_value='gemini-2.5-flash'):
+                    await doc_parser.parse_pdf_document(path_a)
+                    await doc_parser.parse_pdf_document(path_b)
+
+            import asyncio
+            asyncio.run(run())
+
+            self.assertEqual(fake_client.files.upload.call_count, 2)
+        finally:
+            os.remove(path_a)
+            os.remove(path_b)
+
+
+class TestSheetCaching(_IsolatedCacheDB):
+
+    def _mock_http_response(self, csv_text: str):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = csv_text
+        resp.url = 'https://docs.google.com/spreadsheets/d/abc/export?format=csv'
+        return resp
+
+    def test_second_fetch_of_same_sheet_skips_gemini(self):
+        from app import link_fetcher
+
+        csv_text = "Unit,Price\nA1,100000\nA2,120000"
+        fake_gemini_response = MagicMock()
+        fake_gemini_response.text = '{"project_name": "Rise Villas", "units": []}'
+
+        fake_client = MagicMock()
+        fake_client.aio.models.generate_content = AsyncMock(return_value=fake_gemini_response)
+
+        fake_http_client = MagicMock()
+        fake_http_client.get = AsyncMock(return_value=self._mock_http_response(csv_text))
+        fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+        fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def run():
+            with patch.object(link_fetcher, 'client', fake_client), \
+                 patch('app.gemini_parser.resolve_model_name', return_value='gemini-2.5-flash'), \
+                 patch.object(link_fetcher.httpx, 'AsyncClient', return_value=fake_http_client):
+                await link_fetcher.fetch_and_parse_link(
+                    'https://docs.google.com/spreadsheets/d/abc123/edit', message_id=1, chat_id=1
+                )
+                await link_fetcher.fetch_and_parse_link(
+                    'https://docs.google.com/spreadsheets/d/abc123/edit', message_id=2, chat_id=1
+                )
+
+        import asyncio
+        asyncio.run(run())
+
+        fake_client.aio.models.generate_content.assert_awaited_once()
+
+
+if __name__ == '__main__':
+    unittest.main()

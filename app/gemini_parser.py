@@ -1,11 +1,14 @@
 import os
 import json
+import asyncio
 import logging
 import re
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List, Optional
+
+from app import content_cache
 
 logger = logging.getLogger("GeminiParser")
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
@@ -204,6 +207,16 @@ async def parse_message(text: str, chat_title: str = None) -> dict:
     if not text or len(text.strip()) < 3:
         return {"is_relevant": False, "reason": "Message too short"}
 
+    # Один и тот же текст может прийти дважды: пересылка в чате, повторный
+    # скан истории при перезапуске listener. Проверяем кэш до похода в
+    # Airtable за списком проектов застройщика — попадание экономит и его.
+    cache_key = content_cache.hash_text(text, context=chat_title or '')
+    cached = await asyncio.to_thread(content_cache.get, cache_key)
+    if cached is not None:
+        logger.info(f"💾 Cache hit for message (chat='{chat_title}'), skipping Gemini call")
+        return cached
+    logger.info(f"Cache miss (chat='{chat_title}'), calling Gemini...")
+
     model_name = resolve_model_name()
 
     try:
@@ -231,7 +244,10 @@ async def parse_message(text: str, chat_title: str = None) -> dict:
         
         text_resp = response.text.strip()
         parsed_json = json.loads(text_resp)
-                
+
+        if content_cache.is_cacheable(parsed_json):
+            await asyncio.to_thread(content_cache.put, cache_key, 'message', parsed_json)
+
         return parsed_json
     except Exception as e:
         logger.error(f"Error calling Gemini API: {e}")

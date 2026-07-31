@@ -7,6 +7,7 @@ import pypdf
 from google import genai
 from google.genai import types
 
+from app import content_cache
 from app.gemini_parser import (
     client,
     SYSTEM_PROMPT,
@@ -66,6 +67,16 @@ async def parse_pdf_document(pdf_path: str, chat_title: Optional[str] = None) ->
     if not client:
         return {"is_relevant": False, "error": "Gemini API client not initialized"}
 
+    # Тот же PDF мог прийти повторно (пересланный Dev Kit, повторный скан
+    # чата) — графический разбор через Files API самый дорогой вызов в
+    # проекте, проверяем кэш по содержимому файла до загрузки.
+    file_hash = await asyncio.to_thread(content_cache.hash_file, pdf_path)
+    cached = await asyncio.to_thread(content_cache.get, file_hash)
+    if cached is not None:
+        logger.info(f"💾 Cache hit for PDF {os.path.basename(pdf_path)} (hash={file_hash[:12]}...), skipping upload")
+        return cached
+    logger.info(f"Cache miss for PDF hash={file_hash[:12]}..., uploading to Gemini Files API")
+
     try:
         uploaded_file = await asyncio.to_thread(client.files.upload, file=pdf_path)
         
@@ -87,8 +98,12 @@ async def parse_pdf_document(pdf_path: str, chat_title: Optional[str] = None) ->
         
         text_resp = response.text.strip()
         parsed_json = json.loads(text_resp)
+
+        if content_cache.is_cacheable(parsed_json):
+            await asyncio.to_thread(content_cache.put, file_hash, 'pdf_graphic', parsed_json)
+
         return parsed_json
-        
+
     except Exception as e:
         logger.error(f"Ошибка мультимодального анализа PDF: {e}")
         return {"is_relevant": False, "error": str(e)}

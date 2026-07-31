@@ -24,7 +24,25 @@ class TestGraphicPdfPath(unittest.TestCase):
     NameError. Ошибку глотал широкий except, наружу уходило
     {"is_relevant": False, ...} — то есть Dev Kit'ы без текстового слоя
     молча не парсились никогда.
+
+    Эта ветка теперь проверяет content_cache перед загрузкой в Gemini Files
+    API (см. app/content_cache.py). _make_pdf() создает файл с одинаковыми
+    байтами при каждом вызове, поэтому без изоляции кэш-БД второй прогон
+    этого же теста (в этом же файле или в другом) получал бы попадание в
+    реальный data/gemini_cache.db и mock upload переставал вызываться —
+    тест ловил бы не регрессию, а собственный кэш.
     """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = patch.dict(
+            os.environ, {'GEMINI_CACHE_DB_PATH': os.path.join(self._tmpdir.name, 'cache.db')}
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
 
     def test_asyncio_is_importable_in_module(self):
         self.assertTrue(hasattr(doc_parser, 'asyncio'),
