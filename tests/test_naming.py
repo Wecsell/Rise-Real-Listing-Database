@@ -57,6 +57,11 @@ REAL_NAMES = [
     'N Studio Living Seseh Project', 'MARKOV GROUP Project',
     'Ayu Office Development', 'CARE ESTATE', 'Seseh Sense',
     'LASALAHORA RESORT GARDENS', 'Чумаги Апартментс',
+    # Найдены на 234-проектной базе после переноса из Base RR New (Copy):
+    # декоративное прилагательное рядом с настоящим именем ложно превращало
+    # его в заглушку целиком, а не вычиталось как одно мусорное слово.
+    'Amali Luxury Residence', 'Beraban Luxury Lofts',
+    'Exclusive Villas Collection - The Samahadi',
 ]
 
 

@@ -54,12 +54,20 @@ _TYPE_WORDS = {
     'вилла', 'виллы', 'апартаменты', 'проект', 'студия', 'дом',
 }
 
-# Рекламные и описательные обороты вместо имени
+# Структурные обороты: они описывают тип сделки/листинга, а не название,
+# поэтому ловятся безусловно, где бы ни встретились в строке.
 _MARKETING_MARKERS = (
     'for sale', 'for lease', 'for rent', 'leasehold', 'freehold',
-    'luxury', 'designer', 'brand new', 'best ', 'exclusive',
+    'brand new', 'best ',
     'over contract', 'local developer', 'property by',
 )
+
+# Декоративные прилагательные — не безусловный маркер. В рекламе Бали они
+# сплошь и рядом стоят РЯДОМ с настоящим именем ('Amali Luxury Residence',
+# 'Beraban Luxury Lofts', 'Exclusive Villas Collection'), и безусловный запрет
+# на них ложно превращал настоящие названия в заглушки. Слово вычитается как
+# мусорное — так же, как 'villa' или 'project' — а не убивает всю строку.
+_DECORATIVE_ADJECTIVES = {'luxury', 'designer', 'exclusive'}
 
 # Описание юнита вместо названия проекта: '1-Bed Villa with Pool', '4-Bedroom Villa'
 _UNIT_DESCRIPTION = re.compile(
@@ -99,7 +107,7 @@ def is_placeholder_name(name: Optional[str]) -> bool:
     if not words:
         return True
 
-    junk = set(_GENERIC_WORDS)
+    junk = set(_GENERIC_WORDS) | _DECORATIVE_ADJECTIVES
     if any(w in _TYPE_WORDS for w in words):
         junk |= _DISTRICT_WORDS
 
