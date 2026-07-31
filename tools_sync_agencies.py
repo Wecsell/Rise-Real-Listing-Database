@@ -55,14 +55,14 @@ def api(path, data=None, method='GET'):
     url = f'https://api.airtable.com/v0/{path}'
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
-    return json.load(urllib.request.urlopen(req))
+    return json.load(urllib.request.urlopen(req, timeout=20))
 
 
 def meta(path, data=None, method='GET'):
     url = f'https://api.airtable.com/v0/meta/bases/{BASE}/{path}'
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
-    return json.load(urllib.request.urlopen(req))
+    return json.load(urllib.request.urlopen(req, timeout=20))
 
 
 def ensure_fields():

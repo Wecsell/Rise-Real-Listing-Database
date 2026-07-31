@@ -52,7 +52,7 @@ def fetch_agencies():
         if offset:
             params['offset'] = offset
         url = f'https://api.airtable.com/v0/{BASE}/Agencies?' + urllib.parse.urlencode(params)
-        data = json.load(urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS)))
+        data = json.load(urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=20))
         records += data['records']
         offset = data.get('offset')
         if not offset:
@@ -79,7 +79,7 @@ def patch(rec_id, fields):
     req = urllib.request.Request(url, data=json.dumps({'fields': fields}).encode(),
                                  headers=HEADERS, method='PATCH')
     try:
-        urllib.request.urlopen(req)
+        urllib.request.urlopen(req, timeout=20)
         return True
     except urllib.error.HTTPError as e:
         print(f'      ОШИБКА {e.code}: {e.read().decode()[:160]}')
