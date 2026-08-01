@@ -32,6 +32,12 @@ load_dotenv()
 from google import genai
 from google.genai import types
 
+# Проверка цитат живёт в app/citations.py: тот же код сторожит боевую запись
+# в базу (Э2, извлечение полей). Держать здесь вторую копию нельзя - разойдётся
+# с проверенной версией, а именно эта функция четыре раза подряд оказывалась
+# причиной мнимого «провала модели».
+from app.citations import normalize, check_quotes
+
 CASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "tests", "fixtures", "model_traps", "cases.json")
 
@@ -57,56 +63,6 @@ Rules:
 Return strictly this JSON:
 {"answer": "<short answer>", "quotes": ["<verbatim fragment>", "..."], "confidence": <0.0-1.0>}
 """
-
-
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip().lower()
-
-
-def check_quotes(quotes, source: str) -> str:
-    """
-    Трёхуровневая проверка цитат: 'ok' | 'spliced' | 'bad'.
-
-    Список, а не одна строка: составной ответ (два документа, шапка таблицы плюс
-    строка данных) честно требует нескольких фрагментов. Ранняя версия принимала
-    только одну цитату и отвергала корректные составные ответы - измерялся дефект
-    бенчмарка, а не поведение модели.
-
-    Три уровня, а не два, потому что у таблиц дословная непрерывная цитата
-    структурно невозможна: при извлечении текста из PDF двумерная структура
-    теряется, заголовок колонки и значение расходятся далеко друг от друга.
-      ok      - фрагмент встречается в источнике дословно и подряд
-      spliced - все слова фрагмента есть в источнике, но не подряд (нормально
-                для таблиц, подозрительно для связного текста)
-      bad     - слов нет в источнике вовсе, то есть выдумка
-    """
-    if isinstance(quotes, str):
-        quotes = [quotes] if quotes else []
-    if not quotes:
-        return "bad"
-    src = normalize(source)
-    src_tokens = set(re.findall(r"[\wÀ-￿]+", src))
-
-    # Порог длины - суммарный, а не на каждую цитату. Значение ячейки таблицы
-    # коротко по своей природе ("580", "M²"): персональный минимум в 6 символов
-    # браковал настоящие дословные цитаты как выдумку. Суммарный порог по-прежнему
-    # отсекает ответ, подпёртый одним союзом, но не наказывает за краткость.
-    if sum(len(normalize(str(q))) for q in quotes) < 10:
-        return "bad"
-
-    worst = "ok"
-    for q in quotes:
-        qn = normalize(str(q))
-        if not qn:
-            return "bad"
-        if qn in src:
-            continue
-        tokens = re.findall(r"[\wÀ-￿]+", qn)
-        if tokens and all(t in src_tokens for t in tokens):
-            worst = "spliced"
-        else:
-            return "bad"
-    return worst
 
 
 def nums(s: str):
