@@ -22,6 +22,9 @@ data/
 *.swp
 .env
 
+# OAuth-секреты для зеркала Google Drive (Э6, implementation_plan.md)
+gdrive_client_secret.json
+
 # Выгрузки базы и разовые экспорты: содержат данные клиентов и быстро устаревают.
 # Схему читаем из живой базы (app/schema_check.py), а не из сохраненного файла.
 dump*.json

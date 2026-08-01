@@ -94,9 +94,11 @@ async def scan_chat_metadata_and_history(client, chat_entity, limit=100):
             
         # Проверяем ссылки из сообщения
         urls = parsed_data.get("detected_urls", [])
+        mirror_project_name = (parsed_data.get("Projects", {}) or {}).get("Project Name")
         for url in urls:
             await process_generic_link(
-                url, message.id, chat_entity.id, chat_title=chat_title
+                url, message.id, chat_entity.id, chat_title=chat_title,
+                project_name=mirror_project_name,
             )
 
     logger.info(f"✅ Finished scan for '{chat_title}'. Scanned {scanned_count} messages, found {relevant_count} relevant.")

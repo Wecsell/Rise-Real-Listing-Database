@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import json
+import re
 import telethon
 import requests
 from telethon import TelegramClient, events
@@ -27,11 +28,44 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 logger = logging.getLogger("Listener")
 
-PRE_FILTER_KEYWORDS = {"villa", "usd", "$", "спальн", "freehold", "leasehold", "проект", "девелопер", "project", "developer", "цена", "price", "are", "вилла", "апартамент", "apartment", "unit", "rp", "juta"}
+PRE_FILTER_KEYWORDS = {"villa", "usd", "$", "спальн", "freehold", "leasehold", "проект", "девелопер", "project", "developer", "цена", "price", "вилла", "апартамент", "apartment", "unit", "rp", "juta"}
+
+# Ключевые слова короче 4 символов ("usd", "rp") почти гарантированно совпадают
+# как подстрока внутри обычных слов ("prepare", "used") - найдено 2026-08-01:
+# 6 из 14 тестовых сообщений без единого признака недвижимости проходили фильтр.
+# Матчим латиницу по границе слова; "$" - не буквенный символ, граница слова
+# к нему не применима, оставляем подстрокой (сама по себе редко встречается
+# вне сумм). Кириллица НАМЕРЕННО остаётся подстрокой отдельно от латиницы:
+# у русских существительных именительный падеж без окончания - это корень, и
+# подстрока специально ловит все падежи ("проект" -> "проекта", "проекте",
+# "проектов"). Граница слова это ломает - "проект" почти никогда не стоит в
+# тексте отдельным словом. Английские короткие слова такой природы не имеют.
+_WORD_KEYWORDS = {kw for kw in PRE_FILTER_KEYWORDS
+                  if kw.isalnum() and kw.isascii()}
+_STEM_KEYWORDS = {kw for kw in PRE_FILTER_KEYWORDS
+                  if kw.isalnum() and not kw.isascii()}
+_SYMBOL_KEYWORDS = PRE_FILTER_KEYWORDS - _WORD_KEYWORDS - _STEM_KEYWORDS
+_WORD_PATTERN = re.compile(
+    r'\b(?:' + '|'.join(re.escape(kw) for kw in _WORD_KEYWORDS) + r')\b',
+    re.IGNORECASE
+) if _WORD_KEYWORDS else None
+
+# "are" (единица площади земли, 1 are = 100 m2, обиходная в индонезийской
+# недвижимости: "6 are" = 600 m2) убрана из PRE_FILTER_KEYWORDS отдельно от
+# остальных слов: даже с границей слова это самый обычный английский глагол
+# ("how are you", "we are on our way") - граница слова не спасает, когда
+# ложное совпадение само является отдельным словом. Ловим только рядом с числом.
+_ARE_UNIT_PATTERN = re.compile(r'\b\d+([.,]\d+)?\s*are\b', re.IGNORECASE)
 
 def passes_prefilter(text: str) -> bool:
     text_lower = text.lower()
-    return any(kw in text_lower for kw in PRE_FILTER_KEYWORDS)
+    if any(sym in text_lower for sym in _SYMBOL_KEYWORDS):
+        return True
+    if any(stem in text_lower for stem in _STEM_KEYWORDS):
+        return True
+    if _WORD_PATTERN and _WORD_PATTERN.search(text):
+        return True
+    return bool(_ARE_UNIT_PATTERN.search(text))
 
 async def notify_admin(client, message):
     alert_token = os.environ.get('ALERT_BOT_TOKEN')
@@ -55,7 +89,6 @@ async def notify_admin(client, message):
 
 API_ID = os.environ.get('TG_API_ID')
 API_HASH = os.environ.get('TG_API_HASH')
-DRY_RUN = os.environ.get('DRY_RUN', '1') == '1'
 ONLY_GROUPS = os.environ.get('ONLY_GROUPS', '1') == '1'
 ALLOWED_KEYWORDS = [kw.strip().lower() for kw in os.environ.get('CHAT_KEYWORDS', '').split(',') if kw.strip()]
 ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if cid.strip()]
@@ -162,10 +195,15 @@ async def main():
                 # Переходим по найденным ссылкам
                 urls = parsed_data.get("detected_urls", [])
                 if urls:
+                    # "UNKNOWN" - заглушка для save_extraction, не настоящее имя
+                    # проекта. Передавать её в зеркало Drive нельзя - файлы из
+                    # разных ещё не распознанных проектов легли бы в одну папку.
+                    mirror_project_name = project_name if project_name != "UNKNOWN" else None
                     for url in urls:
                         logger.info(f"🔗 Detected URL: {url}")
                         link_result = await process_generic_link(
-                            url, msg_id, chat_id, chat_title=chat_title
+                            url, msg_id, chat_id, chat_title=chat_title,
+                            project_name=mirror_project_name,
                         )
                         if link_result.get("is_private"):
                             logger.warning(
