@@ -41,6 +41,34 @@ def _list_children(service, folder_id: str) -> List[Dict[str, Any]]:
     return files
 
 
+def download_drive_file(file_id: str, dest_path: str) -> bool:
+    """
+    Скачивает файл с Drive по id через OAuth-клиент владельца.
+
+    Не через публичный URL (download_file_from_url в link_fetcher): у файла в
+    папке застройщика доступ бывает «по ссылке для тех, у кого есть ссылка»,
+    и анонимный GET на него отдаёт HTML логина, а не документ. Авторизованный
+    вызов API работает там же, где сработал листинг.
+
+    Вызывающий обязан удалить файл сразу после извлечения (правило проекта:
+    временные файлы не задерживаются на диске).
+    """
+    from googleapiclient.http import MediaIoBaseDownload
+
+    service = get_drive_service()
+    try:
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with open(dest_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        return True
+    except HttpError as e:
+        logger.error(f"Не удалось скачать файл Drive {file_id}: {e}")
+        return False
+
+
 def list_drive_folder_recursive(
     folder_id: str, max_depth: int = 5, _depth: int = 0, _visited: Optional[set] = None,
     _path: str = "",
