@@ -2,6 +2,7 @@ try:
     import asyncpg
 except ImportError:
     asyncpg = None
+import asyncio
 import os
 import logging
 import json
