@@ -77,10 +77,9 @@ _NOTION_ID_RE = re.compile(r'([0-9a-fA-F]{32})(?:[?#]|$)')
 def extract_notion_page_id(url: str) -> Optional[str]:
     """
     Достаёт id страницы из URL и приводит к формату с дефисами (8-4-4-4-12),
-    которого ждёт внутренний API Notion. У "голой" корневой ссылки вида
-    domain.notion.site/?pvs=73 id в URL нет вообще - HTML такой страницы это
-    просто оболочка приложения без единого UUID (проверено вручную), для неё
-    функция возвращает None и вызывающий код должен уйти в фолбэк.
+    которого ждёт внутренний API Notion. Если id в пути нет (ссылка со slug
+    вида domain.notion.site/elysiumgroupbali или "голая" domain.notion.site/?pvs=73),
+    возвращает None - дальше пробуется resolve_notion_page_id_from_html().
     """
     path = urllib.parse.urlparse(url).path
     m = _NOTION_ID_RE.search(path + '?')
@@ -88,6 +87,44 @@ def extract_notion_page_id(url: str) -> Optional[str]:
         return None
     raw = m.group(1)
     return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+
+# UUID в нижнем регистре: настоящие id страниц Notion всегда такие.
+_NOTION_HTML_UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+# Константа, присутствующая в HTML ЛЮБОЙ страницы Notion (проверено на четырёх
+# разных сайтах застройщиков - один и тот же UUID, в верхнем регистре).
+# Регистром отличать нельзя: полагаться на него хрупко, поэтому исключаем явно.
+_NOTION_CONSTANT_UUID = "ea76605a-f565-4b17-a496-34435622a1eb"
+
+async def resolve_notion_page_id_from_html(url: str) -> Optional[str]:
+    """
+    Достаёт id страницы из HTML, когда в URL его нет.
+
+    Notion - SPA, и раньше считалось, что её HTML это универсальная оболочка без
+    единого UUID (так и есть для "голой" корневой ссылки domain.notion.site/?pvs=73).
+    Но у ссылок со slug в пути (domain.notion.site/elysiumgroupbali) HTML содержит
+    настоящий id страницы - проверено на живых ссылках из базы, разбор по этому id
+    вернул реальный контент (4858 символов у x-hotel-nuanu). Это закрывает
+    большинство нерезолвящихся ссылок без headless-браузера.
+
+    Для по-настоящему голой корневой ссылки вернёт None: там в HTML только
+    общая для всех страниц константа Notion, id взять неоткуда.
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            res = await client.get(url)
+        if res.status_code != 200:
+            return None
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить HTML страницы Notion {url}: {e}")
+        return None
+
+    for candidate in _NOTION_HTML_UUID_RE.findall(res.text):
+        if candidate != _NOTION_CONSTANT_UUID:
+            logger.info(f"🔎 id страницы Notion взят из HTML: {candidate} ({url})")
+            return candidate
+    return None
 
 def _notion_rich_text_to_text_and_links(rich_text) -> Tuple[str, List[str]]:
     """Разбирает rich-text Notion: список [текст, [[метка, ...]]]. Метка 'a' - ссылка."""
@@ -248,16 +285,17 @@ async def fetch_notion_content(url: str) -> Tuple[Optional[str], List[str], bool
     реальной ссылке: 95 символов "Notion JavaScript must be enabled..."). Внутренний
     API того же React-приложения отвечает 200 без авторизации на публичных страницах.
 
-    "Голая" корневая ссылка (domain.notion.site/?pvs=73, без id в пути) этим путём не
-    читается - id страницы взять неоткуда, HTML такой ссылки не содержит ни одного UUID.
-    Для неё нужен браузерный фолбэк (Э1a в плане, не реализован); здесь возвращается
-    is_private=False с пустым текстом, и вызывающий код обязан зафиксировать это в Gaps,
-    а не молча продолжить как будто источник прочитан.
+    Если id нет в пути (ссылка со slug), он ищется в HTML - см.
+    resolve_notion_page_id_from_html(). Не резолвится только по-настоящему "голая"
+    корневая ссылка (domain.notion.site/?pvs=73): в её HTML нет ни одного UUID, кроме
+    общей для всех страниц константы. Для неё остаётся браузерный фолбэк (Э1a, не
+    реализован); здесь возвращается is_private=False с пустым текстом, и вызывающий код
+    обязан зафиксировать это в Gaps, а не молча продолжить как будто источник прочитан.
     """
     domain = urllib.parse.urlparse(url).netloc
-    page_id = extract_notion_page_id(url)
+    page_id = extract_notion_page_id(url) or await resolve_notion_page_id_from_html(url)
     if not page_id:
-        logger.warning(f"⚠️ Notion-ссылка без id страницы в пути, нужен браузерный фолбэк: {url}")
+        logger.warning(f"⚠️ Notion-ссылка без id страницы ни в пути, ни в HTML: {url}")
         return None, [], False
 
     try:

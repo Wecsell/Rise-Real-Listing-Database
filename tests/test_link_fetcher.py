@@ -2,7 +2,7 @@ import unittest
 import asyncio
 import os
 import sys
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -14,6 +14,7 @@ from app.link_fetcher import (
     process_generic_link,
     download_file_from_url,
     extract_notion_page_id,
+    resolve_notion_page_id_from_html,
     fetch_notion_content,
     _notion_rich_text_to_text_and_links,
     _walk_notion_blocks,
@@ -620,15 +621,92 @@ class TestFetchNotionContentPagination(unittest.TestCase):
         asyncio.run(run_test())
 
     def test_bare_root_link_returns_no_content_without_crashing(self):
+        """
+        По-настоящему голая корневая ссылка: id нет ни в пути, ни в HTML
+        (там только общая для всех страниц константа Notion). Должна честно
+        вернуть пустоту, а не упасть и не выдать мусор.
+        """
         async def run_test():
-            text, nested, is_private = await fetch_notion_content(
-                "https://fourpalmsvillaskedungu.notion.site/?pvs=73"
-            )
+            with patch('app.link_fetcher.resolve_notion_page_id_from_html',
+                       new=AsyncMock(return_value=None)):
+                text, nested, is_private = await fetch_notion_content(
+                    "https://fourpalmsvillaskedungu.notion.site/?pvs=73"
+                )
             self.assertIsNone(text)
             self.assertEqual(nested, [])
             self.assertFalse(is_private)
 
         asyncio.run(run_test())
+
+    def test_slug_link_resolves_page_id_from_html(self):
+        """
+        Ссылка со slug вместо id (domain.notion.site/elysiumgroupbali) - таких
+        в живой базе большинство среди нерезолвящихся. Раньше отбрасывалась
+        как безнадёжная вместе с голой корневой; на деле её id лежит в HTML.
+        """
+        async def run_test():
+            with patch('app.link_fetcher.resolve_notion_page_id_from_html',
+                       new=AsyncMock(return_value="23a783ac-d377-8053-8b3c-d53723ed054c")) as mock_resolve, \
+                 patch('app.link_fetcher._fetch_notion_block_tree',
+                       new=AsyncMock(return_value={
+                           "23a783ac-d377-8053-8b3c-d53723ed054c": {
+                               "value": {"value": {
+                                   "id": "23a783ac-d377-8053-8b3c-d53723ed054c",
+                                   "type": "page",
+                                   "properties": {"title": [["Elysium Group"]]},
+                                   "content": [],
+                               }}
+                           }
+                       })):
+                text, nested, is_private = await fetch_notion_content(
+                    "https://checkered-twister-bc5.notion.site/elysiumgroupbali"
+                )
+            mock_resolve.assert_awaited_once()
+            self.assertIn("Elysium Group", text)
+            self.assertFalse(is_private)
+
+        asyncio.run(run_test())
+
+
+class TestNotionPageIdFromHtml(unittest.TestCase):
+    """
+    resolve_notion_page_id_from_html(): HTML любой страницы Notion содержит одну
+    и ту же константу-UUID (проверено на четырёх разных сайтах застройщиков).
+    Настоящий id страницы - это второй, уникальный UUID; если его нет, ссылка
+    действительно нерезолвима без браузера.
+    """
+
+    CONST = "EA76605A-F565-4B17-A496-34435622A1EB"
+
+    def _html(self, *uuids):
+        return "<html>" + " ".join(f'"{u}"' for u in uuids) + "</html>"
+
+    def _run_with_html(self, html, status=200):
+        async def run_test():
+            fake_res = MagicMock(status_code=status, text=html)
+            fake_client = MagicMock()
+            fake_client.get = AsyncMock(return_value=fake_res)
+            fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+            fake_client.__aexit__ = AsyncMock(return_value=False)
+            with patch('httpx.AsyncClient', return_value=fake_client):
+                return await resolve_notion_page_id_from_html("https://x.notion.site/slug")
+
+        return asyncio.run(run_test())
+
+    def test_unique_uuid_is_returned(self):
+        real = "23a783ac-d377-8053-8b3c-d53723ed054c"
+        self.assertEqual(self._run_with_html(self._html(self.CONST, real)), real)
+
+    def test_constant_only_means_unresolvable(self):
+        """Голая корневая: кроме константы UUID нет - id взять неоткуда."""
+        self.assertIsNone(self._run_with_html(self._html(self.CONST)))
+
+    def test_constant_is_not_returned_even_if_it_comes_first(self):
+        real = "23898b94-160e-80f6-be4d-c696dee46d7f"
+        self.assertNotEqual(self._run_with_html(self._html(self.CONST, real)), self.CONST.lower())
+
+    def test_http_error_returns_none_not_crash(self):
+        self.assertIsNone(self._run_with_html("<html></html>", status=404))
 
 
 class TestAllNestedNotionLinksAreVisited(unittest.TestCase):
