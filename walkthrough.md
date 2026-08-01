@@ -121,11 +121,10 @@ python -m app.schema_check   # должно быть "Схема согласо�
 
 ---
 
-## 01.08.2026: Э1a (Notion), Э1/Э6 (Google Drive) — черновик implementation_plan.md,
-## код ещё не закоммичен
+## 01.08.2026: Э1a (Notion), Э1/Э6 (Google Drive)
 
-Прогон: **546 passed** (`python -m pytest tests/ -q`). Всё ниже — untracked/modified
-файлы, не в git, план читать в `implementation_plan.md`.
+Прогон: **546 passed** (`python -m pytest tests/ -q`). Закоммичено и запушено
+(`b53a496`, `18b794c`). План — `implementation_plan.md`.
 
 **Э1a, чтение Notion — было полностью нерабочим, починено.** `fetch_notion_content()`
 раньше ловила JS-заглушку SPA (95 символов, «Notion JavaScript must be enabled»),
@@ -134,10 +133,9 @@ Notion (`loadCachedPageChunkV2`, без авторизации на публич
 на реальной странице Four Palms: 6516 символов, 6/6 Drive-папок найдено (было 95
 символов и ноль ссылок). Ключевая ловушка: `cursor: null` в первом ответе не значит
 «дерево полное» — нужна пагинация по `cursor.stack`, иначе теряются именно ссылки на
-Drive (проверено регрессионным тестом). Не реализован: фолбэк для «голой» корневой
-ссылки без id в пути (`domain.notion.site/?pvs=73`) — сегодня в живую обошёл вручную
-через браузер (см. ниже), нужен headless-браузер, чтобы бот делал это сам.
-25 тестов, `tests/test_link_fetcher.py`.
+Drive (проверено регрессионным тестом). Ссылки без id в пути разбираются резолвом
+через HTML — см. ниже; браузер остался нужен только для по-настоящему голой корневой
+ссылки. 31 тест, `tests/test_link_fetcher.py`.
 
 **Э1, листинг папок Drive — реализовано.** `app/drive_folder.py`:
 `list_drive_folder_recursive()`, разыменование ярлыков, кап глубины + `visited` от
