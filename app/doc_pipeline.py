@@ -145,6 +145,7 @@ async def run_for_project(
     project_name: str,
     drive_files: List[Dict[str, Any]],
     budget: int = DEFAULT_OPEN_BUDGET,
+    write_gaps: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     То же самое, но карточка берётся из живой базы по имени проекта.
@@ -173,6 +174,9 @@ async def run_for_project(
     )
     summary["project_id"] = record["id"]
     summary["project_name"] = record.get("fields", {}).get("Project Name")
+
+    if write_gaps:
+        await save_findings_to_gaps(record["id"], summary)
     return summary
 
 
@@ -180,3 +184,91 @@ def _find_project_record(ac, project_name: str) -> Optional[Dict[str, Any]]:
     """Поиск карточки тем же нечётким сопоставлением, что и весь остальной код."""
     ac.init_cache()
     return ac.find_project_by_query(project_name, ac.CACHE_PROJECTS)
+
+
+# Границы секции бота внутри поля Gaps. В Gaps уже лежат рукописные разборы
+# (у Four Palms - подробный отчёт с номерами регистраций и именами), и затирать
+# их нельзя ни при каких условиях. Бот владеет только текстом между маркерами.
+GAPS_SECTION_START = "--- AUTO: разбор документов (бот) ---"
+GAPS_SECTION_END = "--- /AUTO ---"
+
+
+def format_findings_block(summary: Dict[str, Any]) -> str:
+    """
+    Текст секции бота. Предложения помечены именно как предложения: значения
+    попадают в поля только после Confirmed, и человек, читающий Gaps, должен
+    видеть разницу между «нашли и записали» и «нашли, подтвердите».
+    """
+    lines = [GAPS_SECTION_START]
+
+    proposals = summary.get("proposals") or []
+    if proposals:
+        lines.append("ПРЕДЛОЖЕНО (требует подтверждения, в поля не записано):")
+        for p in proposals:
+            mark = " [юр. поле, только с Confirmed]" if p.get("needs_human") else ""
+            lines.append(f"  {p['field']} = {p['value']}{mark}")
+            lines.append(f"      источник: {p.get('source_file')}, цитата: {p.get('citation')}")
+            for q in (p.get("quotes") or [])[:2]:
+                lines.append(f"      «{str(q)[:120]}»")
+
+    gaps = summary.get("gaps") or []
+    if gaps:
+        lines.append("НЕ ЗАКРЫТО документами:")
+        for g in gaps:
+            lines.append(f"  - {g}")
+
+    if not proposals and not gaps:
+        lines.append("  разбор не дал ни предложений, ни новых пробелов")
+
+    lines.append(f"(открыто документов: {summary.get('opened', 0)})")
+    lines.append(GAPS_SECTION_END)
+    return "\n".join(lines)
+
+
+def merge_into_gaps(existing: Optional[str], block: str) -> str:
+    """
+    Вставляет секцию бота в существующий текст Gaps, заменяя ТОЛЬКО свою
+    предыдущую секцию. Рукописный текст вокруг остаётся нетронутым, повторный
+    прогон не плодит копии.
+    """
+    existing = existing or ""
+    start = existing.find(GAPS_SECTION_START)
+    if start == -1:
+        return (existing.rstrip() + "\n\n" + block).strip()
+
+    end = existing.find(GAPS_SECTION_END, start)
+    if end == -1:
+        # Секция открыта, но не закрыта (обрезали руками) - заменяем до конца.
+        return (existing[:start].rstrip() + "\n\n" + block).strip()
+
+    tail = existing[end + len(GAPS_SECTION_END):]
+    return (existing[:start].rstrip() + "\n\n" + block + tail.rstrip()).strip()
+
+
+async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> bool:
+    """
+    Записывает секцию бота в поле Gaps карточки проекта.
+
+    Пишется ТОЛЬКО Gaps: сами поля карточки не трогаются, значения доезжают до
+    них после Confirmed. Существующий текст Gaps сохраняется целиком.
+    """
+    import app.airtable_client as ac
+
+    def _write():
+        table = ac.get_base().table("Projects")
+        record = table.get(project_id)
+        current = (record.get("fields", {}) or {}).get("Gaps")
+        merged = merge_into_gaps(current, format_findings_block(summary))
+        if merged == (current or "").strip():
+            return False
+        table.update(project_id, {"Gaps": merged})
+        return True
+
+    try:
+        changed = await asyncio.to_thread(_write)
+        if changed:
+            logger.info(f"📝 Gaps обновлены для карточки {project_id}")
+        return changed
+    except Exception as e:
+        logger.error(f"Не удалось записать Gaps для {project_id}: {e}")
+        return False

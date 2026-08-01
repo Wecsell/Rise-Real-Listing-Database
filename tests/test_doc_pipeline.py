@@ -6,7 +6,14 @@ from unittest.mock import patch, AsyncMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app.doc_pipeline import empty_required_fields, fill_fields_from_drive_files
+from app.doc_pipeline import (
+    GAPS_SECTION_START,
+    empty_required_fields,
+    fill_fields_from_drive_files,
+    format_findings_block,
+    merge_into_gaps,
+    save_findings_to_gaps,
+)
 
 
 def _f(name, mime="application/pdf", path="", fid=None):
@@ -158,6 +165,92 @@ class TestPipelineWiring(unittest.TestCase):
         )
         self.assertEqual(res["_calls"], [])
         self.assertEqual(res["opened"], 0)
+
+
+class TestGapsMerging(unittest.TestCase):
+    """
+    В Gaps уже лежат рукописные разборы (у Four Palms - отчёт с номерами
+    регистраций и именами). Бот владеет только своей секцией между маркерами
+    и не имеет права затирать текст человека.
+    """
+
+    HUMAN = ("MISSING - ask agent (Seacrest / @NabillaRauter):\n"
+             "1. Handover Permits: intentionally left EMPTY. Evidence not conclusive.")
+
+    def _summary(self, value="PBG"):
+        return {"proposals": [{"field": "Handover Permits", "value": value,
+                               "citation": "ok", "quotes": ["PBG issued"],
+                               "needs_human": True, "source_file": "PBG.pdf"}],
+                "gaps": ["Land Zoning Color: not stated"], "opened": 1}
+
+    def test_human_text_survives_first_write(self):
+        merged = merge_into_gaps(self.HUMAN, format_findings_block(self._summary()))
+        self.assertIn("MISSING - ask agent", merged)
+        self.assertIn("Handover Permits = PBG", merged)
+
+    def test_repeated_run_replaces_only_bot_section(self):
+        """Повторный прогон не плодит копии и не трогает текст человека."""
+        first = merge_into_gaps(self.HUMAN, format_findings_block(self._summary("PBG")))
+        second = merge_into_gaps(first, format_findings_block(self._summary("PBG/SLF")))
+
+        self.assertEqual(second.count(GAPS_SECTION_START), 1)
+        self.assertIn("MISSING - ask agent", second)
+        self.assertIn("PBG/SLF", second)
+        self.assertNotIn("Handover Permits = PBG\n", second.replace("PBG/SLF", "X"))
+
+    def test_text_after_bot_section_is_preserved(self):
+        existing = (self.HUMAN + "\n\n" + format_findings_block(self._summary())
+                    + "\n\nЗаметка человека, дописанная ПОСЛЕ секции бота.")
+        merged = merge_into_gaps(existing, format_findings_block(self._summary("X")))
+        self.assertIn("дописанная ПОСЛЕ", merged)
+        self.assertIn("MISSING - ask agent", merged)
+
+    def test_unclosed_section_does_not_eat_the_rest(self):
+        broken = self.HUMAN + "\n\n" + GAPS_SECTION_START + "\nоборванная секция"
+        merged = merge_into_gaps(broken, format_findings_block(self._summary()))
+        self.assertIn("MISSING - ask agent", merged)
+        self.assertEqual(merged.count(GAPS_SECTION_START), 1)
+
+    def test_proposals_are_labelled_as_proposals_not_values(self):
+        """Человек должен видеть разницу между «записали» и «подтвердите»."""
+        block = format_findings_block(self._summary())
+        self.assertIn("в поля не записано", block)
+        self.assertIn("только с Confirmed", block)
+
+    def test_empty_result_still_writes_an_honest_line(self):
+        block = format_findings_block({"proposals": [], "gaps": [], "opened": 0})
+        self.assertIn("не дал ни предложений", block)
+
+
+class TestGapsWriteSafety(unittest.TestCase):
+
+    def test_only_gaps_field_is_written(self):
+        """Значения полей карточки не трогаются - они доезжают после Confirmed."""
+        updates = {}
+
+        class FakeTable:
+            def get(self, rec_id):
+                return {"id": rec_id, "fields": {"Gaps": "human text", "District": "Tabanan"}}
+
+            def update(self, rec_id, fields):
+                updates.update(fields)
+
+        class FakeBase:
+            def table(self, name):
+                return FakeTable()
+
+        async def run_test():
+            with patch('app.airtable_client.get_base', return_value=FakeBase()):
+                return await save_findings_to_gaps("rec1", {
+                    "proposals": [{"field": "District", "value": "Badung", "citation": "ok",
+                                   "quotes": [], "needs_human": False, "source_file": "x.pdf"}],
+                    "gaps": [], "opened": 1,
+                })
+
+        asyncio.run(run_test())
+        self.assertEqual(set(updates.keys()), {"Gaps"},
+                         "запись должна касаться только Gaps")
+        self.assertIn("human text", updates["Gaps"])
 
 
 if __name__ == '__main__':
