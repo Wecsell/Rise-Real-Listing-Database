@@ -436,6 +436,22 @@ async def process_generic_link(
                     except Exception as mirror_err:
                         logger.error(f"Ошибка зеркалирования Google Drive {url_clean}: {mirror_err}")
                         result["gaps"].append(f"Google Drive mirror failed: {url_clean}")
+
+                    # Э2: разбор документов под ПУСТЫЕ поля карточки. Предложения
+                    # никуда не записываются - их судьбу решает Confirmed (Э4).
+                    try:
+                        from app.doc_pipeline import run_for_project
+                        docs = await run_for_project(project_name, files)
+                        if docs:
+                            result["doc_findings"] = docs
+                            result["gaps"].extend(docs.get("gaps", []))
+                            logger.info(
+                                f"📄 Документы {url_clean}: {len(docs['proposals'])} предложений "
+                                f"по пустым полям, открыто {docs['opened']}"
+                            )
+                    except Exception as doc_err:
+                        logger.error(f"Ошибка разбора документов из {url_clean}: {doc_err}")
+                        result["gaps"].append(f"Document parsing failed: {url_clean}")
             except RuntimeError as e:
                 # OAuth к личному Drive ещё не настроен (tools_drive_auth_setup.py
                 # не запускали) - это ожидаемое состояние до Э6, не повод падать.

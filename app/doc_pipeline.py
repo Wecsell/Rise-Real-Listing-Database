@@ -139,3 +139,44 @@ async def fill_fields_from_drive_files(
         f"{len(gaps)} пробелов, поля без ответа: {sorted(still_empty)}"
     )
     return {"proposals": proposals, "gaps": gaps, "opened": opened}
+
+
+async def run_for_project(
+    project_name: str,
+    drive_files: List[Dict[str, Any]],
+    budget: int = DEFAULT_OPEN_BUDGET,
+) -> Optional[Dict[str, Any]]:
+    """
+    То же самое, но карточка берётся из живой базы по имени проекта.
+
+    Нужна отдельная функция, потому что вызывающий код (link_fetcher) знает имя
+    проекта, но не его текущие поля - а без них нельзя понять, что пусто, и
+    роутер начнёт открывать документы под уже заполненные поля.
+
+    Возвращает None, если проект в базе не найден: открывать документы «на
+    всякий случай», не зная чего не хватает, план запрещает прямо.
+    """
+    import app.airtable_client as ac
+
+    try:
+        record = await asyncio.to_thread(_find_project_record, ac, project_name)
+    except Exception as e:
+        logger.error(f"Не удалось прочитать карточку проекта '{project_name}': {e}")
+        return None
+
+    if not record:
+        logger.info(f"Проект '{project_name}' не найден в базе - разбор документов пропущен")
+        return None
+
+    summary = await fill_fields_from_drive_files(
+        record.get("fields", {}), drive_files, budget=budget
+    )
+    summary["project_id"] = record["id"]
+    summary["project_name"] = record.get("fields", {}).get("Project Name")
+    return summary
+
+
+def _find_project_record(ac, project_name: str) -> Optional[Dict[str, Any]]:
+    """Поиск карточки тем же нечётким сопоставлением, что и весь остальной код."""
+    ac.init_cache()
+    return ac.find_project_by_query(project_name, ac.CACHE_PROJECTS)

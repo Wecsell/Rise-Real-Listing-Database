@@ -428,6 +428,48 @@ class TestDriveFolderMirrorWiring(unittest.TestCase):
         asyncio.run(run_test())
 
 
+class TestDocParsingWiring(unittest.TestCase):
+    """
+    Э2 в пайплайне: найденные в папке документы разбираются под пустые поля
+    карточки. Предложения никуда не пишутся - их судьбу решает Confirmed.
+    """
+
+    URL = "https://drive.google.com/drive/folders/abc123?usp=share_link"
+
+    def _run(self, project_name, run_for_project_mock):
+        async def run_test():
+            files = [{"id": "f1", "name": "PBG.pdf", "mimeType": "application/pdf"}]
+            with patch('app.drive_folder.list_drive_folder_recursive', return_value=files), \
+                 patch('app.drive_mirror.mirror_listed_drive_folder',
+                       return_value={"dest_folder_id": "d", "results": [], "gaps": []}), \
+                 patch('app.doc_pipeline.run_for_project', new=run_for_project_mock):
+                return await process_generic_link(self.URL, project_name=project_name)
+
+        return asyncio.run(run_test())
+
+    def test_findings_are_attached_and_gaps_merged(self):
+        summary = {"proposals": [{"field": "Handover Permits", "value": "PBG"}],
+                   "gaps": ["Land Zoning Color (ITR.pdf): citation not found in source"],
+                   "opened": 1}
+        res = self._run("Four Palms Villas", AsyncMock(return_value=summary))
+        self.assertEqual(res["doc_findings"], summary)
+        self.assertIn("Land Zoning Color (ITR.pdf): citation not found in source", res["gaps"])
+
+    def test_project_not_in_base_means_no_parsing(self):
+        """Открывать документы, не зная чего не хватает, план запрещает прямо."""
+        res = self._run("Unknown Project", AsyncMock(return_value=None))
+        self.assertNotIn("doc_findings", res)
+
+    def test_parsing_error_is_a_gap_not_a_crash(self):
+        res = self._run("Four Palms Villas", AsyncMock(side_effect=Exception("boom")))
+        self.assertTrue(any("Document parsing failed" in g for g in res["gaps"]))
+
+    def test_no_parsing_without_project_name(self):
+        mock = AsyncMock()
+        self._run(None, mock)
+        mock.assert_not_awaited()
+
+
 class TestNotionPageIdExtraction(unittest.TestCase):
     """
     extract_notion_page_id() - фундамент чтения Notion через внутренний API:
