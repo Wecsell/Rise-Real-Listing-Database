@@ -94,6 +94,17 @@ def get_valid_project_areas() -> list:
     return get_select_options('Projects', 'District', FALLBACK_PROJECT_AREAS)
 
 
+def get_valid_unit_areas() -> list:
+    """
+    Районы юнитов из живой базы. VALID_UNIT_AREAS остаётся только запасным
+    списком: его копия уже разошлась с базой — не хватало 'Kedungu', и район
+    у всех типологий Baza Kedungu молча вычищался при записи (02.08.2026).
+    Списки Projects.District и Units.Area РАЗНЫЕ, поэтому читаем именно
+    Units.Area, а не переиспользуем проектный.
+    """
+    return get_select_options('Units', 'Area', VALID_UNIT_AREAS)
+
+
 _AGENCY_PHONES = None
 _AGENCY_LOADED_AT = 0.0
 
@@ -1029,15 +1040,16 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     if 'Notes' in fields:
         fields.pop('Notes')
 
-    # 'Unit Number' — служебное имя для канонического Key выше; в схеме Units
-    # такого поля нет (там 'Unit ID'). Оставить его в fields значит отправить
-    # в Airtable несуществующее поле: запись падает с 422 целиком, а
-    # robust_airtable_op гасит ошибку и возвращает {'id': None} — юнит молча
-    # не создаётся. Номер при этом ценен сам по себе, поэтому переносим его
-    # в настоящее поле, не затирая явно заданный вызывающим 'Unit ID'.
-    if 'Unit Number' in fields:
-        unit_number_value = fields.pop('Unit Number')
-        fields.setdefault('Unit ID', unit_number_value)
+    # 'Unit Number' — служебное имя для канонического Key выше, не поле базы.
+    # Оставить его в fields значит отправить в Airtable несуществующее поле:
+    # запись падает с 422 целиком, а robust_airtable_op гасит ошибку и
+    # возвращает {'id': None} — юнит молча не создаётся.
+    #
+    # Записать номер в 'Unit ID' НЕЛЬЗЯ, хотя такое поле в схеме есть: оно
+    # типа formula, Airtable отвечает "cannot accept a value because the field
+    # is computed" и отвергает всю запись (проверено на живой базе 02.08.2026).
+    # Наличие поля в схеме не означает, что в него можно писать.
+    fields.pop('Unit Number', None)
     # Убираем нулевые плейсхолдеры Gemini
     unit_zero_meaningless = {'Price from (USD)', 'Bedrooms', 'Bathrooms', 'Total Floors', 
                              'Area from (m2)', 'Land Area (m2)', 'leasehold years'}
@@ -1084,7 +1096,7 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
             fields['Img'] = formatted_imgs
 
     if 'Area' in fields:
-        s_area = sanitize_area(fields['Area'], VALID_UNIT_AREAS)
+        s_area = sanitize_area(fields['Area'], get_valid_unit_areas())
         if s_area:
             fields['Area'] = s_area
         else:

@@ -99,21 +99,22 @@ class TestUnitNumberProducesDistinctRecords:
         )
 
     @pytest.mark.asyncio
-    async def test_unit_number_lands_in_real_unit_id_field(self, fake_table):
-        """Номер юнита должен сохраниться - в поле 'Unit ID', которое реально есть в схеме."""
+    async def test_unit_id_is_never_written_because_it_is_computed(self, fake_table):
+        """
+        'Unit ID' в схеме есть, но это formula-поле: Airtable отвечает "cannot
+        accept a value because the field is computed" и отвергает ВСЮ запись.
+        Первая версия этого фикса переносила номер туда, и все 9 типологий
+        Baza Kedungu молча не создались (живой прогон 02.08.2026).
+
+        Регрессия на вывод: наличие поля в схеме не означает, что в него
+        можно писать.
+        """
         await ac.upsert_unit(_unit('AL101', 'Apartment', 115900), 'recProj', 'Baza Kedungu', [])
 
         written = fake_table.created[0]
-        assert written.get('Unit ID') == 'AL101'
-
-    @pytest.mark.asyncio
-    async def test_explicit_unit_id_is_not_overwritten_by_unit_number(self, fake_table):
-        """Если вызывающий уже задал 'Unit ID' явно, номер его не затирает."""
-        data = _unit('AL101', 'Apartment', 115900)
-        data['Unit ID'] = 'CUSTOM-1'
-        await ac.upsert_unit(data, 'recProj', 'Baza Kedungu', [])
-
-        assert fake_table.created[0].get('Unit ID') == 'CUSTOM-1'
+        assert 'Unit ID' not in written, (
+            f"'Unit ID' - вычисляемое поле, запись в него роняет юнит: {sorted(written)}"
+        )
 
     @pytest.mark.asyncio
     async def test_without_unit_number_behaviour_is_unchanged(self, fake_table):
