@@ -45,6 +45,32 @@ DEVELOPER_CONTACTS = (
 
 KEDUNGU_MATRIX_SHEET = "1TWbIAHCWka3ChmSxnl_n1brWpvHWygSgQygDn7SoKMI"
 
+# Найдена 02.08.2026: закреплённое сообщение в чате Baza - RiseReal и вики
+# theheights.io/wiki/eng ведут на ту же таблицу, что и портал - просто нужен
+# был другой лист. У Google Sheets 3 вкладки (gid из htmlview, публичный CSV
+# export отдаёт 401, а gviz - нет): калькулятор цены (демо на Type 6),
+# планировка по этажам, и "Full unit registry" - 105 юнитов поимённо со
+# статусом Sold/Available. Именно третий лист и был нужен.
+HEIGHTS_MATRIX_SHEET = "1a-yy-dG02WZqJxy3J8OAFQpWbjNZD2QEEmjzfOw7QZQ"
+HEIGHTS_REGISTRY_GID = "2010370332"
+HEIGHTS_PRICE_PER_M2 = 3500  # текущая цена по чату/калькулятору того же файла
+
+# Type N -> (Unit type для Airtable, спальни). Спальни проставлены только там,
+# где есть прямое подтверждение (Type 9 назван "Extended Residence (1BR)" в
+# папке рендеров; Studio по определению без отдельной спальни). Type 1/2
+# ("Two-level") и редкие 3/4/10 - без спален: угадывать план прямо запрещает.
+HEIGHTS_TYPE_MAP = {
+    "Type 1": ("Apartment", None),
+    "Type 2": ("Apartment", None),
+    "Type 3": ("Penthouse", None),
+    "Type 4": ("Apartment", None),
+    "Type 5": ("Studio", None),
+    "Type 6": ("Studio", None),
+    "Type 8": ("Studio", None),
+    "Type 9": ("Apartment", 1),
+    "Type 10": ("Apartment", None),
+}
+
 # Тип из шахматки -> Units.Unit type (живой селект: Villa/Apartment/Loft/
 # Townhouse/Studio/Penthouse). Honeymoon и Presidential suite - по сути
 # апартаменты (подтверждено владельцем 02.08.2026).
@@ -100,7 +126,7 @@ PROJECTS = [
             "Доходность ~14% годовых. Рассрочка с ПВ от 5%. "
             "Гарантия дохода 9% для Honeymoon Suite."
         ),
-        "_units_from_matrix": True,
+        "_units_from_matrix": "kedungu",
     },
     {
         "Project Name": "Origins",
@@ -141,7 +167,12 @@ PROJECTS = [
         "Project Name": "The Heights",
         "_existing_name": "The Heights",
         "District": "Seseh",
-        "Property Type": ["Apartment"],
+        # 'Penthouse' - валидный Units.Unit type, но НЕ валидный Projects.Property
+        # Type (живой селект: Villa/Apartment/Studio/Townhouse). С ним Airtable
+        # отверг всё обновление карточки целиком (INSUFFICIENT_PERMISSIONS на
+        # создание опции) - юниты при этом успели записаться отдельным вызовом,
+        # а поля проекта молча не обновились. Списки этих двух полей не совпадают.
+        "Property Type": ["Apartment", "Studio"],
         "Construction stage": "Foundation",
         "Ownership Type": "Leasehold",
         "Lease Term (years)": 30,
@@ -151,9 +182,12 @@ PROJECTS = [
         "Handover Date": "2027-03-31",
         "Handover Permits": "PBG",
         "Total Units": 105,
-        "Price From (USD)": 138720,
         "Downpayment": 0.3,
-        "Availability Chart": "https://docs.google.com/spreadsheets/d/1a-yy-dG02WZqJxy3J8OAFQpWbjNZD2QEEmjzfOw7QZQ/edit?gid=1499658778",
+        # Закреплённое сообщение в чате (приоритетный источник, решение
+        # владельца 02.08.2026) и вики theheights.io/wiki/eng ведут на ту же
+        # таблицу - лист "Full unit registry" (gid=2010370332), а не на
+        # калькулятор цены (gid=1499658778), на который смотрели раньше.
+        "Availability Chart": f"https://docs.google.com/spreadsheets/d/{HEIGHTS_MATRIX_SHEET}/edit?gid={HEIGHTS_REGISTRY_GID}",
         "Link to Developer’s Kit (Rus)": "https://theheights.io/wiki",
         "Link to Developer’s Kit (Eng)": "https://theheights.io/wiki/eng",
         "Location Link": "https://maps.app.goo.gl/bozuiKu7FBR9VhpZ8",
@@ -162,32 +196,15 @@ PROJECTS = [
         ),
         "Special Conditions": (
             "Оптимальный набор наиболее востребованных функций в одном пространстве с единым "
-            "архитектурным кодом. Доходность до 16,2% годовых. Цена от $3 400/м² (pre-launch) "
-            "до $3 550/м² с рассрочкой. Эксклюзивные продажи через Bali Baza. "
-            "Типы юнитов: Studio Standard, Studio with Kitchen, Studio with Bathtub, "
-            "Two-level с бассейном и без, Extended Residence (1BR)."
+            "архитектурным кодом. Доходность до 16,2% годовых. Текущая цена $3 500/м², "
+            "с рассрочкой $3 550/м². Эксклюзивные продажи через Bali Baza. Застройщик по "
+            "решению владельца 02.08.2026 зафиксирован как Bali Baza; уточнение роли "
+            "(девелопер/эксклюзивный продавец) - на усмотрение менеджера-сейлза при запросе клиента."
         ),
-        # Типология из папок рендеров и имён финмоделей. Цены по типам есть
-        # только в самих финмоделях (PDF), здесь не разбирались.
-        "_units": [
-            {"Unit Number": "TYPE1", "Unit type": "Apartment", "Bedrooms": 2,
-             "Availability": "On sale", "Area": "Seseh", "Pool": "Yes(Private)"},
-            {"Unit Number": "TYPE2", "Unit type": "Apartment", "Bedrooms": 2,
-             "Availability": "On sale", "Area": "Seseh"},
-            {"Unit Number": "TYPE5", "Unit type": "Studio", "Bedrooms": 1,
-             "Availability": "On sale", "Area": "Seseh"},
-            {"Unit Number": "TYPE6", "Unit type": "Studio", "Bedrooms": 1,
-             "Availability": "On sale", "Area": "Seseh"},
-            {"Unit Number": "TYPE8", "Unit type": "Studio", "Bedrooms": 1,
-             "Availability": "On sale", "Area": "Seseh"},
-            {"Unit Number": "TYPE9", "Unit type": "Apartment", "Bedrooms": 1,
-             "Availability": "On sale", "Area": "Seseh"},
-        ],
+        "_units_from_matrix": "heights",
         "_gaps": [
-            "шахматка The Heights недоступна (выдана поимённо): 401 публично, 404 нашему OAuth",
-            "цены и площади по типам не заведены - есть только в PDF финмоделей, не разбирались",
-            "расхождение: в чате Bali Baza называет себя эксклюзивным партнёром ПО ПРОДАЖАМ, "
-            "аналитика подписана 'THE HEIGHTS × BALI BAZA DEVELOPMENT' - роль требует уточнения",
+            "цена по типам 3/4/10 и спальни Type 1/2 (Two-level) не заведены - "
+            "в реестре есть только площадь, план квартиры не разбирался",
         ],
     },
     {
@@ -326,6 +343,70 @@ def fetch_kedungu_typology():
     return units, unknown, total
 
 
+def fetch_heights_typology():
+    """
+    'Full unit registry' The Heights (105 юнитов), свёрнутый в базовые типы.
+
+    Побочные варианты стороны/этажа (Type 6-L/Type 6-R, Type 8.2) сведены к
+    базовому Type N - это планировочные варианты одного типа юнита, не
+    отдельные позиции каталога (тот же принцип, что и с префиксами Kedungu).
+    Цена - "от", как и по Kedungu: area * HEIGHTS_PRICE_PER_M2 для площади
+    самого дешёвого юнита типа. Точное площадь/цена по каждому юниту доступны
+    в самой таблице, здесь агрегируются только для карточки каталога.
+    """
+    url = (f"https://docs.google.com/spreadsheets/d/{HEIGHTS_MATRIX_SHEET}"
+           f"/gviz/tq?tqx=out:csv&gid={HEIGHTS_REGISTRY_GID}")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+
+    rows = [r for r in csv.reader(io.StringIO(raw)) if any(c.strip() for c in r)]
+    groups, unknown = defaultdict(list), set()
+    for row in rows[1:]:
+        cells = [c.strip() for c in row]
+        if len(cells) < 6:
+            continue
+        _unit_no, _floor, area, utype, _side, status = cells[:6]
+        base_match = re.match(r"^(Type \d+)", utype)
+        if not base_match or base_match.group(1) not in HEIGHTS_TYPE_MAP:
+            unknown.add(utype)
+            continue
+        area_f = float(area.replace(",", ".")) if re.match(r"^[\d.,]+$", area) else None
+        groups[base_match.group(1)].append({"area": area_f, "status": status.strip().lower()})
+
+    units = []
+    for base_type in sorted(groups, key=lambda t: int(re.search(r"\d+", t).group())):
+        items = groups[base_type]
+        unit_type, bedrooms = HEIGHTS_TYPE_MAP[base_type]
+        areas = [i["area"] for i in items if i["area"]]
+        available = [i for i in items if i["status"] == "available"]
+
+        price = None
+        if available:
+            avail_areas = [i["area"] for i in available if i["area"]]
+            if avail_areas:
+                price = round(min(avail_areas) * HEIGHTS_PRICE_PER_M2)
+        elif areas:
+            price = round(min(areas) * HEIGHTS_PRICE_PER_M2)
+
+        unit = {
+            "Unit Number": base_type.replace(" ", "").upper(),
+            "Unit type": unit_type,
+            "Availability": "On sale" if available else "Sold",
+            "_count": len(items),
+            "_on_sale": len(available),
+        }
+        if bedrooms:
+            unit["Bedrooms"] = bedrooms
+        if areas:
+            unit["Area from (m2)"] = min(areas)
+        if price:
+            unit["Price from (USD)"] = price
+        units.append(unit)
+
+    return units, unknown, sum(len(v) for v in groups.values())
+
+
 def merge_developer(apply_changes: bool):
     """
     Сводит две записи застройщика в одну 'Bali Baza'.
@@ -380,11 +461,19 @@ def merge_developer(apply_changes: bool):
     return keep["id"], moved
 
 
-def find_existing(projects, name):
-    """Точное совпадение по имени. Нечёткому сопоставлению здесь доверять нельзя."""
-    target = (name or "").strip().lower()
+def find_existing(projects, *names):
+    """
+    Точное совпадение по любому из имён. Нечёткому сопоставлению здесь
+    доверять нельзя ('Baza Kedungu' даёт fuzzy score 0.000 против 'Kedungu').
+
+    Несколько имён нужны для идемпотентности: после первого прогона проект
+    уже называется по-новому ('Baza Kedungu'), а старое имя ('Kedungu'), под
+    которым его найти в первый раз, больше не существует. Поиск строго по
+    старому имени на повторном запуске создал бы дубль.
+    """
+    targets = {n.strip().lower() for n in names if n}
     return next((r for r in projects
-                 if (r["fields"].get("Project Name") or "").strip().lower() == target), None)
+                 if (r["fields"].get("Project Name") or "").strip().lower() in targets), None)
 
 
 def report_stale_units(existing_rec, all_units, new_keys):
@@ -419,18 +508,29 @@ async def run(apply_changes: bool, do_mirror: bool):
     if not dev_id:
         return
 
-    typology, unknown, total_units = fetch_kedungu_typology()
-    print(f"\n2. Шахматка Baza Kedungu: {total_units} юнитов -> {len(typology)} типологий")
-    if unknown:
-        print(f"   ! не распознано: {unknown}")
-    for u in typology:
+    kedungu_typology, kedungu_unknown, kedungu_total = fetch_kedungu_typology()
+    print(f"\n2a. Шахматка Baza Kedungu: {kedungu_total} юнитов -> {len(kedungu_typology)} типологий")
+    if kedungu_unknown:
+        print(f"   ! не распознано: {kedungu_unknown}")
+    for u in kedungu_typology:
         price = f"${u['Price from (USD)']:,.0f}" if u["Price from (USD)"] else "—"
         print(f"   {u['Unit Number']:10} {u['Unit type']:10} {u['Area from (m2)'] or '—':>6} м2  "
               f"{price:>10}  {u['Availability']:8} ({u['_count']} шт, свободно {u['_on_sale']})")
 
-    sale_prices = [u["Price from (USD)"] for u in typology
-                   if u["Availability"] == "On sale" and u["Price from (USD)"]]
-    all_prices = [u["Price from (USD)"] for u in typology if u["Price from (USD)"]]
+    heights_typology, heights_unknown, heights_total = fetch_heights_typology()
+    print(f"\n2b. Реестр The Heights: {heights_total} юнитов -> {len(heights_typology)} типологий")
+    if heights_unknown:
+        print(f"   ! не распознано: {heights_unknown}")
+    for u in heights_typology:
+        price = f"${u['Price from (USD)']:,.0f}" if u.get("Price from (USD)") else "—"
+        area = f"{u['Area from (m2)']:.1f}" if u.get("Area from (m2)") else "—"
+        print(f"   {u['Unit Number']:8} {u['Unit type']:10} {area:>6} м2  {price:>10}  "
+              f"{u['Availability']:8} ({u['_count']} шт, свободно {u['_on_sale']})")
+
+    MATRICES = {
+        "kedungu": kedungu_typology,
+        "heights": heights_typology,
+    }
 
     print("\n3. Проекты")
     base = get_base()
@@ -444,13 +544,18 @@ async def run(apply_changes: bool, do_mirror: bool):
         proj = {k: v for k, v in spec.items() if not k.startswith("_")}
         name = proj["Project Name"]
         gaps = list(spec.get("_gaps") or [])
-        existing = find_existing(all_projects, spec.get("_existing_name") or name)
+        existing = find_existing(all_projects, name, spec.get("_existing_name"))
 
-        if spec.get("_units_from_matrix"):
-            units = [{k: v for k, v in u.items() if not k.startswith("_")} for u in typology]
+        matrix_key = spec.get("_units_from_matrix")
+        if matrix_key:
+            source_typology = MATRICES[matrix_key]
+            units = [{k: v for k, v in u.items() if not k.startswith("_")} for u in source_typology]
             # Цена проекта - минимум среди типологий В ПРОДАЖЕ: проданные стоят
-            # по старым, уже недоступным ценам ($79 000 против актуальных
-            # $92 500), и такая цена в карточке вводила бы брокера в заблуждение.
+            # по старым, уже недоступным ценам, и такая цена в карточке вводила
+            # бы брокера в заблуждение.
+            sale_prices = [u["Price from (USD)"] for u in source_typology
+                           if u["Availability"] == "On sale" and u.get("Price from (USD)")]
+            all_prices = [u["Price from (USD)"] for u in source_typology if u.get("Price from (USD)")]
             if sale_prices:
                 proj["Price From (USD)"] = min(sale_prices)
             if all_prices:
@@ -492,6 +597,14 @@ async def run(apply_changes: bool, do_mirror: bool):
             fields["Gaps"] = ", ".join(gaps) if gaps else ""
             fields["Status"] = "Needs data" if gaps else "Verified"
             res = robust_airtable_op(proj_table.update, existing["id"], fields=fields)
+            if not res.get("id"):
+                # robust_airtable_op гасит HTTPError и возвращает {'id': None} -
+                # обновление карточки провалилось ЦЕЛИКОМ (422 на одном поле
+                # роняет весь запрос), а юниты ниже пишутся отдельным вызовом
+                # и всё равно проедут. Молчать об этом нельзя - иначе кажется,
+                # что карточка обновлена, а на деле старые поля остались.
+                print(f"       !! ОБНОВЛЕНИЕ КАРТОЧКИ ПРОВАЛИЛОСЬ - поля проекта НЕ записаны "
+                      f"(см. лог ошибки Airtable выше), юниты ниже всё равно запишутся")
             proj_id = res.get("id") or existing["id"]
         else:
             proj_id = await upsert_project(proj, dev_id, gaps)
