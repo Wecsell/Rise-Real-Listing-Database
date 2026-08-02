@@ -28,7 +28,7 @@ api = Api(AIRTABLE_TOKEN) if AIRTABLE_TOKEN else None
 # Запасной список на случай, если схему не удалось прочитать из Airtable.
 # Боевой источник истины — сама база, см. get_select_options().
 FALLBACK_PROJECT_AREAS = ['Kuta', 'Seminyak', 'Canggu', 'Kerobokan', 'Umalas', 'Pererenan', 'Seseh', 'Cemagi', 'Nuanu', 'Kedungu', 'Jimbaran', 'Nusa Dua', 'Ungasan', 'Uluwatu', 'Sanur', 'Ubud', 'Karengasem', 'Sumba']
-VALID_UNIT_AREAS = ['Ubud', 'Cemagi', 'Kuta', 'Sumba', 'Canggu', 'Bukit', 'Mengwi', 'Nuanu', 'Ungasan', 'Buduk', 'Seseh', 'Melasti', 'Sanur', 'Kutuh', 'Pecatu', 'Uluwatu', 'Nusa Dua', 'Berawa', 'Lombok', 'Karangasem', 'Badung', 'South Kuta', 'Bingin']
+VALID_UNIT_AREAS = ['Ubud', 'Cemagi', 'Kuta', 'Sumba', 'Canggu', 'Bukit', 'Mengwi', 'Nuanu', 'Ungasan', 'Buduk', 'Seseh', 'Melasti', 'Sanur', 'Kutuh', 'Pecatu', 'Uluwatu', 'Nusa Dua', 'Melast', 'Berawa', 'Lombok', 'Karangasem', 'Badung', 'South Kuta', 'Bingin', 'Kedungu']
 
 _SCHEMA_OPTIONS = None
 _SCHEMA_FIELDS = {}

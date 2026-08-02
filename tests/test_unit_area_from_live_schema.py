@@ -50,6 +50,14 @@ class TestUnitAreasComeFromLiveSchema:
             areas = ac.get_valid_unit_areas()
             assert 'Canggu' in areas
 
+    def test_hardcoded_fallback_includes_kedungu(self):
+        """
+        Сам запасной список синхронизирован с живой базой (02.08.2026):
+        если схему не удастся прочитать именно в момент записи Kedungu-типологий,
+        фолбэк не должен повторить ту же потерю.
+        """
+        assert 'Kedungu' in ac.VALID_UNIT_AREAS
+
     def test_unit_areas_are_read_from_units_table_not_projects(self):
         """
         Списки районов у Projects и Units РАЗНЫЕ (в Units нет Kerobokan, в

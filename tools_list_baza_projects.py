@@ -167,12 +167,13 @@ PROJECTS = [
         "Project Name": "The Heights",
         "_existing_name": "The Heights",
         "District": "Seseh",
-        # 'Penthouse' - валидный Units.Unit type, но НЕ валидный Projects.Property
-        # Type (живой селект: Villa/Apartment/Studio/Townhouse). С ним Airtable
-        # отверг всё обновление карточки целиком (INSUFFICIENT_PERMISSIONS на
-        # создание опции) - юниты при этом успели записаться отдельным вызовом,
-        # а поля проекта молча не обновились. Списки этих двух полей не совпадают.
-        "Property Type": ["Apartment", "Studio"],
+        # 'Penthouse' добавлена в живой селект Projects.Property Type 02.08.2026
+        # (решение владельца) - у The Heights реально есть Type 3 (157м², sold).
+        # Раньше её здесь не было вовсе (только Villa/Apartment/Studio/
+        # Townhouse), и запись с ней ронялась 422 - используйте typecast=True
+        # при первой записи нового значения селекта, обычная запись такую
+        # опцию не создаёт и отвергает всю карточку целиком.
+        "Property Type": ["Apartment", "Studio", "Penthouse"],
         "Construction stage": "Foundation",
         "Ownership Type": "Leasehold",
         "Lease Term (years)": 30,
