@@ -1,5 +1,5 @@
 import pytest
-from app.phone_formatter import format_single_phone, format_whatsapp_link
+from app.phone_formatter import format_contacts_international, format_single_phone, format_whatsapp_link
 
 
 class TestFormatSinglePhone:
@@ -75,3 +75,61 @@ class TestFormatWhatsappLink:
         input_str = "08133888995, +61 434 639 068\n+62 813-3919-882, @agent_nick"
         expected = "https://wa.me/628133888995, https://wa.me/61434639068, https://wa.me/628133919882, @agent_nick"
         assert format_whatsapp_link(input_str) == expected
+
+
+class TestFormatContactsInternational:
+    """
+    Единый вид "+код номер" для колонки Developer.Contacts (задача: 142 живых
+    записи, часть уже '+62 ...', часть в локальном формате с 0, часть вообще
+    не телефон). Кейсы взяты из реальных значений, увиденных живым чтением базы.
+    """
+
+    def test_already_formatted_phone_is_left_equivalent(self):
+        assert format_contacts_international("+62 821 4424119") == "+62 8214424119"
+
+    def test_local_indonesian_zero_prefix_becomes_plus_62(self):
+        assert format_contacts_international("0858-4764-6202") == "+62 85847646202"
+
+    def test_bare_local_number_with_spaces(self):
+        assert format_contacts_international("081 558 615 999") == "+62 81558615999"
+
+    def test_handle_only_is_untouched(self):
+        assert format_contacts_international("@Agent_BaliBaza, @DanBaliBaza") == "@Agent_BaliBaza, @DanBaliBaza"
+
+    def test_website_is_untouched(self):
+        assert format_contacts_international("cemagirock.com") == "cemagirock.com"
+
+    def test_qr_code_placeholder_is_untouched(self):
+        assert format_contacts_international("QR code") == "QR code"
+
+    def test_phone_with_trailing_annotation_keeps_annotation(self):
+        """'+6281330820767 (Jeff whatsapp)' - номер переформатирован, пометка на месте."""
+        result = format_contacts_international("+6281330820767 (Jeff whatsapp)")
+        assert result == "+62 81330820767 (Jeff whatsapp)"
+
+    def test_certificate_like_number_is_not_mistaken_for_a_phone(self):
+        """
+        '96.2.22.01.04.001' - номер сертификата/акта, а не телефон: цифры
+        разбиты точками на короткие группы, ни одна не даёт непрерывный
+        телефон-подобный кусок длиной от 8 цифр.
+        """
+        result = format_contacts_international("96.2.22.01.04.001, +62 823-5935-4250")
+        assert result == "96.2.22.01.04.001, +62 82359354250"
+
+    def test_website_and_phone_mixed_only_phone_reformatted(self):
+        result = format_contacts_international("+62 822 3089 1640, www.luxurypalmbali.com")
+        assert result == "+62 82230891640, www.luxurypalmbali.com"
+
+    def test_wa_me_link_is_left_untouched(self):
+        """Ссылки wa.me - отдельный, уже решённый формат; эта функция про '+код номер', не про них."""
+        result = format_contacts_international("https://wa.me/6281234567890")
+        assert result == "https://wa.me/6281234567890"
+
+    @pytest.mark.parametrize("invalid_input, expected", [
+        (None, None),
+        ("", ""),
+        ("   ", ""),
+        (12345, 12345),
+    ])
+    def test_empty_or_invalid_inputs(self, invalid_input, expected):
+        assert format_contacts_international(invalid_input) == expected

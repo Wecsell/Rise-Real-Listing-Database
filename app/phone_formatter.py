@@ -100,6 +100,56 @@ def format_single_phone(phone_str: str) -> str:
     
     return s
 
+def format_contacts_international(contact_input: Optional[str]) -> Optional[str]:
+    """
+    Приводит телефон-подобные фрагменты строки контактов к виду "+код номер"
+    (format_international), остальные фрагменты (сайты, @ники, "QR code")
+    оставляет как есть и на своих местах.
+
+    Разбор телефона делегирован app.dedup.normalize_phone — там уже решён
+    индонезийский случай (ведущий 0 -> 62) и отсеяны слишком короткие/длинные
+    цифровые обрывки (номера сертификатов вида "96.2.22.01.04.001"). Вторая
+    копия этой логики здесь неизбежно разошлась бы с отлаженной (тот же довод,
+    что уже применялся в tools_fix_agency_phones.py).
+    """
+    if not contact_input or not isinstance(contact_input, str):
+        return contact_input
+
+    from app.dedup import normalize_phone
+
+    s = contact_input.strip()
+    if not s:
+        return s
+
+    parts = re.split(r'[,;\n\|]+|(?<=\d|\))\s*/\s*(?=\+|\d|\()|(?<=\d)(?=\+)', s)
+    result = []
+
+    for part in parts:
+        part_str = part.strip()
+        if not part_str:
+            continue
+
+        has_phone_pattern = re.search(r'(\+?\d[\d\s\-\(\)]{6,}\d)', part_str)
+        is_phone_candidate = (
+            has_phone_pattern
+            and not part_str.startswith("@")
+            and "http" not in part_str.lower()
+            and "wa.me" not in part_str.lower()
+        )
+
+        if is_phone_candidate:
+            raw_phone = has_phone_pattern.group(1)
+            digits = normalize_phone(raw_phone)
+            formatted_phone = format_international(digits) if digits else None
+            if formatted_phone:
+                result.append(part_str.replace(raw_phone, formatted_phone))
+                continue
+
+        result.append(part_str)
+
+    return ", ".join(result)
+
+
 def format_whatsapp_link(contact_input: Optional[str]) -> Optional[str]:
     """
     Принимает строку контактов (телефон, список телефонов, соцсети),
