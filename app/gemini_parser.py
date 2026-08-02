@@ -150,11 +150,16 @@ SYSTEM_PROMPT = """
 - Указывай итоговый коэффициент уверенности `confidence` от 0.0 до 1.0. Если данные фрагментарны или противоречивы, ставь confidence < 0.7.
 """
 
-DEFAULT_MODEL = 'gemini-2.5-flash'
+# T1 по implementation_plan.md ("Выбор моделей по уровням"): сухое чтение
+# сообщений чата - высокий объём, решение "релевантно/нет". Берётся lite:
+# втрое быстрее при той же цене за токен, а её осторожность здесь не мешает.
+# Разбор документов (T2) идёт другой моделью - field_extractor.DOC_MODEL.
+DEFAULT_MODEL = 'gemini-3.5-flash-lite'
 
 # Порядок предпочтения при авто-детекте. Без него бралась первая попавшаяся
 # модель из выдачи API, то есть качество разбора зависело от порядка ответа.
-PREFERRED_MODELS = ('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash')
+PREFERRED_MODELS = ('gemini-3.5-flash-lite', 'gemini-3.5-flash',
+                    'gemini-2.5-flash-lite', 'gemini-2.5-flash')
 
 _cached_model_name = None
 
@@ -177,13 +182,18 @@ def resolve_model_name() -> str:
 
     try:
         available = [m.name for m in client.models.list() if 'flash' in m.name.lower()]
+
+        # Сравниваем по точному имени модели, а не подстрокой: 'gemini-3.5-flash'
+        # является подстрокой 'gemini-3.5-flash-lite', и наивное `preferred in name`
+        # молча возвращало бы не ту модель в зависимости от порядка выдачи API
+        # (в живой выдаче полная flash идёт РАНЬШЕ lite). Тот же класс бага, что
+        # 'are' внутри 'share' в предфильтре listener.py.
+        by_bare_name = {name.split('/')[-1]: name for name in available}
+
         chosen = None
         for preferred in PREFERRED_MODELS:
-            for name in available:
-                if preferred in name:
-                    chosen = name
-                    break
-            if chosen:
+            if preferred in by_bare_name:
+                chosen = by_bare_name[preferred]
                 break
 
         if not chosen and available:
