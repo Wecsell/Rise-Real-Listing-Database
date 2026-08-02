@@ -66,6 +66,24 @@ class TestClassification(unittest.TestCase):
             classify_document("scan_01.pdf", path="03 Legal/Sewa Menyewa"), "lease"
         )
 
+    def test_weak_marketing_words_do_not_outrank_real_document_type(self):
+        """
+        Регрессия 02.08.2026: шаблон presentation с общими словами (info, about,
+        overview, concept, deck) стоял ВЫШЕ certificate и совпадал с путём, а не
+        только с именем файла. "01 Legal/General Info/SHM Certificate.pdf"
+        уезжал в presentation, и сертификат переставал закрывать Land Zoning Color.
+        """
+        self.assertEqual(
+            classify_document("SHM Certificate.pdf", path="01 Legal/General Info"),
+            "certificate",
+        )
+        self.assertEqual(
+            classify_document("NPWP.pdf", path="02 Company Info"), "company"
+        )
+        self.assertEqual(
+            classify_document("ITR.pdf", path="Legal/Info"), "zoning"
+        )
+
     def test_fields_map_matches_gaps_field_names(self):
         """
         Роутер должен говорить именами полей из app/gaps.py - иначе сопоставление
@@ -110,6 +128,23 @@ class TestSkipList(unittest.TestCase):
         self.assertTrue(is_parsable(scan))
         self.assertTrue(is_document_scan(scan))
         self.assertFalse(is_document_scan(_f("3.1.jpg", mime="image/jpeg")))
+
+    def test_render_in_marketing_folder_is_not_a_document_scan(self):
+        """
+        Регрессия 02.08.2026: presentation/location ловили путь рендера
+        ("Renders/Masterplan/3.1.jpg", "Deck area/pool.jpg"), is_document_scan
+        начинал возвращать True, и рендеры уезжали в дорогое зрение.
+        """
+        for name, path in (
+            ("3.1.jpg", "Renders/Masterplan"),
+            ("view_07.jpg", "Exterior/Concept"),
+            ("bedroom.jpg", "Interior/Overview"),
+            ("pool.jpg", "Deck area"),
+            ("plan.jpg", "Site map"),
+        ):
+            info = _f(name, mime="image/jpeg", path=path)
+            self.assertFalse(is_document_scan(info), f"{path}/{name}")
+            self.assertFalse(is_parsable(info), f"{path}/{name}")
 
     def test_passport_scan_stays_skipped_even_though_it_is_a_document(self):
         """Skip-лист сильнее правила про сканы: паспорт - тоже 'документ'."""

@@ -9,6 +9,15 @@ from app import schema_check
 from app.schema_check import check_schema_drift, expected_select_values
 
 
+@pytest.fixture(autouse=True)
+def _no_live_schema_calls(monkeypatch):
+    """
+    Проверка типов полей ходит в живую схему Airtable. В тестах глушим её,
+    иначе прогон зависит от сети и от того, задан ли AIRTABLE_TOKEN.
+    """
+    monkeypatch.setattr(schema_check, 'get_field_type', lambda table, field: 'singleLineText')
+
+
 class TestDriftDetection:
     """
     Проверяем, что детектор действительно ловит расхождения, а не всегда
@@ -53,6 +62,23 @@ class TestDriftDetection:
         )
         assert check_schema_drift() == []
 
+    def test_reports_field_that_became_a_formula_in_the_live_base(self, monkeypatch):
+        """
+        Тот самый класс багов, ради которого проверка и писалась: поле стало
+        формулой в интерфейсе Airtable, код продолжает в него писать, и вся
+        запись падает на 422. Статический READ_ONLY_FIELDS такое не ловит —
+        тип обязан читаться из живой схемы.
+        """
+        monkeypatch.setattr(schema_check, 'field_exists', lambda table, field: True)
+        monkeypatch.setattr(schema_check, 'get_select_options', lambda table, field: ['заглушка'])
+        monkeypatch.setattr(
+            schema_check, 'get_field_type',
+            lambda table, field: 'formula' if field == 'Bedrooms' else 'singleLineText',
+        )
+
+        problems = check_schema_drift()
+        assert any("только для чтения" in p and "Bedrooms" in p for p in problems)
+
     def test_reports_readonly_formula_fields_in_required(self, monkeypatch):
         monkeypatch.setattr(schema_check, 'field_exists', lambda table, field: True)
         monkeypatch.setattr(schema_check, 'get_select_options', lambda table, field: ['заглушка'])
@@ -87,3 +113,20 @@ class TestAgainstLiveBase:
     def test_live_schema_has_no_drift(self):
         problems = check_schema_drift()
         assert problems == [], "Расхождение кода и живой базы:\n" + "\n".join(problems)
+
+    def test_readonly_list_names_exist_and_really_are_computed(self):
+        """
+        Страховочный список бесполезен, если в нём опечатка: 'Price per m²' в
+        базе не существует, настоящее имя — 'Price per m² from(USD)'. Такой
+        элемент защищает от несуществующего поля и молча ничего не проверяет.
+        """
+        from app.airtable_client import get_field_type
+        from app.schema_check import COMPUTED_FIELD_TYPES, READ_ONLY_FIELDS
+
+        for table, names in READ_ONLY_FIELDS.items():
+            for name in names:
+                ftype = get_field_type(table, name)
+                assert ftype is not None, f"{table}.{name!r} нет в базе — опечатка в списке"
+                assert ftype in COMPUTED_FIELD_TYPES, (
+                    f"{table}.{name!r} имеет тип {ftype!r} и не является вычисляемым"
+                )

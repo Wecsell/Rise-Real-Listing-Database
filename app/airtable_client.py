@@ -33,6 +33,10 @@ VALID_UNIT_AREAS = ['Ubud', 'Cemagi', 'Kuta', 'Sumba', 'Canggu', 'Bukit', 'Mengw
 
 _SCHEMA_OPTIONS = None
 _SCHEMA_FIELDS = {}
+# (table, field) -> тип поля из живой схемы Airtable ('formula', 'number', ...).
+# Нужен, чтобы ловить не только отсутствие поля, но и запись в вычисляемое:
+# 'Unit ID' оказался формулой и молча ронял всю запись юнита (02.08.2026).
+_SCHEMA_FIELD_TYPES = {}
 
 
 def _load_schema_options() -> dict:
@@ -59,10 +63,17 @@ def _load_schema_options() -> dict:
     for table in data.get('tables', []):
         _SCHEMA_FIELDS[table['name']] = {f['name'] for f in table.get('fields', [])}
         for field in table.get('fields', []):
+            _SCHEMA_FIELD_TYPES[(table['name'], field['name'])] = field.get('type')
             choices = field.get('options', {}).get('choices')
             if choices:
                 result[(table['name'], field['name'])] = [c['name'] for c in choices]
     return result
+
+
+def get_field_type(table: str, field: str):
+    """Тип поля из живой схемы. None — схема не прочитана или поля нет."""
+    get_select_options(table, field)  # гарантирует, что схема загружена
+    return _SCHEMA_FIELD_TYPES.get((table, field))
 
 
 def field_exists(table: str, field: str) -> bool:
@@ -316,6 +327,12 @@ UNIT_TYPE_ALIASES = {
     'penthouse': 'Penthouse',  # В селекте базы есть отдельное значение
     'bungalow': 'Villa',
 }
+
+# Значения, которые код отдаёт в Projects.Property Type. Это ДРУГОЙ селект,
+# чем Units.Unit type: брать для него UNIT_TYPE_ALIASES нельзя — там нет
+# 'Apartment'/'Studio', а именно отсутствие значения в этом селекте уронило
+# запись The Heights на 422 (02.08.2026).
+VALID_PROPERTY_TYPES = ['Villa', 'Apartment', 'Studio', 'Penthouse']
 
 # Запасной список типов юнитов. Боевой источник — селект Units.Unit type,
 # см. get_valid_unit_types(). Значения 'Hotel' и 'Hotel room' раньше жестко
@@ -942,17 +959,10 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
         rec_id = match['id']
         old_price = match.get('fields', {}).get('Price From (USD)')
         new_price = fields.get('Price From (USD)')
-        if old_price is not None and new_price is not None and safe_float(old_price) != safe_float(new_price):
-            try:
-                from app.database import save_fact
-                await save_fact(
-                    project_recid=rec_id,
-                    old_value=str(old_price),
-                    new_value=str(new_price),
-                    fact_type="price_change"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to record price change fact: {e}")
+        price_changed = (
+            old_price is not None and new_price is not None
+            and safe_float(old_price) != safe_float(new_price)
+        )
 
         logger.info(f"Updating project '{proj_name}' matched to '{match['fields'].get('Project Name')}' (ID: {rec_id}, Score: {score:.2f})")
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
@@ -970,7 +980,21 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
             else:
                 logger.error(f"❌ Failed to update Project '{proj_name}' (ID: {rec_id}) [{err_code}]: {err_details}")
                 return None
-        
+
+        # Факт пишем ТОЛЬКО после успешного апдейта: иначе 422/404 оставлял бы
+        # в истории цен изменение, которого в Airtable не произошло.
+        if price_changed:
+            try:
+                from app.database import save_fact
+                await save_fact(
+                    project_recid=rec_id,
+                    old_value=str(old_price),
+                    new_value=str(new_price),
+                    fact_type="price_change"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record price change fact: {e}")
+
         # Обновляем кэш
         for i, c in enumerate(CACHE_PROJECTS):
             if c['id'] == rec_id:

@@ -298,11 +298,21 @@ def merge_into_gaps(existing: Optional[str], block: str) -> str:
 
 async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> bool:
     """
-    Записывает секцию бота в поле Gaps карточки проекта, а также безопасные
-    поля зеркалирования Drive (Link to Developer’s Kit (Rus) и обложку Img).
+    Записывает секцию бота в поле Gaps карточки проекта, а также результат
+    зеркалирования Drive: ссылку на зеркало в Renders и обложку в Img.
+
+    Извлечённые из документов ЗНАЧЕНИЯ полей карточки по-прежнему не трогаются -
+    они доезжают туда только после Confirmed. Renders/Img - это не найденный
+    факт, а адрес нашей же копии файлов; оба пишутся только в пустое поле,
+    чужую ссылку не затираем.
     """
     import app.airtable_client as ac
     from app.drive_mirror import extract_mirror_airtable_fields
+
+    # Считаем до формирования текста: ссылка на зеркало попадает в саму секцию.
+    mirror_summary = summary.get("drive_mirror") or {}
+    mirror_fields = summary.get("mirror_airtable_fields") or extract_mirror_airtable_fields(mirror_summary)
+    summary = {**summary, "mirror_airtable_fields": mirror_fields}
 
     def _write():
         table = ac.get_base().table("Projects")
@@ -315,12 +325,17 @@ async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> boo
         if merged_gaps != (current_gaps or "").strip():
             update_payload["Gaps"] = merged_gaps
 
-        # Проставляем отзеркалированные ссылки на личный Drive
-        mirror_summary = summary.get("drive_mirror") or {}
-        mirror_fields = summary.get("mirror_airtable_fields") or extract_mirror_airtable_fields(mirror_summary)
-
-        if mirror_fields.get("Link to Developer’s Kit (Rus)") and not fields_dict.get("Link to Developer’s Kit (Rus)"):
-            update_payload["Link to Developer’s Kit (Rus)"] = mirror_fields["Link to Developer’s Kit (Rus)"]
+        if mirror_fields.get("Renders"):
+            current_renders = fields_dict.get("Renders")
+            if not current_renders:
+                update_payload["Renders"] = mirror_fields["Renders"]
+            elif mirror_fields["Renders"] not in str(current_renders):
+                # Там уже чужая ссылка (обычно папка застройщика). Менять её -
+                # решение владельца, поэтому только сообщаем, а не затираем.
+                logger.warning(
+                    f"Renders у {project_id} занят другой ссылкой, зеркало не "
+                    f"проставлено: {mirror_fields['Renders']}"
+                )
 
         if mirror_fields.get("Img") and not fields_dict.get("Img"):
             update_payload["Img"] = mirror_fields["Img"]
@@ -329,8 +344,9 @@ async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> boo
             return False
 
         result = ac.robust_airtable_op(table.update, project_id, fields=update_payload)
-        if not result or not result.get('id'):
-            logger.error(f"❌ Не удалось обновить карточку {project_id}: {result.get('error_details', 'unknown')}")
+        if not isinstance(result, dict) or not result.get('id'):
+            details = result.get('error_details', 'unknown') if isinstance(result, dict) else result
+            logger.error(f"❌ Не удалось обновить карточку {project_id}: {details}")
             return False
         return True
 

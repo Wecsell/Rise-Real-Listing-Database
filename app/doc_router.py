@@ -40,12 +40,26 @@ DOC_TYPE_PATTERNS = [
     ("zoning", r"\bitr\b|\bpkkpr\b|tata\s*ruang|zoning|\bkkpr\b"),
     ("company", r"akta\s*pendirian|\bnib\b|\bnpwp\b|notaris"),
     ("lease", r"\bsmt\b|sewa|lease|\bakta\b|perjanjian"),
+    # pric(e|ing): реальное имя из папки Four Palms - "ENG Pricing June'2026.pdf".
+    # Шаблон "price" его не ловит, в "Pricing" такой подстроки нет.
     ("pricing", r"pric(?:e|ing)|harga|pricelist|specification|spesifikasi|quotation"),
-    ("presentation", r"presentation|brochure|devkit|catalog|каталог|презентация|deck|info|about|overview|concept|masterplan|booklet"),
-    ("location", r"location|map|карта|локация|address|адрес|район|district"),
     ("certificate", r"\bshm\b|\bshgb\b|sertifikat|certificate\s*of\s*land"),
+    # Слабые признаки - строго последними, по правилу порядка выше.
+    # Здесь нельзя держать общие слова ("info", "about", "deck", "overview",
+    # "concept", голый "map"): haystack включает ПУТЬ, поэтому "Legal/General
+    # Info/SHM Certificate.pdf" уезжал в presentation вместо certificate,
+    # а "Deck area/pool.jpg" и "Renders/Masterplan/3.1.jpg" переставали быть
+    # рендерами (проверено прогоном 02.08.2026).
+    ("presentation", r"presentation|презентац|brochure|брошюр|dev\s*kit|devkit|catalog(?:ue)?|каталог|booklet"),
+    ("location", r"\blocation\b|\bлокация\b|site\s*plan|master\s*plan|masterplan|google\.[a-z.]*/maps"),
+    # \bpt[\s.] совпадает почти с каждым файлом застройщика - только последним.
     ("company", r"company|\bpt[\s.]"),
 ]
+
+# Типы, которые опознаются по слабым, "маркетинговым" признакам. Картинка,
+# попавшая в них, - это рендер или план, а не скан документа: отправлять её
+# в дорогое зрение нельзя.
+_WEAK_DOC_TYPES = {"presentation", "location"}
 
 # Какие поля Airtable закрывает документ каждого типа. Имена полей - ровно те,
 # что в app/gaps.py: роутер должен говорить на языке детектора пробелов, иначе
@@ -118,7 +132,8 @@ def is_document_scan(file_info: Dict[str, Any]) -> bool:
     mime = file_info.get("mimeType") or ""
     if not mime.startswith("image/"):
         return False
-    return classify_document(file_info.get("name"), file_info.get("path", "")) is not None
+    doc_type = classify_document(file_info.get("name"), file_info.get("path", ""))
+    return doc_type is not None and doc_type not in _WEAK_DOC_TYPES
 
 
 def needs_vision(file_info: Dict[str, Any]) -> bool:

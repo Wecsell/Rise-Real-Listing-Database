@@ -356,26 +356,42 @@ async def mirror_project_external_images(
 
 def extract_mirror_airtable_fields(mirror_summary: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Извлекает данные для полей Airtable из результата зеркалирования:
-    - Link to Developer’s Kit (Rus): ссылка на созданную папку зеркала в Google Drive
-    - Img: обложка проекта (первое скопированное изображение)
+    Извлекает поля Airtable из результата зеркалирования:
+    - Renders: ссылка на папку-зеркало на нашем Drive;
+    - Img: обложка проекта (первый скопированный рендер).
+
+    Именно Renders, а не 'Link to Developer’s Kit (Rus)': последнее - ссылка на
+    материалы САМОГО застройщика, первоисточник. Записав туда своё зеркало, мы
+    теряем оригинал и на следующем прогоне выкачиваем собственную копию вместо
+    материалов застройщика. Поле Projects.Renders заведено под это 02.08.2026
+    (в Units одноимённое поле было изначально).
     """
+    from app.doc_router import is_document_scan
+
     fields: Dict[str, Any] = {}
     if not mirror_summary or not isinstance(mirror_summary, dict):
         return fields
 
     dest_folder_id = mirror_summary.get("dest_folder_id")
     if dest_folder_id:
-        fields["Link to Developer’s Kit (Rus)"] = f"https://drive.google.com/drive/folders/{dest_folder_id}"
+        fields["Renders"] = f"https://drive.google.com/drive/folders/{dest_folder_id}"
 
     results = mirror_summary.get("results") or []
     for item in results:
         status = item.get("status")
         # mirror_drive_image returns 'file_id', not 'id'
         file_id = item.get("file_id") or item.get("id")
-        if status in ("copied", "exists", "uploaded") and file_id:
-            cover_url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
-            fields["Img"] = [{"url": cover_url}]
-            break
+        if status not in ("copied", "exists", "uploaded") or not file_id:
+            continue
+        # Обложкой не может стать скан документа: в зеркало попадает и "SLF reg.jpeg".
+        if is_document_scan({
+            "mimeType": "image/jpeg",
+            "name": item.get("name"),
+            "path": item.get("path", ""),
+        }):
+            continue
+        # Формат URL картинки закреплён каноном базы (RULES.md): sz=w2000.
+        fields["Img"] = [{"url": f"https://drive.google.com/thumbnail?id={file_id}&sz=w2000"}]
+        break
 
     return fields

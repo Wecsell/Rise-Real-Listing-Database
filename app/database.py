@@ -109,13 +109,23 @@ async def save_fact(
 ):
     """Сохраняет исторический факт изменения данных (например, цены) в таблицу facts."""
     if not pool:
+        # Молча терять историю цен нельзя: без Postgres фича просто не работает,
+        # и это должно быть видно в логе, а не выглядеть как успешная запись.
+        logger.warning(
+            f"Postgres недоступен — факт [{fact_type}] по проекту {project_recid} "
+            f"({old_value} -> {new_value}) НЕ записан"
+        )
         return
     try:
+        # None -> "", но 0 и '0' обязаны сохраниться как есть: цена 0 это тоже
+        # значение, а не отсутствие данных.
+        old_str = "" if old_value is None else str(old_value)
+        new_str = "" if new_value is None else str(new_value)
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO facts (project_recid, unit_id, old_value, new_value, fact_type, source_message_id, model_used, tokens_in, tokens_out)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """, project_recid[:255] if project_recid else "", unit_id, str(old_value) if old_value else "", str(new_value) if new_value else "", fact_type[:50] if fact_type else "price_change", source_message_id, model_used, tokens_in, tokens_out)
+            """, project_recid[:255] if project_recid else "", unit_id, old_str, new_str, fact_type[:50] if fact_type else "price_change", source_message_id, model_used, tokens_in, tokens_out)
             logger.info(f"📊 Fact recorded [{fact_type}] for project {project_recid}: {old_value} -> {new_value}")
     except Exception as e:
         logger.error(f"Error saving fact for project {project_recid}: {e}")

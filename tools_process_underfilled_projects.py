@@ -4,8 +4,8 @@
 2. Заполнены МЕНЕЕ чем на 60% (по списку обязательных полей из app/gaps.py).
 
 Запуск:
-    python tools_process_underfilled_projects.py          # По умолчанию с --apply
-    python tools_process_underfilled_projects.py --check  # Только список проектов без выполнения
+    python tools_process_underfilled_projects.py          # Только список проектов, без записи
+    python tools_process_underfilled_projects.py --apply  # Экстракция + запись в Airtable
 """
 import os
 import sys
@@ -36,12 +36,18 @@ def calculate_completeness(fields: Dict[str, Any]) -> float:
 
 async def main():
     parser = argparse.ArgumentParser(description="Обработка проектов с заполненностью < 60%")
-    parser.add_argument("--check", action="store_true", help="Только показать список проектов без запуска")
+    parser.add_argument("--apply", action="store_true",
+                        help="Запускать экстракцию и писать в Airtable (по умолчанию — только список)")
+    parser.add_argument("--check", action="store_true",
+                        help="Совместимость: то же, что запуск без флагов — только список проектов")
     parser.add_argument("--force", action="store_true", help="Форсировать повторный разбор даже если разбор уже был")
     parser.add_argument("--limit", type=int, default=0, help="Лимит проектов (0 = без ограничений)")
     args = parser.parse_args()
 
-    apply = not args.check
+    # Запись и зеркалирование — только по явному флагу. Прежний
+    # `apply = not args.check` означал, что запуск без аргументов проходил по
+    # всей базе, писал в Airtable и копировал гигабайты файлов на Drive.
+    apply = args.apply and not args.check
 
     ac.init_cache()
     all_projects = ac.CACHE_PROJECTS
@@ -77,7 +83,9 @@ async def main():
         p_name = p.get('fields', {}).get('Project Name', 'Unnamed')
         logger.info(f"  • {p_name[:35]:36} | Заполненность: {comp*100:.1f}%")
 
-    if args.check:
+    if not apply:
+        logger.info("Режим отчёта: ничего не записано и не скопировано. "
+                    "Для реальной обработки добавьте --apply.")
         return
 
     logger.info(f"\n🚀 НАЧИНАЕМ ПАКЕТНУЮ ЭКСТРАКЦИЮ И ЗЕРКАЛИРОВАНИЕ...")
@@ -99,7 +107,7 @@ async def main():
         for field_name, url in links:
             try:
                 logger.info(f"   ➜ [{field_name}]: {url}")
-                res = await process_generic_link(url, project_name=p_name)
+                res = await process_generic_link(url, project_name=p_name if apply else None)
                 saved = await save_findings_to_gaps(rec_id, res)
                 if saved:
                     any_updated = True

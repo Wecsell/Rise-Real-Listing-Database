@@ -10,10 +10,12 @@
 1. Выкачивает содержимое ссылки (Notion API, Google Sheets CSV, Drive folder, PDF).
 2. Анализирует документ с помощью Gemini под пропуски полей (Gaps).
 3. Зеркалирует рендеры на личный Google Drive (если настроен).
-4. Записывает блок предложений и отзеркалированные ссылки в карточку проекта в Airtable (`Gaps`, `Img`, `Link to Developer’s Kit (Rus)`).
+4. Записывает блок предложений в `Gaps` и обложку в `Img`. Ссылка застройщика
+   (`Link to Developer’s Kit`) не перезаписывается: адрес зеркала уходит текстом
+   в секцию Gaps, отдельного поля под него в Projects нет.
 
 Запуск:
-    python tools_batch_process_links.py                   # По умолчанию dry-run / лимит 5
+    python tools_batch_process_links.py                   # dry-run, без записи и без зеркалирования
     python tools_batch_process_links.py --apply --limit 20 # Обработать 20 проектов
     python tools_batch_process_links.py --apply --all      # Обработать ВСЕ 125 проектов
     python tools_batch_process_links.py --project "Mangata" # Только для одного проекта
@@ -57,8 +59,11 @@ async def process_project_links(project_record: Dict[str, Any], apply: bool = Tr
     for field_name, url in links:
         try:
             logger.info(f"   ➜ [{field_name}]: {url}")
-            res = await process_generic_link(url, project_name=project_name)
-            
+            # project_name включает зеркалирование файлов на личный Drive внутри
+            # process_generic_link. Без apply это была бы запись мимо "сухого"
+            # прогона: копии гигабайтов уезжали на Drive при формально dry-run.
+            res = await process_generic_link(url, project_name=project_name if apply else None)
+
             if apply:
                 saved = await save_findings_to_gaps(rec_id, res)
                 if saved:

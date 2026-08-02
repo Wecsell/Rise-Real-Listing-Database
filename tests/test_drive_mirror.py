@@ -440,8 +440,32 @@ class TestExtractMirrorAirtableFields(unittest.TestCase):
             ]
         }
         fields = extract_mirror_airtable_fields(summary)
-        self.assertEqual(fields.get("Link to Developer’s Kit (Rus)"), "https://drive.google.com/drive/folders/folder_123")
-        self.assertEqual(fields.get("Img"), [{"url": "https://drive.google.com/thumbnail?id=img_456&sz=w800"}])
+        # Зеркало едет в Renders: 'Link to Developer’s Kit' - ссылка застройщика,
+        # подменять первоисточник своей копией нельзя.
+        self.assertEqual(
+            fields.get("Renders"),
+            "https://drive.google.com/drive/folders/folder_123",
+        )
+        self.assertNotIn("Link to Developer’s Kit (Rus)", fields)
+        # sz=w2000 - канон формата картинки из RULES.md.
+        self.assertEqual(fields.get("Img"), [{"url": "https://drive.google.com/thumbnail?id=img_456&sz=w2000"}])
+
+    def test_cover_skips_document_scans(self):
+        """Обложкой проекта не должен становиться скан документа из Legal-папки."""
+        from app.drive_mirror import extract_mirror_airtable_fields
+
+        summary = {
+            "dest_folder_id": "folder_123",
+            "results": [
+                {"name": "SLF reg.jpeg", "status": "copied", "file_id": "scan_1"},
+                {"name": "3.1.jpg", "status": "copied", "file_id": "render_1", "path": "Renders"},
+            ]
+        }
+        fields = extract_mirror_airtable_fields(summary)
+        self.assertEqual(
+            fields.get("Img"),
+            [{"url": "https://drive.google.com/thumbnail?id=render_1&sz=w2000"}],
+        )
 
     def test_handles_empty_summary(self):
         from app.drive_mirror import extract_mirror_airtable_fields

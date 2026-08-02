@@ -1,7 +1,7 @@
 # 🤖 Bots RV — Полный аудит системы листинга
 
 > **Стек:** Python 3.12 · Telethon · Gemini 3.5 Flash · Airtable · PostgreSQL · Redis · Docker  
-> **Тесты:** 647 passed · **База:** `appsAbRs7DnYYWFt6` (Test) / `app2IEMPr6R3GelVP` (Prod)  
+> **Тесты:** 685 passed (0 failed) · **База:** `appsAbRs7DnYYWFt6` (Test) / `app2IEMPr6R3GelVP` (Prod)  
 > **Стоимость:** ~$30-70/мес (Gemini API + Airtable)
 
 ---
