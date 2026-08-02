@@ -37,10 +37,14 @@ from app.airtable_client import (get_base, get_select_options, init_cache_async,
 
 DEVELOPER_NAME = "Bali Baza"
 
-# Контакты собраны из чата, партнёрского портала и вики The Heights.
+# Контакты собраны из чата, партнёрского портала, вики The Heights, и
+# (Валерия/Дан) - из независимой полевой находки 02.08.2026, приклеенной
+# раньше к сиротской заглушке 'Unknown' (recp5xr2cwdf5LdLX) вместе с
+# остальными шестью чужими проектами - см. разбор в этой же сессии.
 DEVELOPER_CONTACTS = (
     "+62 81139908903, @balibazapartners, @balibazaagents, "
-    "@agent_bali_baza, +62 89505211764"
+    "@agent_bali_baza, +62 89505211764, "
+    "Валерия: @Agent_Bali_Baza, Дан: @DanBaliBaza"
 )
 
 KEDUNGU_MATRIX_SHEET = "1TWbIAHCWka3ChmSxnl_n1brWpvHWygSgQygDn7SoKMI"
@@ -105,8 +109,15 @@ PROJECTS = [
         # создал бы дубль (проверено на живых данных 02.08.2026).
         "_existing_name": "Kedungu",
         "District": "Kedungu",
-        "Property Type": ["Apartment"],
-        "Construction stage": "Finishing",
+        # Studio добавлена 02.08.2026: в шахматке 27 SMT + 5 SL - настоящие
+        # студии, а не только апартаменты (см. fetch_kedungu_typology).
+        "Property Type": ["Apartment", "Studio"],
+        # Было ошибочно 'Finishing' - скопировано со старого стейта карточки
+        # ('Kedungu' до переименования), а не выведено из источника. В чате
+        # прямым текстом (#155, 22.05.2026): "Идут монолитные работы" - это
+        # Structure, что и согласуется со сдачей через 10-11 месяцев (найдено
+        # владельцем при ручной проверке карточки 02.08.2026).
+        "Construction stage": "Structure",
         "Ownership Type": "Leasehold",
         "Lease Term (years)": 30,
         # Поле в базе — singleLineText, а не число (проверено 02.08.2026):
@@ -116,6 +127,11 @@ PROJECTS = [
         "Handover Permits": "PBG",
         "Total Units": 58,
         "Downpayment": 0.05,
+        # Координаты точки (не viewport-центр) из короткой ссылки портала
+        # ('Локация на карте') - развёрнута вручную 02.08.2026, !3d/!4d из
+        # финального URL Google Maps. Поле ждёт "долгота,широта" (см.
+        # app.naming.swap_coordinates).
+        "Coordinates(for Map)": "115.0862312, -8.6079802",
         "Availability Chart": f"https://docs.google.com/spreadsheets/d/{KEDUNGU_MATRIX_SHEET}/edit?gid=849122232",
         "Link to Developer’s Kit (Rus)": "https://drive.google.com/drive/folders/1CYb5VUvG2_ba_H8h9Q4JPHUHq7FWyOjT",
         "Link to Developer’s Kit (Eng)": "https://drive.google.com/drive/folders/1nzulfJcek4KM7OcJQm4yHESltHCRCbxn",
@@ -127,6 +143,17 @@ PROJECTS = [
             "Гарантия дохода 9% для Honeymoon Suite."
         ),
         "_units_from_matrix": "kedungu",
+        # До правки 02.08.2026 в Gaps висел устаревший список с 'Handover Date',
+        # хотя дата сдачи уже заполнена: robust_airtable_op фильтрует пустые
+        # строки, поэтому запись Gaps="" не очищает поле - нужно явно писать
+        # актуальный список, а не полагаться на очистку пустым значением.
+        "_gaps": [
+            "Land Zoning Color не указан - уточнить у застройщика",
+            "Bathrooms по юнитам не заполнены",
+            "View не указан ни в одном источнике",
+            "Property Management не указан",
+            "Distance to the beach не указана (в материалах только «3 минуты пешком»)",
+        ],
     },
     {
         "Project Name": "Origins",
