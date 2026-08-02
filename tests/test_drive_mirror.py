@@ -426,5 +426,29 @@ class TestMirrorExternalImage(unittest.TestCase):
         asyncio.run(run_test())
 
 
+class TestExtractMirrorAirtableFields(unittest.TestCase):
+
+    def test_extracts_folder_url_and_cover_image(self):
+        from app.drive_mirror import extract_mirror_airtable_fields
+
+        summary = {
+            "dest_folder_id": "folder_123",
+            "results": [
+                {"name": "doc.pdf", "status": "skipped"},
+                {"name": "render1.jpg", "status": "copied", "file_id": "img_456"},
+                {"name": "render2.jpg", "status": "copied", "file_id": "img_789"},
+            ]
+        }
+        fields = extract_mirror_airtable_fields(summary)
+        self.assertEqual(fields.get("Link to Developer’s Kit (Rus)"), "https://drive.google.com/drive/folders/folder_123")
+        self.assertEqual(fields.get("Img"), [{"url": "https://drive.google.com/thumbnail?id=img_456&sz=w800"}])
+
+    def test_handles_empty_summary(self):
+        from app.drive_mirror import extract_mirror_airtable_fields
+
+        fields = extract_mirror_airtable_fields({})
+        self.assertEqual(fields, {})
+
+
 if __name__ == '__main__':
     unittest.main()

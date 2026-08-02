@@ -415,12 +415,13 @@ async def process_generic_link(
                 logger.info(f"📁 Папка Google Drive развёрнута: {url_clean} -> {len(files)} файлов")
 
                 if project_name:
-                    from app.drive_mirror import mirror_listed_drive_folder
+                    from app.drive_mirror import extract_mirror_airtable_fields, mirror_listed_drive_folder
                     try:
                         mirror_summary = await asyncio.to_thread(
                             mirror_listed_drive_folder, gdrive_id, files, project_name
                         )
                         result["drive_mirror"] = mirror_summary
+                        result["mirror_airtable_fields"] = extract_mirror_airtable_fields(mirror_summary)
                         result["gaps"].extend(mirror_summary.get("gaps", []))
                         copied = sum(1 for r in mirror_summary["results"] if r["status"] == "copied")
                         logger.info(

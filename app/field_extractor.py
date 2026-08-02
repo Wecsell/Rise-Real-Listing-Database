@@ -71,6 +71,11 @@ FIELD_QUESTIONS: Dict[str, str] = {
     ),
     "Developer": "What is the full legal name of the company that owns or develops this project?",
     "Price From (USD)": "What is the lowest price of a unit, and in what currency?",
+    "District": "In which district or area of Bali (e.g. Canggu, Ubud, Bingin, Uluwatu, Sanur, Umalas, Kedungu, Pererenan, Seminyak, Jimbaran, Tabanan, Nusa Penida) is this project located?",
+    "Property Type": "What is the property type of the project (e.g. Villa, Apartment, Townhouse, Loft, Hotel, Complex)?",
+    "Construction stage": "What is the construction stage of the project (e.g. Off-plan, Under Construction, Completed)?",
+    "Handover Date": "What is the expected handover, completion, or delivery date or quarter/year of the project?",
+    "Location Link": "What is the address, location details, or Google Maps URL of the project mentioned in the document?",
 }
 
 _NOT_STATED = ("not stated", "not stated.", "unknown", "n/a", "none", "")

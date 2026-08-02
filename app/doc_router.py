@@ -40,9 +40,9 @@ DOC_TYPE_PATTERNS = [
     ("zoning", r"\bitr\b|\bpkkpr\b|tata\s*ruang|zoning|\bkkpr\b"),
     ("company", r"akta\s*pendirian|\bnib\b|\bnpwp\b|notaris"),
     ("lease", r"\bsmt\b|sewa|lease|\bakta\b|perjanjian"),
-    # pric(e|ing): реальное имя из папки Four Palms - "ENG Pricing June'2026.pdf".
-    # Шаблон "price" его не ловит, в "Pricing" такой подстроки нет.
     ("pricing", r"pric(?:e|ing)|harga|pricelist|specification|spesifikasi|quotation"),
+    ("presentation", r"presentation|brochure|devkit|catalog|каталог|презентация|deck|info|about|overview|concept|masterplan|booklet"),
+    ("location", r"location|map|карта|локация|address|адрес|район|district"),
     ("certificate", r"\bshm\b|\bshgb\b|sertifikat|certificate\s*of\s*land"),
     ("company", r"company|\bpt[\s.]"),
 ]
@@ -52,10 +52,12 @@ DOC_TYPE_PATTERNS = [
 # сопоставление "пустое поле -> документ" придётся делать вручную в двух местах.
 DOC_TYPE_TO_FIELDS: Dict[str, Set[str]] = {
     "lease": {"Lease Term (years)", "Ownership Type"},
-    "zoning": {"Land Zoning Color"},
+    "zoning": {"Land Zoning Color", "District"},
     "permits": {"Handover Permits"},
     "company": {"Developer"},
-    "pricing": {"Price From (USD)", "Price from(USD)", "Area from (m2)"},
+    "pricing": {"Price From (USD)", "Price from(USD)", "Area from (m2)", "Handover Date", "Construction stage"},
+    "presentation": {"District", "Property Type", "Construction stage", "Handover Date", "Location Link", "Ownership Type"},
+    "location": {"District", "Location Link"},
     "certificate": {"Land Zoning Color"},
 }
 

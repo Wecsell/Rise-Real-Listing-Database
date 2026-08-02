@@ -298,27 +298,46 @@ def merge_into_gaps(existing: Optional[str], block: str) -> str:
 
 async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> bool:
     """
-    Записывает секцию бота в поле Gaps карточки проекта.
-
-    Пишется ТОЛЬКО Gaps: сами поля карточки не трогаются, значения доезжают до
-    них после Confirmed. Существующий текст Gaps сохраняется целиком.
+    Записывает секцию бота в поле Gaps карточки проекта, а также безопасные
+    поля зеркалирования Drive (Link to Developer’s Kit (Rus) и обложку Img).
     """
     import app.airtable_client as ac
+    from app.drive_mirror import extract_mirror_airtable_fields
 
     def _write():
         table = ac.get_base().table("Projects")
         record = table.get(project_id)
-        current = (record.get("fields", {}) or {}).get("Gaps")
-        merged = merge_into_gaps(current, format_findings_block(summary))
-        if merged == (current or "").strip():
+        fields_dict = record.get("fields", {}) or {}
+        current_gaps = fields_dict.get("Gaps")
+        merged_gaps = merge_into_gaps(current_gaps, format_findings_block(summary))
+
+        update_payload = {}
+        if merged_gaps != (current_gaps or "").strip():
+            update_payload["Gaps"] = merged_gaps
+
+        # Проставляем отзеркалированные ссылки на личный Drive
+        mirror_summary = summary.get("drive_mirror") or {}
+        mirror_fields = summary.get("mirror_airtable_fields") or extract_mirror_airtable_fields(mirror_summary)
+
+        if mirror_fields.get("Link to Developer’s Kit (Rus)") and not fields_dict.get("Link to Developer’s Kit (Rus)"):
+            update_payload["Link to Developer’s Kit (Rus)"] = mirror_fields["Link to Developer’s Kit (Rus)"]
+
+        if mirror_fields.get("Img") and not fields_dict.get("Img"):
+            update_payload["Img"] = mirror_fields["Img"]
+
+        if not update_payload:
             return False
-        table.update(project_id, {"Gaps": merged})
+
+        result = ac.robust_airtable_op(table.update, project_id, fields=update_payload)
+        if not result or not result.get('id'):
+            logger.error(f"❌ Не удалось обновить карточку {project_id}: {result.get('error_details', 'unknown')}")
+            return False
         return True
 
     try:
         changed = await asyncio.to_thread(_write)
         if changed:
-            logger.info(f"📝 Gaps обновлены для карточки {project_id}")
+            logger.info(f"📝 Поля и Gaps обновлены для карточки {project_id}")
         return changed
     except Exception as e:
         logger.error(f"Не удалось записать Gaps для {project_id}: {e}")

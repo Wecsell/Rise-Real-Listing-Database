@@ -72,14 +72,22 @@ REQUIRED_FIELDS = {
 REQUIRED_FIELDS['Units (Secondary)'] = list(REQUIRED_FIELDS['Units'])
 
 
+# Поля, которые рассчитываются формулами или являются служебными (read-only).
+# Запись в них через API приводит к критической ошибке Airtable 422.
+READ_ONLY_FIELDS = {
+    'Units': ['Unit ID', 'Price per m²'],
+    'Units (Secondary)': ['Unit ID', 'Price per m²'],
+}
+
+
 def expected_select_values() -> dict:
     """Значения селектов, которые код может отдать. Источник — сам код."""
     return {
         ('Projects', 'District'): set(AREA_ALIASES.values()),
         ('Projects', 'Construction stage'): set(VALID_STAGES),
+        ('Projects', 'Property Type'): {v for v in UNIT_TYPE_ALIASES.values() if v},
         ('Field Staging', 'Priority'): set(AIRTABLE_PRIORITY.values()),
         ('Units', 'Pool'): set(VALID_POOL_VALUES),
-        # None означает «поле не заполняем» — это не значение селекта
         ('Units', 'Unit type'): {v for v in UNIT_TYPE_ALIASES.values() if v},
         ('Units (Secondary)', 'Pool'): set(VALID_POOL_VALUES),
         ('Units (Secondary)', 'Unit type'): {v for v in UNIT_TYPE_ALIASES.values() if v},
@@ -92,6 +100,7 @@ def check_schema_drift() -> List[str]:
     """
     problems: List[str] = []
 
+    # 1. Проверка существования обязательных полей
     for table, fields in REQUIRED_FIELDS.items():
         for name in fields:
             if not field_exists(table, name):
@@ -100,6 +109,16 @@ def check_schema_drift() -> List[str]:
                     f"запись упадет с 422"
                 )
 
+    # 2. Проверка, что в REQUIRED_FIELDS не попали read-only / formula поля
+    for table, read_only_list in READ_ONLY_FIELDS.items():
+        for name in read_only_list:
+            if name in REQUIRED_FIELDS.get(table, []):
+                problems.append(
+                    f"[ошибка схемы: read-only поле] {table}.{name!r} является формулой/read-only. "
+                    f"Попытка записи вызовет падение 422."
+                )
+
+    # 3. Проверка соответствия значений селектов
     for (table, field), expected in expected_select_values().items():
         actual = set(get_select_options(table, field))
         if not actual:

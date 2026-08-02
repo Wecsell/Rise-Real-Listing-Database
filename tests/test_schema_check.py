@@ -53,6 +53,15 @@ class TestDriftDetection:
         )
         assert check_schema_drift() == []
 
+    def test_reports_readonly_formula_fields_in_required(self, monkeypatch):
+        monkeypatch.setattr(schema_check, 'field_exists', lambda table, field: True)
+        monkeypatch.setattr(schema_check, 'get_select_options', lambda table, field: ['заглушка'])
+        # monkeypatch.setitem auto-reverts on teardown — no manual cleanup needed
+        monkeypatch.setitem(schema_check.REQUIRED_FIELDS, 'Units', ['Unit ID'])
+
+        problems = check_schema_drift()
+        assert any("read-only" in p and "Unit ID" in p for p in problems)
+
 
 class TestExpectationsComeFromCode:
     """

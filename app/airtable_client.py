@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import difflib
+import requests
 from pyairtable import Api
 from datetime import datetime
 
@@ -403,10 +404,8 @@ def safe_float(val):
     except (ValueError, TypeError):
         return val
 
-import requests
-
 def robust_airtable_op(func, *args, fields=None, **kwargs):
-    """Синхронная обертка для безопасного выполнения (устарела, используйте async)"""
+    """Синхронная обертка для безопасного выполнения с детальной диагностикой ошибок"""
     try:
         if 'fields' in kwargs:
             kwargs['fields'] = {k: v for k, v in kwargs['fields'].items() if v is not None and str(v).strip() != ""}
@@ -415,11 +414,16 @@ def robust_airtable_op(func, *args, fields=None, **kwargs):
         
         return func(*args, **kwargs)
     except requests.exceptions.HTTPError as e:
-        logger.error(f"Airtable HTTP Error 422: {e}")
-        return {'id': None, 'fields': {}}
+        status_code = e.response.status_code if e.response is not None else None
+        try:
+            err_body = e.response.text if e.response is not None else str(e)
+        except Exception:
+            err_body = str(e)
+        logger.error(f"❌ Airtable HTTP Error [{status_code}]: {err_body}")
+        return {'id': None, 'error_code': status_code, 'error_details': err_body, 'fields': {}}
     except Exception as e:
-        logger.error(f"Unexpected Airtable Error: {e}")
-        return {'id': None, 'fields': {}}
+        logger.error(f"❌ Unexpected Airtable Error: {e}")
+        return {'id': None, 'error_code': None, 'error_details': str(e), 'fields': {}}
 
 async def robust_airtable_op_async(func, *args, fields=None, **kwargs):
     """Асинхронная обертка, запускающая HTTP-запросы в отдельном потоке."""
@@ -772,13 +776,19 @@ async def upsert_developer(dev_data: dict) -> str:
         # Обновляем (upsert)
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
         if not record or not record.get('id'):
-            logger.warning(f"Failed to update Developer {rec_id} (likely deleted in Airtable). Removing from cache and creating fresh record...")
-            CACHE_DEVELOPERS = [c for c in CACHE_DEVELOPERS if c['id'] != rec_id]
-            record = await robust_airtable_op_async(table.create, fields=fields)
-            if record and record.get('id'):
-                CACHE_DEVELOPERS.append(record)
-                return record['id']
-            return None
+            err_code = record.get('error_code') if isinstance(record, dict) else None
+            err_details = record.get('error_details', '') if isinstance(record, dict) else ''
+            if err_code == 404:
+                logger.warning(f"Developer {rec_id} was deleted in Airtable (404). Recreating fresh record...")
+                CACHE_DEVELOPERS = [c for c in CACHE_DEVELOPERS if c['id'] != rec_id]
+                record = await robust_airtable_op_async(table.create, fields=fields)
+                if record and record.get('id'):
+                    CACHE_DEVELOPERS.append(record)
+                    return record['id']
+                return None
+            else:
+                logger.error(f"❌ Failed to update Developer '{dev_name}' (ID: {rec_id}) [{err_code}]: {err_details}")
+                return None
         
         # Обновляем кэш
         for i, c in enumerate(CACHE_DEVELOPERS):
@@ -930,16 +940,36 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
 
     if match:
         rec_id = match['id']
+        old_price = match.get('fields', {}).get('Price From (USD)')
+        new_price = fields.get('Price From (USD)')
+        if old_price is not None and new_price is not None and safe_float(old_price) != safe_float(new_price):
+            try:
+                from app.database import save_fact
+                await save_fact(
+                    project_recid=rec_id,
+                    old_value=str(old_price),
+                    new_value=str(new_price),
+                    fact_type="price_change"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record price change fact: {e}")
+
         logger.info(f"Updating project '{proj_name}' matched to '{match['fields'].get('Project Name')}' (ID: {rec_id}, Score: {score:.2f})")
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
         if not record or not record.get('id'):
-            logger.warning(f"Failed to update Project {rec_id} (likely deleted in Airtable). Removing from cache and creating fresh record...")
-            CACHE_PROJECTS = [c for c in CACHE_PROJECTS if c['id'] != rec_id]
-            record = await robust_airtable_op_async(table.create, fields=fields)
-            if record and record.get('id'):
-                CACHE_PROJECTS.append(record)
-                return record['id']
-            return None
+            err_code = record.get('error_code') if isinstance(record, dict) else None
+            err_details = record.get('error_details', '') if isinstance(record, dict) else ''
+            if err_code == 404:
+                logger.warning(f"Project {rec_id} was deleted in Airtable (404). Recreating fresh record...")
+                CACHE_PROJECTS = [c for c in CACHE_PROJECTS if c['id'] != rec_id]
+                record = await robust_airtable_op_async(table.create, fields=fields)
+                if record and record.get('id'):
+                    CACHE_PROJECTS.append(record)
+                    return record['id']
+                return None
+            else:
+                logger.error(f"❌ Failed to update Project '{proj_name}' (ID: {rec_id}) [{err_code}]: {err_details}")
+                return None
         
         # Обновляем кэш
         for i, c in enumerate(CACHE_PROJECTS):

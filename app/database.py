@@ -96,6 +96,30 @@ async def save_extraction(message_id: int, chat_id: int, project_recid: str, obj
     except Exception as e:
         logger.error(f"Error saving extraction for msg {message_id}: {e}")
 
+async def save_fact(
+    project_recid: str,
+    old_value: str,
+    new_value: str,
+    fact_type: str = "price_change",
+    unit_id: str = None,
+    source_message_id: int = None,
+    model_used: str = None,
+    tokens_in: int = None,
+    tokens_out: int = None
+):
+    """Сохраняет исторический факт изменения данных (например, цены) в таблицу facts."""
+    if not pool:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO facts (project_recid, unit_id, old_value, new_value, fact_type, source_message_id, model_used, tokens_in, tokens_out)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, project_recid[:255] if project_recid else "", unit_id, str(old_value) if old_value else "", str(new_value) if new_value else "", fact_type[:50] if fact_type else "price_change", source_message_id, model_used, tokens_in, tokens_out)
+            logger.info(f"📊 Fact recorded [{fact_type}] for project {project_recid}: {old_value} -> {new_value}")
+    except Exception as e:
+        logger.error(f"Error saving fact for project {project_recid}: {e}")
+
 async def close_db():
     global pool
     if pool:
