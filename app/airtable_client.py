@@ -1028,6 +1028,16 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     fields = {k: v for k, v in unit_data.items() if v is not None and str(v).strip() != ""}
     if 'Notes' in fields:
         fields.pop('Notes')
+
+    # 'Unit Number' — служебное имя для канонического Key выше; в схеме Units
+    # такого поля нет (там 'Unit ID'). Оставить его в fields значит отправить
+    # в Airtable несуществующее поле: запись падает с 422 целиком, а
+    # robust_airtable_op гасит ошибку и возвращает {'id': None} — юнит молча
+    # не создаётся. Номер при этом ценен сам по себе, поэтому переносим его
+    # в настоящее поле, не затирая явно заданный вызывающим 'Unit ID'.
+    if 'Unit Number' in fields:
+        unit_number_value = fields.pop('Unit Number')
+        fields.setdefault('Unit ID', unit_number_value)
     # Убираем нулевые плейсхолдеры Gemini
     unit_zero_meaningless = {'Price from (USD)', 'Bedrooms', 'Bathrooms', 'Total Floors', 
                              'Area from (m2)', 'Land Area (m2)', 'leasehold years'}
