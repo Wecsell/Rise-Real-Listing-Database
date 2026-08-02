@@ -167,6 +167,123 @@ class TestPipelineWiring(unittest.TestCase):
         self.assertEqual(res["opened"], 0)
 
 
+def _only_empty(*empty_keys):
+    """
+    Карточка, где пусты РОВНО перечисленные поля - остальные REQUIRED_PROJECT_FIELDS
+    заполнены заглушкой. Просто {"Field": None} этого не даёт: is_filled(None)
+    для отсутствующих ключей тоже False, то есть все незаписанные поля карточки
+    молча попадают в "пустые" и раздувают широкий fallback-вопрос сверх ожидаемого.
+    """
+    from app.gaps import REQUIRED_PROJECT_FIELDS
+    fields = {k: "filled" for k in REQUIRED_PROJECT_FIELDS}
+    for key in empty_keys:
+        fields[key] = None
+    return fields
+
+
+class TestUnknownFileClassificationFallback(unittest.TestCase):
+    """
+    Файлы, не опознанные по имени (implementation_plan.md, Э2, fallback), должны
+    сначала спросить реестр (app/doc_classification_registry.py), затем при
+    промахе классифицировать моделью и сохранить результат - а не сразу
+    перебирать модель по каждому пустому полю подряд.
+    """
+
+    def _run(self, files, project_fields, cached_type=None, model_type=None,
+              extract_side_effect=None, text="Some contract text"):
+        extract_side_effect = extract_side_effect or (lambda t, field: _accepted(field))
+
+        async def run_test():
+            with patch('app.drive_folder.download_drive_file', return_value=True), \
+                 patch('app.doc_pipeline._extract_text', new=AsyncMock(return_value=text)), \
+                 patch('app.doc_pipeline.get_cached_classification',
+                       new=AsyncMock(return_value=cached_type)), \
+                 patch('app.doc_pipeline.classify_document_content',
+                       new=AsyncMock(return_value=model_type)) as mock_classify, \
+                 patch('app.doc_pipeline.save_classification',
+                       new=AsyncMock()) as mock_save, \
+                 patch('app.doc_pipeline.extract_field',
+                       new=AsyncMock(side_effect=extract_side_effect)) as mock_extract:
+                res = await fill_fields_from_drive_files(project_fields, files)
+                res["_calls"] = [c.args[1] for c in mock_extract.await_args_list]
+                res["_classify_called"] = mock_classify.await_count > 0
+                res["_save_args"] = mock_save.await_args_list
+                return res
+
+        return asyncio.run(run_test())
+
+    def test_cached_classification_skips_model_and_narrows_question(self):
+        """Реестр уже знает тип - модель классификации не вызывается вовсе."""
+        res = self._run(
+            [_f("unnamed_scan_042.pdf", fid="drive-file-1")],
+            _only_empty("Handover Permits", "Land Zoning Color"),
+            cached_type="permits",
+        )
+        self.assertFalse(res["_classify_called"], "тип уже в реестре - модель классификации лишняя")
+        self.assertEqual(res["_calls"], ["Handover Permits"],
+                          "узкий вопрос только по полю, которое закрывает 'permits'")
+
+    def test_uncached_file_is_classified_and_result_saved_to_registry(self):
+        """
+        Промах реестра -> классификация моделью -> запись в реестр, чтобы
+        следующий прогон (этот или другой проект) не платил за тот же файл снова.
+        """
+        res = self._run(
+            [_f("unnamed_scan_042.pdf", fid="drive-file-1")],
+            _only_empty("Land Zoning Color"),
+            cached_type=None,
+            model_type="zoning",
+        )
+        self.assertTrue(res["_classify_called"])
+        self.assertEqual(res["_calls"], ["Land Zoning Color"])
+        self.assertEqual(len(res["_save_args"]), 1)
+        args = res["_save_args"][0].args
+        self.assertEqual(args[0], "drive-file-1")
+        self.assertEqual(args[1], "zoning")
+        self.assertEqual(res["_save_args"][0].kwargs.get("classified_by"), "model_fallback")
+
+    def test_classified_type_irrelevant_to_gaps_skips_extraction_entirely(self):
+        """
+        Модель успешно определила тип документа, но он не про наши пустые поля -
+        нет смысла тратить вызовы extract_field на заведомо не те вопросы.
+        """
+        res = self._run(
+            [_f("unnamed_scan_042.pdf", fid="drive-file-1")],
+            _only_empty("Handover Permits"),
+            cached_type=None,
+            model_type="pricing",
+        )
+        self.assertEqual(res["_calls"], [])
+        self.assertTrue(any("classified as 'pricing'" in g for g in res["gaps"]))
+
+    def test_genuinely_unclassifiable_file_falls_back_to_broad_questions(self):
+        """
+        Модель тоже не смогла классифицировать (None) - план разрешает
+        последний резерв: спросить документ по всем ещё пустым полям, а не
+        молча его пропустить.
+        """
+        res = self._run(
+            [_f("unnamed_scan_042.pdf", fid="drive-file-1")],
+            _only_empty("Handover Permits"),
+            cached_type=None,
+            model_type=None,
+        )
+        self.assertTrue(res["_classify_called"])
+        self.assertEqual(res["_calls"], ["Handover Permits"])
+        self.assertEqual(res["_save_args"], [], "нечего сохранять - классификация не удалась")
+
+    def test_no_file_id_skips_registry_lookup_but_still_extracts(self):
+        """Файл без id (теоретически) не должен падать - просто нет ключа для кэша."""
+        res = self._run(
+            [{"id": None, "name": "unnamed_scan_042.pdf", "mimeType": "application/pdf", "path": ""}],
+            _only_empty("Handover Permits"),
+            cached_type=None,
+            model_type="permits",
+        )
+        self.assertEqual(res["_calls"], ["Handover Permits"])
+        self.assertEqual(res["_save_args"], [], "без file_id сохранять некуда")
+
+
 class TestGapsMerging(unittest.TestCase):
     """
     В Gaps уже лежат рукописные разборы (у Four Palms - отчёт с номерами

@@ -142,6 +142,70 @@ def question_for(field: str) -> Optional[str]:
     return FIELD_QUESTIONS.get(field)
 
 
+_CLASSIFY_SYSTEM_PROMPT = """You classify ONE real-estate document by its type.
+
+Rules:
+- Answer using ONLY the text provided, no outside knowledge.
+- Pick exactly one label from the allowed list, or "unknown" if none genuinely fits.
+- Do not guess: an unclear or unrelated document must be "unknown", not a forced label.
+
+Return strictly this JSON:
+{"doc_type": "<one label from the list, or unknown>", "confidence": <0.0-1.0>}
+"""
+
+_DOC_TYPE_DESCRIPTIONS = {
+    "lease": "land lease / rental agreement (SMT, sewa, akta sewa)",
+    "zoning": "land zoning designation document (ITR, PKKPR, KKPR)",
+    "permits": "building/occupancy permit (PBG, SLF, IMB)",
+    "company": "developer company registration document (akta pendirian, NIB, NPWP)",
+    "pricing": "unit pricing or specification sheet",
+    "certificate": "land title certificate (SHM, SHGB)",
+}
+
+
+async def classify_document_content(text: str, model: str = DOC_MODEL) -> Optional[str]:
+    """
+    Классифицирует ДОКУМЕНТ (implementation_plan.md, Э2, fallback для файлов,
+    не опознанных по имени) - не поле, поэтому вне валидации цитат из extract_field:
+    ошибочная классификация здесь максимум приводит к неверному узкому вопросу,
+    а итоговое значение поля всё равно проходит свою собственную проверку цитаты.
+
+    Возвращает один из ключей app.doc_router.DOC_TYPE_TO_FIELDS или None, если
+    модель ответила "unknown" либо вернула что-то не из списка - в реестр
+    попадает только правдоподобный тип, не мусор.
+    """
+    if not client or not (text or "").strip():
+        return None
+
+    from app.doc_router import DOC_TYPE_TO_FIELDS
+
+    labels = sorted(DOC_TYPE_TO_FIELDS.keys())
+    listing = "\n".join(f"- {label}: {_DOC_TYPE_DESCRIPTIONS.get(label, label)}" for label in labels)
+    # Нарезка входа (план, п.4): классификации достаточно начала документа,
+    # первая страница/заголовок обычно и определяет тип формы.
+    excerpt = (text or "")[:4000]
+
+    try:
+        resp = await client.aio.models.generate_content(
+            model=model or resolve_model_name(),
+            contents=f"ALLOWED LABELS:\n{listing}\n\nDOCUMENT:\n{excerpt}",
+            config=types.GenerateContentConfig(
+                system_instruction=_CLASSIFY_SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                temperature=0.0,
+            ),
+        )
+        data = _parse_model_json(resp.text)
+    except Exception as e:
+        logger.error(f"Ошибка классификации документа: {e}")
+        return None
+
+    doc_type = str(data.get("doc_type", "")).strip().lower()
+    if doc_type not in labels:
+        return None
+    return doc_type
+
+
 def select_relevant_pages(text: str, field: str, max_pages: int = 2) -> str:
     """
     Нарезка входа (план, п.4): не отдавать модели 10 страниц. Ищем страницы по

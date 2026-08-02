@@ -59,3 +59,14 @@ CREATE TABLE IF NOT EXISTS track_points (
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_points_lat_lng ON track_points(latitude, longitude);
+
+-- Реестр классификаций документов (implementation_plan.md, Э2). Ключ - file_id
+-- Google Drive: тип документа, определённый моделью для файла, не опознанного
+-- по имени, переиспользуется всеми проектами, не пересчитывается заново.
+CREATE TABLE IF NOT EXISTS document_classifications (
+    file_id VARCHAR(255) PRIMARY KEY,
+    doc_type VARCHAR(50) NOT NULL,
+    classified_by VARCHAR(50) NOT NULL,
+    model_used VARCHAR(50),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);

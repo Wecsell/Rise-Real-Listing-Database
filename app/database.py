@@ -27,12 +27,25 @@ async def init_db():
         # Миграция: Добавляем колонки для пакетной синхронизации, если их нет
         async with pool.acquire() as conn:
             await conn.execute("""
-                ALTER TABLE extractions 
+                ALTER TABLE extractions
                 ADD COLUMN IF NOT EXISTS raw_json JSONB,
                 ADD COLUMN IF NOT EXISTS sync_status VARCHAR(50) DEFAULT 'pending',
                 ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
             """)
-            
+
+            # Реестр классификаций документов (implementation_plan.md, Э2):
+            # file_id -> тип документа, заполняется один раз при fallback-разборе
+            # неопознанных по имени файлов, переиспользуется всеми проектами.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_classifications (
+                    file_id VARCHAR(255) PRIMARY KEY,
+                    doc_type VARCHAR(50) NOT NULL,
+                    classified_by VARCHAR(50) NOT NULL,
+                    model_used VARCHAR(50),
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                );
+            """)
+
     except Exception as e:
         logger.error(f"Failed to connect to Postgres database: {e}")
 

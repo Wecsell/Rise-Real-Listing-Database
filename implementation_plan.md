@@ -250,6 +250,10 @@ Units: `Bathrooms`, `Land Area (m²)`, `Pool`, `Furnishing`, `Parking`, `Commiss
   - `price`, `harga`, `pricelist`, `specification` → цены, площади
 - Реестр классификаций в Postgres: `file_id → тип документа, какие поля закрывает`.
   Заполняется один раз, переиспользуется всеми проектами.
+  **РЕАЛИЗОВАНО 2026-08-02**: `app/doc_classification_registry.py` +
+  `document_classifications` (`init.sql`, миграция в `app/database.py`),
+  подключён в `app/doc_pipeline.py`. Подробности — `walkthrough.md`, раздел
+  «02.08.2026». Живой прогон на боевом неопознанном файле ещё не делался.
 - **Fallback (по решению владельца)**: если поле пустое и по именам ничего не подошло —
   открыть непонятные документы в пределах бюджета, классифицировать, записать в реестр.
 

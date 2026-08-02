@@ -18,8 +18,9 @@ import os
 import tempfile
 from typing import Any, Dict, List, Optional, Set
 
-from app.doc_router import DEFAULT_OPEN_BUDGET, route_files_for_gaps
-from app.field_extractor import extract_field, question_for
+from app.doc_classification_registry import get_cached_classification, save_classification
+from app.doc_router import DEFAULT_OPEN_BUDGET, fields_closed_by, route_files_for_gaps
+from app.field_extractor import DOC_MODEL, classify_document_content, extract_field, question_for
 from app.gaps import REQUIRED_PROJECT_FIELDS, is_filled
 
 logger = logging.getLogger("DocPipeline")
@@ -78,17 +79,43 @@ async def fill_fields_from_drive_files(
     for item in routing["to_open"]:
         f = item["file"]
         name = f.get("name") or f.get("id")
+        file_id = f.get("id")
+        doc_type = item["doc_type"]
+        # None, пока неопознанный файл не классифицирован (кэшем или моделью) -
+        # отличает "уже проверили, классифицировать некуда" от "ещё не пытались".
+        classified_fallback = False
 
-        # Поля, ради которых открываем: только те, что ещё не закрыты предыдущим
-        # документом. Иначе второй файл того же типа тратит вызовы модели впустую.
-        target_fields = {fl for fl in item["fields"] if fl in still_empty}
-        if item["doc_type"] is None:
-            # Неопознанный документ (fallback по решению владельца): под какое
-            # поле его спрашивать, неизвестно - пробуем все ещё пустые, для
-            # которых вообще заведён узкий вопрос.
-            target_fields = {fl for fl in still_empty if question_for(fl)}
-        if not target_fields:
-            continue
+        if doc_type is not None:
+            # Поля, ради которых открываем: только те, что ещё не закрыты
+            # предыдущим документом. Иначе второй файл того же типа тратит
+            # вызовы модели впустую.
+            target_fields = {fl for fl in item["fields"] if fl in still_empty}
+            if not target_fields:
+                continue
+        else:
+            # Неопознанный по имени файл (план, Э2, fallback): сначала реестр
+            # (app/doc_classification_registry.py) - тот же файл мог уже
+            # классифицироваться дорогим вызовом модели в прошлом прогоне по
+            # другому проекту, план требует переиспользовать этот результат,
+            # а не платить за него снова.
+            cached_type = await get_cached_classification(file_id) if file_id else None
+            if cached_type:
+                target_fields = {fl for fl in fields_closed_by(cached_type) if fl in still_empty}
+                if not target_fields:
+                    # Классификация из реестра однозначна, и она не про пустые
+                    # поля этого прогона - открывать файл незачем вовсе.
+                    continue
+                doc_type = cached_type
+            elif not still_empty:
+                # Нечего закрывать вообще - незачем классифицировать файл,
+                # даже дёшево из реестра, тем более дорого через модель.
+                continue
+            else:
+                # Реестр не знает файл - классификация решится только после
+                # скачивания и извлечения текста (ниже), пока считаем, что
+                # закрыть можно любое ещё пустое поле.
+                target_fields = {fl for fl in still_empty if question_for(fl)}
+                classified_fallback = True
 
         if item.get("needs_vision"):
             # Скан без текстового слоя. Сверять цитату не с чем, а значение без
@@ -114,6 +141,30 @@ async def fill_fields_from_drive_files(
             if not text.strip():
                 gaps.append(f"{name}: no text layer extracted")
                 continue
+
+            if classified_fallback:
+                # Текст есть - классифицируем по-настоящему и записываем в
+                # реестр, чтобы следующий прогон (этот или любой другой проект)
+                # больше не платил за этот же файл.
+                model_type = await classify_document_content(text)
+                if model_type:
+                    if file_id:
+                        await save_classification(
+                            file_id, model_type,
+                            classified_by="model_fallback", model_used=DOC_MODEL,
+                        )
+                    doc_type = model_type
+                    narrowed = {fl for fl in fields_closed_by(model_type) if fl in still_empty}
+                    if not narrowed:
+                        # Определили тип, но он не про наши пустые поля -
+                        # не тратим вызовы модели на заведомо не те вопросы.
+                        gaps.append(f"{name}: classified as '{model_type}', closes no remaining empty field")
+                        continue
+                    target_fields = narrowed
+                # Иначе модель тоже не смогла классифицировать (genuinely
+                # unknown) - остаёмся при широком target_fields как последнем
+                # средстве, план прямо разрешает открыть непонятный документ
+                # "на всякий случай" в пределах бюджета.
 
             for field in sorted(target_fields):
                 result = await extract_field(text, field)

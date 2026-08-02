@@ -11,6 +11,7 @@ from app.field_extractor import (
     HUMAN_CONFIRM_FIELDS,
     POSITIVE_ONLY_FIELDS,
     _verdict,
+    classify_document_content,
     extract_field,
     gaps_from_results,
     is_negative_answer,
@@ -271,6 +272,71 @@ class TestExtractFieldWiring(unittest.TestCase):
         res = asyncio.run(run_test())
         self.assertFalse(res["accepted"])
         self.assertIn("no narrow question", res["reason"])
+
+
+class TestClassifyDocumentContent(unittest.TestCase):
+    """
+    Fallback-классификация неопознанных по имени файлов (implementation_plan.md,
+    Э2). В отличие от extract_field здесь нет цитаты для сверки - ошибка тут
+    максимум приводит к неверному узкому вопросу, а не к мусору в поле, потому
+    что итоговое значение всё равно проходит через собственную проверку цитаты.
+    """
+
+    def _run(self, model_json, text="Some document text about a building permit."):
+        async def run_test():
+            fake_resp = MagicMock(text=model_json)
+            fake_client = MagicMock()
+            fake_client.aio.models.generate_content = AsyncMock(return_value=fake_resp)
+            with patch('app.field_extractor.client', fake_client):
+                return await classify_document_content(text)
+
+        return asyncio.run(run_test())
+
+    def test_known_label_is_returned(self):
+        result = self._run('{"doc_type": "permits", "confidence": 0.9}')
+        self.assertEqual(result, "permits")
+
+    def test_unknown_label_from_model_returns_none(self):
+        """Модель ответила 'unknown' - в реестр должно попасть None, не мусор."""
+        result = self._run('{"doc_type": "unknown", "confidence": 0.2}')
+        self.assertIsNone(result)
+
+    def test_label_outside_allowed_set_is_rejected(self):
+        """
+        Модель придумала лейбл не из списка (галлюцинация формата ответа) -
+        не должен пройти как настоящая классификация.
+        """
+        result = self._run('{"doc_type": "invoice", "confidence": 0.7}')
+        self.assertIsNone(result)
+
+    def test_empty_text_returns_none_without_calling_model(self):
+        async def run_test():
+            fake_client = MagicMock()
+            fake_client.aio.models.generate_content = AsyncMock()
+            with patch('app.field_extractor.client', fake_client):
+                result = await classify_document_content("   ")
+                return result, fake_client.aio.models.generate_content.await_count
+
+        result, call_count = asyncio.run(run_test())
+        self.assertIsNone(result)
+        self.assertEqual(call_count, 0)
+
+    def test_api_error_is_reported_not_raised(self):
+        async def run_test():
+            fake_client = MagicMock()
+            fake_client.aio.models.generate_content = AsyncMock(side_effect=Exception("quota"))
+            with patch('app.field_extractor.client', fake_client):
+                return await classify_document_content("Some text")
+
+        result = asyncio.run(run_test())
+        self.assertIsNone(result)
+
+    def test_no_client_returns_none(self):
+        async def run_test():
+            with patch('app.field_extractor.client', None):
+                return await classify_document_content("Some text")
+
+        self.assertIsNone(asyncio.run(run_test()))
 
 
 class TestGapsFromResults(unittest.TestCase):
