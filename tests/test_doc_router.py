@@ -239,6 +239,42 @@ class TestRoutingUnderBudget(unittest.TestCase):
         self.assertEqual(res["unknown"], [])
         self.assertEqual(res["skipped"][0]["reason"], "identity document")
 
+    def test_combined_typology_file_preferred_over_near_duplicates(self):
+        """
+        Регрессия на реальный случай Mangata (03.08.2026): в папке 4 почти
+        идентичных файла "...3BR.pdf" (RU/EN, с лого и без) и один
+        "...2_3BR.pdf" в подпапке "Presentation FULL (1,2,3 BR)". Стадия
+        готовности (83%) была написана только в сводном файле, но при
+        budget=1 порядок листинга Drive API отдавал слот случайному дублю.
+
+        _specificity_score должен предпочесть сводный файл: и по "FULL" в
+        пути, и по числу разных упоминаний спален (2 и 3) против одного (3).
+        """
+        files = [
+            _f("RUS_Mangata residence_3BR.pdf", path="7. Presentations/3BR townhouse"),
+            _f("ENG_Mangata residence_3BR.pdf", path="7. Presentations/3BR townhouse"),
+            _f("ENG_Mangata residence_3BR_NO LOGO.pdf",
+               path="7. Presentations/3BR townhouse/NO LOGO 3 BR"),
+            _f("RUS_Mangata residence_2_3BR.pdf",
+               path="7. Presentations/Presentation FULL (1,2,3 BR)"),
+        ]
+        res = route_files_for_gaps(
+            files, empty_fields={"Construction stage"}, budget=1
+        )
+        self.assertEqual(len(res["to_open"]), 1)
+        self.assertEqual(res["to_open"][0]["file"]["name"], "RUS_Mangata residence_2_3BR.pdf")
+
+    def test_specificity_tie_break_also_applies_to_duplicate_fill(self):
+        """Тот же приоритет должен работать и на дублях, добираемых сверх бюджета."""
+        files = [
+            _f("ITR narrow.pdf", path="Legal/3BR"),
+            _f("ITR full masterplan.pdf", path="Legal/Presentation FULL (1,2,3 BR)"),
+        ]
+        res = route_files_for_gaps(
+            files, empty_fields={"Land Zoning Color"}, budget=1
+        )
+        self.assertEqual(res["to_open"][0]["file"]["name"], "ITR full masterplan.pdf")
+
 
 if __name__ == '__main__':
     unittest.main()

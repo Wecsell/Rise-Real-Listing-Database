@@ -18,18 +18,49 @@ from app.gemini_parser import (
 
 logger = logging.getLogger("DocParser")
 
+def _pages_via_pymupdf(pdf_path: str) -> list:
+    """
+    Основной экстрактор. PyMuPDF держит разрядку шрифта, а pypdf её рвёт:
+    на реальной презентации Mangata (замер 03.08.2026) pypdf выдавал
+    "ПРОГРЕ СС ~8 3%" вместо "ПРОГРЕСС ~83%", то есть 36.5% "слов" были
+    однобуквенными против 12.1% у PyMuPDF. Из-за этого стадия готовности
+    не находилась вовсе, а найденные значения не проходили сверку цитат:
+    модель приводила "S ANUR" к "Sanur", и дословного совпадения не было.
+    """
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        return [page.get_text() for page in doc]
+    finally:
+        doc.close()
+
+
+def _pages_via_pypdf(pdf_path: str) -> list:
+    reader = pypdf.PdfReader(pdf_path)
+    return [(page.extract_text() or "") for page in reader.pages]
+
+
 def extract_text_from_pdf(pdf_path: str) -> str:
     """Извлекает текстовое содержимое из PDF файла."""
-    extracted_text = []
+    pages = []
     try:
-        reader = pypdf.PdfReader(pdf_path)
-        for page_num, page in enumerate(reader.pages, start=1):
-            text = page.extract_text()
-            if text:
-                extracted_text.append(f"--- Страница {page_num} ---\n{text}")
+        pages = _pages_via_pymupdf(pdf_path)
     except Exception as e:
-        logger.error(f" Ошибка чтения PDF файла {pdf_path}: {e}")
-    return "\n\n".join(extracted_text)
+        # PyMuPDF может отсутствовать в окружении или не осилить файл -
+        # это не повод терять документ целиком, pypdf остаётся запасным.
+        logger.warning(f"PyMuPDF не смог прочитать {pdf_path} ({e}), пробуем pypdf")
+        try:
+            pages = _pages_via_pypdf(pdf_path)
+        except Exception as e2:
+            logger.error(f" Ошибка чтения PDF файла {pdf_path}: {e2}")
+            return ""
+
+    return "\n\n".join(
+        f"--- Страница {num} ---\n{text}"
+        for num, text in enumerate(pages, start=1)
+        if text and text.strip()
+    )
 
 async def parse_pdf_document(pdf_path: str, chat_title: Optional[str] = None) -> Dict[str, Any]:
     """

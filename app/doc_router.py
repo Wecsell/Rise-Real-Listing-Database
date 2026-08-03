@@ -23,6 +23,29 @@ logger = logging.getLogger("DocRouter")
 # Бюджет открытий на проект за один проход (план: "N в конфиг, старт - 5").
 DEFAULT_OPEN_BUDGET = 5
 
+# Между документами ОДНОГО типа (значит, закрывающими одни и те же поля)
+# выбор шёл по порядку листинга Drive API - произвольному. Живой случай
+# (Mangata, 03.08.2026): в папке 4 файла "...3BR.pdf" (RU/EN, с лого и без) и
+# один "...2_3BR.pdf" в подпапке "Presentation FULL (1,2,3 BR)" - именно в нём
+# была стадия готовности (83%), но бюджет из 5 слотов трижды тратился на почти
+# идентичные 3BR-варианты раньше, чем очередь доходила до комбинированного файла.
+_BR_GROUP_RE = re.compile(r"((?:\d[\s,_&+-]*){1,4})br\b", re.IGNORECASE)
+_FULL_MARKER_RE = re.compile(r"\bfull\b|\ball\b|\bcombined\b|\bmaster\b", re.IGNORECASE)
+
+
+def _specificity_score(file_info: Dict[str, Any]) -> tuple:
+    """
+    Чем выше, тем вероятнее файл - сводный, а не узкий по одной типологии.
+    Используется только как tie-break внутри одного doc_type - не подменяет
+    сам выбор типа документа.
+    """
+    haystack = f"{file_info.get('path', '')}/{file_info.get('name', '')}"
+    bedroom_digits: Set[str] = set()
+    for group in _BR_GROUP_RE.findall(haystack):
+        bedroom_digits |= set(re.findall(r"\d", group))
+    full_marker = 1 if _FULL_MARKER_RE.search(haystack) else 0
+    return (full_marker, len(bedroom_digits))
+
 # Карта из плана, Э2. Ключ - тип документа, значение - какие поля он закрывает.
 # Индонезийские аббревиатуры важнее английских слов: документы застройщиков
 # называются на bahasa, и именно по ним файл опознаётся однозначно.
@@ -225,7 +248,13 @@ def route_files_for_gaps(
     remaining = sorted(matched, key=lambda item: len(item["fields"]), reverse=True)
 
     while remaining and len(to_open) < budget:
-        best = max(remaining, key=lambda item: len(item["fields"] - covered))
+        # При равном покрытии новых полей выигрывает более "сводный" файл
+        # (_specificity_score) - иначе tie-break падает на порядок листинга
+        # Drive API, который ничего не говорит о содержании документа.
+        best = max(
+            remaining,
+            key=lambda item: (len(item["fields"] - covered), _specificity_score(item["file"])),
+        )
         if not (best["fields"] - covered):
             break  # новых полей никто уже не закрывает - дальше только дубли
         to_open.append(best)
@@ -233,7 +262,9 @@ def route_files_for_gaps(
         remaining.remove(best)
 
     # Дубли под уже покрытые поля берём только на остатке бюджета: второй
-    # документ по тому же полю - это подстраховка, а не приоритет.
+    # документ по тому же полю - это подстраховка, а не приоритет. Среди
+    # самих дублей тоже предпочитаем более сводные файлы той же логикой.
+    remaining.sort(key=lambda item: _specificity_score(item["file"]), reverse=True)
     for item in remaining:
         if len(to_open) >= budget:
             break

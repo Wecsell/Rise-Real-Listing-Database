@@ -211,6 +211,45 @@ async def classify_document_content(text: str, model: str = DOC_MODEL) -> Option
     return doc_type
 
 
+# Ключевые слова для поиска СТРАНИЦЫ, на которой факт может быть написан.
+#
+# Это принципиально не то же самое, что DOC_TYPE_PATTERNS: те опознают документ
+# по ИМЕНИ файла ("PBG", "brochure", "devkit", "presentation") и в тексте
+# брошюры не встречаются почти никогда. Пока страницы скорились ими, выбор
+# вырождался в "первые 2 страницы" для любой презентации.
+#
+# Замер 03.08.2026 на RUS_Mangata residence_2_3BR.pdf: 32 страницы, 10857
+# символов, модели показывалось 366 символов (страницы 1-2, 3.4% документа).
+# Срок сдачи и стадия готовности написаны на странице 12 ("ПРОГРЕСС ~83%
+# ДЕКАБРЬ 2025 Г."), латинское "Sanur" - на 9. Ни один из этих фактов модель
+# не видела ни разу, и все они ушли в Gaps как "not stated in document".
+#
+# ВАЖНО про Construction stage: голый "\d{1,3}\s*%" ловит ЛЮБОЙ процент на
+# странице, а в презентациях процентов много - комиссия УК, заполняемость,
+# ROI. На той же Mångata страница 28 (таблица доходности: 25% комиссии, 80%
+# заполняемость, 11.5% ROI) набирала score=6 против score=1 у настоящей
+# страницы прогресса (только "~83%") - и побеждала. Дошло даже после починки
+# tie-break по файлам: правильный файл открылся, а страница внутри него была
+# выбрана неверно. Слово "прогресс" тоже отсутствовало - в паттерне было
+# только латинское "progress", а в документе кириллица "ПРОГРЕСС".
+FIELD_PAGE_KEYWORDS: Dict[str, str] = {
+    "Lease Term (years)": r"аренд|lease|sewa|leasehold|срок|\byears\b|\bлет\b|hgb|hak\s*pakai",
+    "Ownership Type": r"leasehold|freehold|hak\s*milik|владени|собственност|ownership|аренд",
+    "Land Zoning Color": r"зон|zoning|\bitr\b|\bpkkpr\b|\bkkpr\b|tata\s*ruang|green|yellow|pink|\bred\b|зелён|жёлт",
+    "Handover Permits": r"\bpbg\b|\bslf\b|\bimb\b|simbg|разрешен|permit|izin",
+    "Developer": r"\bpt\b|девелоп|developer|компан|company|застройщик",
+    "Price From (USD)": r"\$|\busd\b|цена|price|harga|стоимост|прайс",
+    "District": r"район|локац|адрес|location|district|\barea\b|расположен|located|situated",
+    "Property Type": r"вилл|villa|апартамент|apartment|townhouse|таунхаус|студи|studio|пентхаус|penthouse|loft",
+    "Construction stage": (
+        r"готовн|стади(?:я|и|ю)?|прогресс|строительств|construction\s*stage|"
+        r"under\s*construction|complet(?:ed|ion)?|off[\s-]*plan|ready\s*to\s*move|сдан[оа]?\b"
+    ),
+    "Handover Date": r"сдач|сдан|delivery|handover|completion|20\d\d|квартал|\bQ[1-4]\b",
+    "Location Link": r"maps\.|goo\.gl|адрес|address|локац|location|координат|coordinates",
+}
+
+
 def select_relevant_pages(text: str, field: str, max_pages: int = 2) -> str:
     """
     Нарезка входа (план, п.4): не отдавать модели 10 страниц. Ищем страницы по
@@ -220,19 +259,16 @@ def select_relevant_pages(text: str, field: str, max_pages: int = 2) -> str:
     заголовком "--- Страница N ---". Если разметки страниц нет (обычный текст),
     возвращаем как есть.
     """
-    from app.doc_router import DOC_TYPE_PATTERNS, DOC_TYPE_TO_FIELDS
-
     pages = re.split(r"(?=--- Страница \d+ ---)", text or "")
     pages = [p for p in pages if p.strip()]
     if len(pages) <= max_pages:
         return text or ""
 
-    patterns = [pat for doc_type, pat in DOC_TYPE_PATTERNS
-                if field in DOC_TYPE_TO_FIELDS.get(doc_type, set())]
-    if not patterns:
+    pattern = FIELD_PAGE_KEYWORDS.get(field)
+    if not pattern:
         return "\n\n".join(pages[:max_pages])
 
-    combined = re.compile("|".join(patterns), re.IGNORECASE)
+    combined = re.compile(pattern, re.IGNORECASE)
     scored = [(len(combined.findall(p)), i, p) for i, p in enumerate(pages)]
     scored.sort(key=lambda t: (-t[0], t[1]))
 

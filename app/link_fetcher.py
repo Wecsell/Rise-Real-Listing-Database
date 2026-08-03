@@ -365,6 +365,7 @@ async def process_generic_link(
     max_depth: int = 2,
     visited: Optional[set] = None,
     project_name: Optional[str] = None,
+    exclude_fields: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
     Единая точка входа для обработки любых внешних ссылок.
@@ -374,6 +375,10 @@ async def process_generic_link(
     папку Drive, найденные изображения зеркалируются на личный Drive владельца.
     Без project_name (звонок из истории/без разобранной карточки) зеркалирование
     просто не запускается - оно требует места назначения, гадать имя проекта нельзя.
+
+    exclude_fields (владелец, 02.08.2026): поля, уже закрытые шахматкой,
+    обработанной раньше этой ссылки в рамках того же проекта - документы Drive
+    под них не открываются, см. doc_pipeline.fill_fields_from_drive_files.
     """
     if visited is None:
         visited = set()
@@ -396,11 +401,19 @@ async def process_generic_link(
         "gaps": []
     }
 
-    # 1. Google Sheets
+    # 1. Google Sheets - шахматка сканируется ПЕРВОЙ (владелец, 02.08.2026):
+    # её принятые предложения возвращаются вызывающему как doc_findings,
+    # чтобы дальнейшее открытие документов Drive под тот же проект пропускало
+    # уже закрытые ею поля (см. exclude_fields у process_generic_link).
     gsheet_id = extract_gsheet_id(url_clean)
     if gsheet_id:
-        await fetch_and_parse_link(url_clean, message_id, chat_id)
+        sheet_findings = await fetch_and_parse_link(
+            url_clean, message_id, chat_id, project_name=project_name
+        )
         result["dev_kit_url"] = url_clean
+        if sheet_findings:
+            result["doc_findings"] = sheet_findings
+            result["gaps"].extend(sheet_findings.get("gaps", []))
         return result
 
     # 2. Google Drive File or Folder
@@ -442,7 +455,7 @@ async def process_generic_link(
                     # никуда не записываются - их судьбу решает Confirmed (Э4).
                     try:
                         from app.doc_pipeline import run_for_project
-                        docs = await run_for_project(project_name, files)
+                        docs = await run_for_project(project_name, files, exclude_fields=exclude_fields)
                         if docs:
                             result["doc_findings"] = docs
                             result["gaps"].extend(docs.get("gaps", []))
@@ -565,14 +578,32 @@ async def process_generic_link(
 
     return result
 
-async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
-    """Переходит по ссылке Google Sheets, выкачивает содержимое и парсит шахматку через Gemini."""
+async def fetch_and_parse_link(
+    url: str, message_id: int, chat_id: int, project_name: Optional[str] = None
+):
+    """
+    Переходит по ссылке Google Sheets, выкачивает содержимое и парсит шахматку
+    через Gemini (список юнитов), а если передан project_name - ещё и полями
+    карточки проекта (район, срок сдачи, форма владения и т.п.) через
+    doc_pipeline.run_for_project_from_sheet.
+
+    Возвращает summary извлечения полей карточки ({proposals, gaps, opened})
+    или None, если project_name не передан либо ничего не нашлось.
+    """
     gsheet_id = extract_gsheet_id(url)
     if not gsheet_id:
-        return
+        return None
 
+    # gid обязателен: без него всегда скачивается вкладка Google по умолчанию,
+    # а не та, что указана в ссылке - на реальной шахматке Mångata с несколькими
+    # вкладками (townhouses/villas) это молча теряло вкладку целиком (02.08.2026).
+    gid_match = re.search(r"[#&?]gid=(\d+)", url)
     export_csv_url = f"https://docs.google.com/spreadsheets/d/{gsheet_id}/export?format=csv"
+    if gid_match:
+        export_csv_url += f"&gid={gid_match.group(1)}"
     logger.info(f"🌐 Fetching Google Sheet CSV from: {export_csv_url}")
+
+    sheet_findings = None
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http_client:
         try:
@@ -591,11 +622,23 @@ async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
                         why=f"Ссылка закрыта настройками приватности: {url}",
                         needs_human=True
                     )
-                return
-                
+                return None
+
             if res.status_code == 200:
                 csv_text = res.text[:15000]
                 logger.info(f"Successfully downloaded Google Sheet CSV ({len(csv_text)} bytes).")
+
+                # Поля карточки (район, срок сдачи, форма владения...) - из
+                # той же шахматки, независимо от того, распознались ли юниты
+                # ниже. Владелец, 02.08.2026: шахматка сканируется первой.
+                if project_name:
+                    try:
+                        from app.doc_pipeline import run_for_project_from_sheet
+                        sheet_findings = await run_for_project_from_sheet(
+                            project_name, csv_text, source_name=f"шахматка: {url}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка извлечения полей карточки из шахматки {url}: {e}")
 
                 # Одну и ту же шахматку слушатель встречает повторно — на
                 # каждом рескане истории чата и при каждом повторном упоминании
@@ -629,17 +672,20 @@ async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
                     parsed_sheet = None
 
                 if parsed_sheet:
-                    project_name = parsed_sheet.get("project_name", "Unknown Project")
+                    # Имя проекта, как его написал застройщик ВНУТРИ шахматки -
+                    # не путать с параметром project_name (реальным именем
+                    # карточки), от которого зависит извлечение полей выше.
+                    sheet_project_name = parsed_sheet.get("project_name", "Unknown Project")
                     units = parsed_sheet.get("units", [])
 
-                    logger.info(f"🎯 Extracted {len(units)} units from Google Sheet for project '{project_name}'!")
+                    logger.info(f"🎯 Extracted {len(units)} units from Google Sheet for project '{sheet_project_name}'!")
                     if save_extraction and isinstance(units, list):
                         for unit in units:
                             if isinstance(unit, dict):
                                 await save_extraction(
                                     message_id=message_id,
                                     chat_id=chat_id,
-                                    project_recid=project_name,
+                                    project_recid=sheet_project_name,
                                     object_guess=f"{unit.get('unit_id')} ({unit.get('bedrooms')} BR)",
                                     confidence=0.95,
                                     slot="unit_price",
@@ -649,3 +695,5 @@ async def fetch_and_parse_link(url: str, message_id: int, chat_id: int):
                                 )
         except Exception as e:
             logger.error(f"Error fetching/parsing Google Sheet {url}: {e}")
+
+    return sheet_findings

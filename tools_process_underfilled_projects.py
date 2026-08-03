@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(override=True)
 
 from app.link_fetcher import process_generic_link
-from app.doc_pipeline import save_findings_to_gaps
+from app.doc_pipeline import collect_project_links, combine_findings, save_findings_to_gaps
 from app.gaps import REQUIRED_PROJECT_FIELDS, is_filled
 import app.airtable_client as ac
 
@@ -97,27 +97,43 @@ async def main():
         
         logger.info(f"\n--- [{i}/{len(target_projects)}] '{p_name}' (Заполненность {comp*100:.1f}%) ---")
         
-        links = []
-        for k in ['Link to Developer’s Kit (Rus)', 'Link to Developer’s Kit (Eng)', 'Availability Chart']:
-            val = fields.get(k)
-            if val and str(val).strip().startswith('http'):
-                links.append((k, str(val).strip()))
+        # Порядок (шахматки первыми) и дедуп по URL - в collect_project_links.
+        ordered_links = collect_project_links(fields)
 
-        any_updated = False
-        for field_name, url in links:
+        # Копим находки всех ссылок и пишем ОДИН раз в конце - запись заменяет
+        # секцию бота целиком, запись по разу на ссылку теряла находки всех
+        # ссылок, кроме последней.
+        results = []
+        already_found: set = set()
+        for field_name, url in ordered_links:
             try:
                 logger.info(f"   ➜ [{field_name}]: {url}")
-                res = await process_generic_link(url, project_name=p_name if apply else None)
-                saved = await save_findings_to_gaps(rec_id, res)
-                if saved:
-                    any_updated = True
-                    logger.info(f"   ✅ Данные извлечены и записаны в Airtable для '{p_name}'")
+                res = await process_generic_link(
+                    url,
+                    project_name=p_name if apply else None,
+                    exclude_fields=already_found if apply else None,
+                )
+                results.append(res)
+                if apply:
+                    closed = combine_findings([res])
+                    already_found |= {prop["field"] for prop in closed["proposals"]}
             except Exception as e:
                 logger.error(f"   ❌ Ошибка при обработке {url}: {e}")
 
-        if any_updated:
-            success_count += 1
-            
+        if results:
+            combined = combine_findings(results)
+            # False у save_findings_to_gaps может значить и "писать было нечего"
+            # (текст совпал с уже записанным run_for_project), а не сбой -
+            # считаем проект обработанным по факту находок, а не по записи.
+            saved = await save_findings_to_gaps(rec_id, combined)
+            if saved or combined["opened"] > 0 or combined["proposals"]:
+                success_count += 1
+                logger.info(
+                    f"   ✅ Обработано '{p_name}' "
+                    f"(предложений: {len(combined['proposals'])}, открыто документов: {combined['opened']}, "
+                    f"запись в Airtable: {'да' if saved else 'без изменений'})"
+                )
+
         await asyncio.sleep(2) # Задержка для защиты от таймаутов/лимитов API
 
     logger.info(f"\n🎉 ЗАВЕРШЕНО! Успешно обновлено проектов: {success_count}/{len(target_projects)}")

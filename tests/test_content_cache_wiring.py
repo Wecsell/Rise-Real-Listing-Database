@@ -214,6 +214,36 @@ class TestSheetCaching(_IsolatedCacheDB):
 
         fake_client.aio.models.generate_content.assert_awaited_once()
 
+    def test_gid_is_forwarded_to_csv_export_url(self):
+        """
+        Регрессия 02.08.2026: без gid в экспортной ссылке всегда скачивается
+        вкладка Google по умолчанию, а не та, что указана в ссылке. На реальной
+        шахматке Mångata с несколькими вкладками (townhouses/villas) это молча
+        теряло вкладку целиком.
+        """
+        from app import link_fetcher
+
+        fake_http_client = MagicMock()
+        fake_http_client.get = AsyncMock(
+            return_value=self._mock_http_response("Unit,Price\nA1,100000")
+        )
+        fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+        fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def run():
+            with patch.object(link_fetcher, 'client', None), \
+                 patch.object(link_fetcher.httpx, 'AsyncClient', return_value=fake_http_client):
+                await link_fetcher.fetch_and_parse_link(
+                    'https://docs.google.com/spreadsheets/d/abc123/edit?gid=987654',
+                    message_id=1, chat_id=1,
+                )
+
+        import asyncio
+        asyncio.run(run())
+
+        requested_url = fake_http_client.get.await_args.args[0]
+        self.assertIn("gid=987654", requested_url)
+
 
 if __name__ == '__main__':
     unittest.main()

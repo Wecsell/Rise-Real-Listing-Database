@@ -206,6 +206,33 @@ class TestPageSlicing(unittest.TestCase):
         out = select_relevant_pages(doc, "Handover Permits", max_pages=1)
         self.assertIn("A", out)
 
+    def test_construction_stage_percent_page_beats_unrelated_percent_page(self):
+        """
+        Регрессия 03.08.2026 (Mångata): голый '\\d{1,3}\\s*%' ловил ЛЮБОЙ
+        процент - страница доходности (комиссия УК 25%, заполняемость 80%,
+        ROI 11.5%) набирала больше совпадений, чем настоящая страница
+        готовности объекта с единственным '~83%', и побеждала при отборе.
+        """
+        doc = (
+            "--- Страница 1 ---\nОбщее описание проекта.\n\n"
+            "--- Страница 2 ---\n"
+            "ДОХОДНОСТЬ ПРИ СДАЧЕ В АРЕНДУ. Комиссия УК 25%. Заполняемость 80%. "
+            "ROI при владении в год 11.5%.\n\n"
+            "--- Страница 3 ---\nПРОГРЕСС ~83% ДЕКАБРЬ 2025 Г.\n"
+        )
+        out = select_relevant_pages(doc, "Construction stage", max_pages=1)
+        self.assertIn("83%", out)
+        self.assertNotIn("ROI", out)
+
+    def test_construction_stage_matches_cyrillic_progress(self):
+        """Латинское 'progress' не покрывает кириллическое 'ПРОГРЕСС'."""
+        doc = (
+            "--- Страница 1 ---\nКонтакты.\n\n"
+            "--- Страница 2 ---\nПРОГРЕСС ~83% ДЕКАБРЬ 2025 Г.\n"
+        )
+        out = select_relevant_pages(doc, "Construction stage", max_pages=1)
+        self.assertIn("83%", out)
+
 
 class TestExtractFieldWiring(unittest.TestCase):
 
