@@ -383,6 +383,49 @@ def sanitize_unit_type(raw_type):
         logger.warning(f"Unit type '{raw_type}' is unknown, stripping it.")
     return None
 
+# Живые опции Land Zoning Color (проверено 03.08.2026): 'Red/Commercial',
+# 'Tourism/Mixed', 'Residential', 'Brown', 'Green'. У поля НЕ было sanitize-
+# функции вовсе - ни gemini_parser.SYSTEM_PROMPT (жёстко перечислял 4 из 5
+# опций, без 'Red/Commercial'), ни upsert_project не проверяли значение перед
+# записью. schema_check.py уже документировал один такой инцидент задним
+# числом ("промпт требовал 'Commercial', где база знает 'Brown'") - без
+# постоянной защиты тот же класс бага повторился с 'Red' против
+# 'Red/Commercial'.
+LAND_ZONING_ALIASES = {
+    'red': 'Red/Commercial', 'red/commercial': 'Red/Commercial',
+    'commercial': 'Red/Commercial', 'trades & services': 'Red/Commercial',
+    'trades and services': 'Red/Commercial',
+    'yellow': 'Tourism/Mixed', 'pink': 'Tourism/Mixed',
+    'tourism': 'Tourism/Mixed', 'tourism/mixed': 'Tourism/Mixed',
+    'mixed': 'Tourism/Mixed', 'mixed use': 'Tourism/Mixed',
+    'residential': 'Residential', 'white': 'Residential',
+    'brown': 'Brown', 'agriculture': 'Brown', 'agricultural': 'Brown',
+    'green': 'Green',
+}
+
+
+def sanitize_land_zoning(raw_zoning):
+    """Нормализует Land Zoning Color до одной из живых опций базы."""
+    if not raw_zoning:
+        return None
+    raw_lower = str(raw_zoning).strip().lower()
+
+    valid = set(get_select_options('Projects', 'Land Zoning Color')) or set(LAND_ZONING_ALIASES.values())
+    for value in valid:
+        if value.lower() == raw_lower:
+            return value
+
+    canonical = LAND_ZONING_ALIASES.get(raw_lower)
+    if canonical and canonical in valid:
+        return canonical
+    for alias, mapped in LAND_ZONING_ALIASES.items():
+        if alias in raw_lower and mapped in valid:
+            return mapped
+
+    logger.warning(f"Land Zoning Color '{raw_zoning}' не опознан, поле очищено.")
+    return None
+
+
 def sanitize_pool(raw_pool):
     """Нормализует Pool до одного из валидных: Yes(Private), Yes(Shared), No"""
     if not raw_pool:
@@ -903,7 +946,19 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
             fields.pop('District')
             gaps = list(gaps or [])
             gaps.append(f"Район не распознан: {raw_area}")
-        
+
+    if 'Land Zoning Color' in fields:
+        raw_zoning = fields['Land Zoning Color']
+        s_zoning = sanitize_land_zoning(raw_zoning)
+        if s_zoning:
+            fields['Land Zoning Color'] = s_zoning
+        else:
+            # Как и с District: без сверки со списком селекта неверное значение
+            # роняло бы весь апдейт записи на 422, а не игнорировалось.
+            fields.pop('Land Zoning Color')
+            gaps = list(gaps or [])
+            gaps.append(f"Зонирование не распознано: {raw_zoning}")
+
     existing = CACHE_PROJECTS
     match, score = fuzzy_match_project(proj_name, existing, area=fields.get('District'), dev_id=dev_id)
 

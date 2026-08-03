@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from google.genai import types
 
+from app import content_cache
 from app.citations import check_quotes, is_verifiable_source, normalize, BAD, OK, SPLICED
 from app.gemini_parser import client, resolve_model_name
 
@@ -28,6 +29,13 @@ logger = logging.getLogger("FieldExtractor")
 # Уровень T2 из плана: документы, низкий объём вызовов. Единственная модель со
 # 100% на обоих наборах замера и чистыми цитатами. Дороже за токен, но объём мал.
 DOC_MODEL = "gemini-3.5-flash"
+
+# Версия промпта/логики выбора страниц. Бампится при значимой правке
+# SYSTEM_PROMPT, FIELD_QUESTIONS или FIELD_PAGE_KEYWORDS - иначе кэш молча
+# отдавал бы результаты по СТАРОЙ логике (03.08.2026: в один день поправлены
+# и промпт про контекстную цитату, и весь FIELD_PAGE_KEYWORDS для
+# Construction stage - без версии кэш замаскировал бы оба улучшения).
+_PROMPT_VERSION = "2026-08-03a"
 
 # Юридические и рисковые поля модель не заполняет сама (план, п.6): её ответ -
 # только предложение, которое подтверждает человек через Confirmed.
@@ -337,6 +345,12 @@ async def extract_field(
                                 подтверждает человек через Confirmed (план, п.6)
       citation                - 'ok' | 'spliced' | 'bad' | 'n/a'
       quotes, confidence, reason
+
+    Кэшируется по (показанный модели текст, поле, вопрос, модель, версия
+    промпта) - до 03.08.2026 кэша не было вовсе, и повторный прогон одного и
+    того же документа (или ручная отладка вроде "проверить 5 раз подряд")
+    каждый раз был новым оплаченным вызовом, включая нестабильные ответы на
+    ИДЕНТИЧНОМ входе (temperature=0.0 не гарантирует детерминизм у Gemini).
     """
     question = question or question_for(field)
     if not question:
@@ -348,10 +362,19 @@ async def extract_field(
                 "reason": "Gemini API client not initialized"}
 
     source = select_relevant_pages(text, field)
+    used_model = model or resolve_model_name()
+
+    cache_key = content_cache.hash_text(
+        f"{question}{content_cache.SEPARATOR}{source}",
+        context=f"field:{field}:{used_model}:{_PROMPT_VERSION}",
+    )
+    cached = content_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         resp = await client.aio.models.generate_content(
-            model=model or resolve_model_name(),
+            model=used_model,
             contents=f"DOCUMENT:\n{source}\n\nQUESTION: {question}",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -362,6 +385,8 @@ async def extract_field(
         data = _parse_model_json(resp.text)
     except Exception as e:
         logger.error(f"Ошибка извлечения поля {field}: {e}")
+        # Не кэшируется: временный сбой (сеть, лимит) не должен залипать на
+        # CACHE_TTL_DAYS - на следующий прогон стоит попробовать снова.
         return {"field": field, "value": None, "accepted": False, "reason": str(e)[:200]}
 
     answer = str(data.get("answer", ""))
@@ -373,7 +398,7 @@ async def extract_field(
         f"🔍 {field}: {'принято' if accepted else 'отклонено'} "
         f"({verdict['reason'] or verdict['citation']}) -> {answer[:60]}"
     )
-    return {
+    result = {
         "field": field,
         "value": answer if accepted else None,
         "accepted": accepted,
@@ -383,6 +408,9 @@ async def extract_field(
         "confidence": data.get("confidence"),
         "reason": verdict["reason"],
     }
+    if content_cache.is_cacheable(result):
+        content_cache.put(cache_key, "field_extraction", result)
+    return result
 
 
 def gaps_from_results(results: List[Dict[str, Any]]) -> List[str]:

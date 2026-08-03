@@ -27,6 +27,7 @@ from typing import List
 
 from app.airtable_client import (
     AREA_ALIASES,
+    LAND_ZONING_ALIASES,
     UNIT_TYPE_ALIASES,
     VALID_POOL_VALUES,
     VALID_PROPERTY_TYPES,
@@ -100,6 +101,11 @@ def expected_select_values() -> dict:
         ('Projects', 'District'): set(AREA_ALIASES.values()),
         ('Projects', 'Construction stage'): set(VALID_STAGES),
         ('Projects', 'Property Type'): set(VALID_PROPERTY_TYPES),
+        # 03.08.2026: этого расхождения не было видно ни разу, пока не
+        # завели проверку - код молчал про 'Red/Commercial' с самого начала,
+        # а старый инцидент "'Commercial' против 'Brown'" (см. докстринг
+        # модуля) точно так же не был виден автоматически, только вручную.
+        ('Projects', 'Land Zoning Color'): set(LAND_ZONING_ALIASES.values()),
         ('Field Staging', 'Priority'): set(AIRTABLE_PRIORITY.values()),
         ('Units', 'Pool'): set(VALID_POOL_VALUES),
         ('Units', 'Unit type'): {v for v in UNIT_TYPE_ALIASES.values() if v},

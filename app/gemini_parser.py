@@ -129,7 +129,10 @@ SYSTEM_PROMPT = """
 - Lease Term (years): Срок аренды в годах (число, например 25 или 30).
 - Extension Term (years): Условия продления (например "25 years", "30 years fixed").
 - Renewal Right: СТРОГО один из: "Guaranteed at Market Price", "Fixed Price", "Priority at Market Price", "Prepaid".
-- Land Zoning Color: СТРОГО один из: "Residential", "Tourism/Mixed", "Brown", "Green".
+- Land Zoning Color: СТРОГО один из: "Residential", "Tourism/Mixed", "Brown", "Green", "Red/Commercial".
+  (Этот список сверяется с живой базой в app.schema_check и очищается перед записью в
+  app.airtable_client.sanitize_land_zoning - если он опять устареет, запись не упадёт
+  молча, но лучше держать его синхронным.)
 - Handover Permits: СТРОГО один из: "PBG in process", "PBG", "PBG/SLF in process", "PBG/SLF".
 - Priority: СТРОГО один из: "Высокий", "Средний", "Низкий". ("Высокий" — только при личной похвале агентом в аудио или пометке срочно; "Низкий" — при негативных отзывах или юридических рисках "зеленая зона/без PBG").
 

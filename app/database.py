@@ -78,6 +78,15 @@ async def save_message(msg_id: int, chat_id: int, sender_id: int, text: str, has
 async def save_extraction(message_id: int, chat_id: int, project_recid: str, object_guess: str, confidence: float, slot: str, url_status: str, why: str, needs_human: bool, raw_json: dict = None):
     """Сохраняет извлечённый факт и полный JSON в БД."""
     if not pool:
+        # Молча терять находку нельзя: без Postgres unit-экстракция из шахматок
+        # (app/link_fetcher.py, SHEET_SYSTEM_PROMPT) успешно парсит юниты и
+        # тут же теряет их - ни строки в Postgres, ни в Airtable, без единого
+        # предупреждения в логе (обнаружено 03.08.2026: "Extracted 7 units"
+        # в логе, 0 юнитов Mangata в живой базе).
+        logger.warning(
+            f"Postgres недоступен - находка [{slot}] по '{object_guess}' "
+            f"(проект {project_recid}) НЕ сохранена"
+        )
         return
     try:
         # Обрезаем строки

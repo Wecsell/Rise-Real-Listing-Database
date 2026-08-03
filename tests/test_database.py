@@ -71,5 +71,68 @@ class TestCheckDbPing(unittest.TestCase):
         self.assertFalse(asyncio.run(db.check_db_ping()))
 
 
+class _FakeExecuteConn:
+    def __init__(self):
+        self.executed = []
+
+    async def execute(self, query, *args):
+        self.executed.append((query, args))
+
+
+class TestSilentLossWithoutPostgres(unittest.TestCase):
+    """
+    Находки без Postgres должны быть ВИДНЫ в логе, а не молча теряться.
+
+    Регрессия 03.08.2026: save_extraction() возвращалась без единого лога при
+    pool=None. Извлечение юнитов из шахматки Mångata успешно отработало
+    ("Extracted 7 units from Google Sheet"), но ни строки не попало ни в
+    Postgres, ни в Airtable - в логе не осталось следа потери вовсе.
+    save_fact() ту же дыру уже закрывал раньше в этой сессии.
+    """
+
+    def setUp(self):
+        self._orig_pool = db.pool
+
+    def tearDown(self):
+        db.pool = self._orig_pool
+
+    def test_save_extraction_warns_and_does_not_raise_without_pool(self):
+        db.pool = None
+        with self.assertLogs('Database', level='WARNING') as log:
+            asyncio.run(db.save_extraction(
+                message_id=1, chat_id=1, project_recid="Mangata",
+                object_guess="Unit 1 (2 BR)", confidence=0.95, slot="unit_price",
+                url_status="parsed", why="Price: 100000$", needs_human=True,
+            ))
+        self.assertTrue(any("Mangata" in m for m in log.output))
+
+    def test_save_extraction_writes_when_pool_is_present(self):
+        conn = _FakeExecuteConn()
+        db.pool = _FakePool(conn)
+        asyncio.run(db.save_extraction(
+            message_id=1, chat_id=1, project_recid="Mangata",
+            object_guess="Unit 1 (2 BR)", confidence=0.95, slot="unit_price",
+            url_status="parsed", why="Price: 100000$", needs_human=True,
+        ))
+        self.assertEqual(len(conn.executed), 1)
+
+    def test_save_fact_warns_and_does_not_raise_without_pool(self):
+        db.pool = None
+        with self.assertLogs('Database', level='WARNING') as log:
+            asyncio.run(db.save_fact(
+                project_recid="rec123", old_value="400000", new_value="430000",
+                fact_type="price_change",
+            ))
+        self.assertTrue(any("rec123" in m for m in log.output))
+
+    def test_save_fact_preserves_zero_as_a_real_value(self):
+        """None -> '', но 0/'0' - тоже значение, а не отсутствие данных."""
+        conn = _FakeExecuteConn()
+        db.pool = _FakePool(conn)
+        asyncio.run(db.save_fact(project_recid="rec123", old_value=0, new_value="430000"))
+        args = conn.executed[0][1]
+        self.assertEqual(args[2], "0")
+
+
 if __name__ == '__main__':
     unittest.main()

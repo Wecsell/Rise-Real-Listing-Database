@@ -104,6 +104,17 @@ class TestExpectationsComeFromCode:
         from app.priority_parser import AIRTABLE_PRIORITY
         assert expected_select_values()[('Field Staging', 'Priority')] == set(AIRTABLE_PRIORITY.values())
 
+    def test_land_zoning_values_come_from_aliases(self):
+        """
+        Регрессия 03.08.2026: 'Red/Commercial' не было в живой базе ни в
+        промпте gemini_parser.py, ни где-либо ещё - никакой проверки для этого
+        поля не существовало вовсе, хотя точно такой же инцидент ("промпт
+        требовал 'Commercial', где база знает 'Brown'") уже случался раньше.
+        """
+        from app.airtable_client import LAND_ZONING_ALIASES
+        assert (expected_select_values()[('Projects', 'Land Zoning Color')]
+                == set(LAND_ZONING_ALIASES.values()))
+
 
 @pytest.mark.skipif(not os.environ.get('AIRTABLE_TOKEN'),
                     reason="нет AIRTABLE_TOKEN — проверка живой базы пропущена")

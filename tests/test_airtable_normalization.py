@@ -13,10 +13,12 @@ import pytest
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.airtable_client import (
+    LAND_ZONING_ALIASES,
     format_drive_link,
     fuzzy_match_developer,
     fuzzy_match_project,
     safe_float,
+    sanitize_land_zoning,
     sanitize_pool,
     sanitize_unit_type,
 )
@@ -256,6 +258,43 @@ class TestPool:
     @pytest.mark.parametrize("raw", [None, '', 'maybe'])
     def test_unknown_is_dropped(self, raw):
         assert sanitize_pool(raw) is None
+
+
+class TestLandZoning:
+    """
+    Регрессия 03.08.2026: у поля не было sanitize-функции вовсе, в отличие от
+    District/Unit type/Pool - raw-значение модели шло прямо в fields без
+    сверки со списком селекта. Живая опция базы - 'Red/Commercial', её не
+    было ни в промпте gemini_parser.py, ни где-либо в коде. monkeypatch
+    держит тесты офлайн: без него sanitize_land_zoning ходит в живую базу.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _offline_schema(self, monkeypatch):
+        import app.airtable_client as ac
+        monkeypatch.setattr(
+            ac, 'get_select_options',
+            lambda table, field, fallback=None: list(LAND_ZONING_ALIASES.values())
+        )
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('Red/Commercial', 'Red/Commercial'),
+        ('red', 'Red/Commercial'),
+        ('Red', 'Red/Commercial'),
+        ('Commercial', 'Red/Commercial'),
+        ('yellow', 'Tourism/Mixed'),
+        ('pink', 'Tourism/Mixed'),
+        ('Tourism/Mixed', 'Tourism/Mixed'),
+        ('Residential', 'Residential'),
+        ('Brown', 'Brown'),
+        ('Green', 'Green'),
+    ])
+    def test_normalises_to_canonical_form(self, raw, expected):
+        assert sanitize_land_zoning(raw) == expected
+
+    @pytest.mark.parametrize("raw", [None, '', 'purple', 'unknown zone'])
+    def test_unknown_is_dropped_not_written_raw(self, raw):
+        assert sanitize_land_zoning(raw) is None
 
 
 class TestDriveLink:
