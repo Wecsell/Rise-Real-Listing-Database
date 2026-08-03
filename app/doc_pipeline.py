@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from typing import Any, Dict, List, Optional, Set
 
@@ -241,6 +242,23 @@ async def run_for_project(
     return summary
 
 
+_CSV_EMPTY_CELLS_RE = re.compile(r"\s*,\s*(?:,\s*)+")
+
+
+def _readable_csv(text: str) -> str:
+    """
+    Сворачивает подряд идущие запятые пустых ячеек CSV в ' | ' для читаемости.
+
+    Шахматка попадает в extract_field() как есть, и её дословные цитаты
+    выглядели так: «Sanur,,Available units», «Land color,,,,Red,,Trades &
+    services city area» - технически верно (значение то же), но нечитаемо
+    человеку, который подтверждает предложение (замер 03.08.2026, Mångata).
+    Одиночная запятая (обычный текст) не трогается - регулярка требует
+    минимум двух подряд.
+    """
+    return _CSV_EMPTY_CELLS_RE.sub(" | ", text or "")
+
+
 async def fill_project_fields_from_text(
     project_fields: Optional[Dict[str, Any]],
     text: str,
@@ -257,6 +275,7 @@ async def fill_project_fields_from_text(
     fill_fields_from_drive_files, чтобы combine_findings мог их объединить
     с находками документов Drive без специального случая.
     """
+    text = _readable_csv(text)
     empty = empty_required_fields(project_fields)
     if not empty or not (text or "").strip():
         return {"proposals": [], "gaps": [], "opened": 0}

@@ -8,6 +8,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.doc_pipeline import (
     GAPS_SECTION_START,
+    _readable_csv,
     collect_project_links,
     combine_findings,
     empty_required_fields,
@@ -401,6 +402,40 @@ class TestFillProjectFieldsFromText(unittest.TestCase):
             _only_empty("District"), "Sanur", lambda t, f: _accepted(f, "Sanur")
         )
         self.assertEqual(res["proposals"][0]["source_file"], "шахматка")
+
+    def test_csv_gaps_are_readable_when_shown_to_model(self):
+        """
+        Регрессия 03.08.2026: CSV-текст шахматки шёл в модель как есть, и
+        дословные цитаты выглядели как «Sanur,,Available units» - технически
+        верно, но нечитаемо человеку, подтверждающему предложение.
+        """
+        seen_text = {}
+
+        def capture(t, f):
+            seen_text["text"] = t
+            return _accepted(f, "Sanur")
+
+        self._run(_only_empty("District"), "Sanur,,Available units", capture)
+        self.assertNotIn(",,", seen_text["text"])
+        self.assertIn("Sanur | Available units", seen_text["text"])
+
+
+class TestReadableCsv(unittest.TestCase):
+
+    def test_collapses_empty_cell_commas(self):
+        self.assertEqual(_readable_csv("Sanur,,Available units"), "Sanur | Available units")
+        self.assertEqual(
+            _readable_csv("Land color,,,,Red,,Trades & services city area"),
+            "Land color | Red | Trades & services city area",
+        )
+
+    def test_single_comma_in_prose_is_untouched(self):
+        prose = "The lease period is 35 years, starting 2023."
+        self.assertEqual(_readable_csv(prose), prose)
+
+    def test_none_and_empty_are_safe(self):
+        self.assertEqual(_readable_csv(""), "")
+        self.assertEqual(_readable_csv(None), "")
 
 
 class TestGapsMerging(unittest.TestCase):

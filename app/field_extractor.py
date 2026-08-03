@@ -49,6 +49,9 @@ Rules:
   item in the list. If your answer rests on two documents or two rows, give one quote per source.
 - If the document does not state the answer, set answer to "not stated" and quotes to [].
 - Beware of numbers that appear in a different context than the one asked about.
+- If your answer itself is a single short word (a place name, a number, a status
+  word), ALSO include a second verbatim quote with the surrounding context (a
+  nearby label, heading or sentence) - not just the bare word by itself.
 
 Return strictly this JSON:
 {"answer": "<short answer>", "quotes": ["<verbatim fragment>", "..."], "confidence": <0.0-1.0>}
