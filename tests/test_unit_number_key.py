@@ -153,14 +153,36 @@ class TestUnitNumberProducesDistinctRecords:
         assert key == 'coco-hills__b39__studio'
 
     @pytest.mark.asyncio
-    async def test_non_studio_unfilled_bedrooms_still_falls_back_to_0br(self, fake_table):
-        """Поведение для остальных типов юнитов сознательно не менялось."""
+    async def test_non_studio_unfilled_bedrooms_uses_nbr_token(self, fake_table):
+        """
+        Регрессия на вопрос владельца 05.08.2026: 0 спален не бывает - это
+        всегда "не извлекли", а не реальная величина, поэтому не-Studio юнит
+        без Bedrooms получает явный 'nbr', а не выдаваемый за настоящий '0br'.
+        """
         await ac.upsert_unit(
             {'Unit type': 'Villa', 'Price from (USD)': 537000},
             'recProj', 'Origins', [],
         )
         key = fake_table.created[0]['Key']
-        assert key == 'origins__villa__0br'
+        assert key == 'origins__villa__nbr'
+
+    @pytest.mark.asyncio
+    async def test_non_studio_explicit_zero_bedrooms_also_uses_nbr_token(self, fake_table):
+        await ac.upsert_unit(
+            {'Unit type': 'Villa', 'Bedrooms': 0, 'Price from (USD)': 537000},
+            'recProj', 'Origins', [],
+        )
+        key = fake_table.created[0]['Key']
+        assert key == 'origins__villa__nbr'
+
+    @pytest.mark.asyncio
+    async def test_non_studio_real_bedroom_count_is_unaffected(self, fake_table):
+        await ac.upsert_unit(
+            {'Unit type': 'Villa', 'Bedrooms': 3, 'Price from (USD)': 537000},
+            'recProj', 'Origins', [],
+        )
+        key = fake_table.created[0]['Key']
+        assert key == 'origins__villa__3br'
 
     @pytest.mark.asyncio
     async def test_failed_existing_unit_update_returns_no_record_id(self, fake_table):

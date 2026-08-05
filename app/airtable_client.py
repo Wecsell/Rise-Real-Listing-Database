@@ -1178,12 +1178,16 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
 
     proj_slug = re.sub(r'[^a-z0-9-]', '', str(proj_name).lower().replace(' ', '-'))[:15]
 
-    # У студии Bedrooms по определению не заполняется, поэтому запасное
-    # значение '0' попадало в ключ как '0br' - неотличимо от юнита другого
-    # типа, у которого число спален просто не извлеклось (владелец,
-    # 05.08.2026; тот же паттерн уже приводил к браку 25.07). Только для
-    # Studio используем явный токен, а не общий 'Nbr'.
-    bed_token = 'studio' if u_type == 'studio' else f"{beds}br"
+    # 0 спален не бывает - это всегда "не извлекли", а не реальная величина
+    # (владелец, 05.08.2026; тот же паттерн уже приводил к браку 25.07).
+    # Studio получает свой явный токен; у остальных типов отсутствие числа
+    # спален помечается 'nbr', а не выдаётся за настоящий 'Nbr'.
+    if u_type == 'studio':
+        bed_token = 'studio'
+    elif beds in ('0', '0.0'):
+        bed_token = 'nbr'
+    else:
+        bed_token = f"{beds}br"
 
     if unit_no:
         key = f"{proj_slug}__{str(unit_no).lower()}__{bed_token}"
