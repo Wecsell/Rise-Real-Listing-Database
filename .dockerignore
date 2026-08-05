@@ -1,6 +1,25 @@
-data/
-.env
-.git
-__pycache__
-*.pyc
-whatsapp_listener/
+# The production image needs only these files.  A deny-by-default context keeps
+# local sessions, exports, .env files and one-off investigation artifacts out
+# of the Docker daemon as well as out of the image.
+*
+!Dockerfile
+!.dockerignore
+!.env.example
+!.gitignore
+!README.md
+!docker-compose.yml
+!docker-compose.override.yml
+!requirements.txt
+!requirements-dev.txt
+!app/
+!app/**
+!field_bot.py
+!field_processor.py
+!tests/
+!tests/**
+
+# Source is needed, locally compiled bytecode is not.
+app/__pycache__/
+app/**/*.py[cod]
+tests/__pycache__/
+tests/**/*.py[cod]

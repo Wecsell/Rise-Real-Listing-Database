@@ -1,7 +1,9 @@
 import unittest
 import asyncio
+import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from unittest.mock import patch, AsyncMock, MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -19,6 +21,36 @@ from app.link_fetcher import (
     _notion_rich_text_to_text_and_links,
     _walk_notion_blocks,
 )
+
+
+def _fake_response(payload_bytes, status_code=200, url="https://x.notion.site/slug", headers=None):
+    """Build a minimal stand-in for the httpx.Response yielded by stream_safe_url."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.url = url
+    resp.headers = headers or {}
+
+    async def aiter_bytes():
+        yield payload_bytes
+
+    resp.aiter_bytes = aiter_bytes
+    return resp
+
+
+def _fake_stream_safe_url(response_factory):
+    """Replace app.link_fetcher.stream_safe_url with a network-free stub.
+
+    ``response_factory(url, method, json_body)`` returns the fake response for
+    that call; tests only fake the transport, not the allow-list/redirect
+    logic, which is covered separately by tests/test_ingress_security.py.
+    """
+
+    @asynccontextmanager
+    async def _stub(url, *, method="GET", json_body=None, headers=None, timeout=20.0,
+                     allowed_hosts=None, max_redirects=5, client=None):
+        yield response_factory(url, method, json_body)
+
+    return _stub
 
 
 class TestLinkFetcher(unittest.TestCase):
@@ -625,27 +657,14 @@ class TestFetchNotionContentPagination(unittest.TestCase):
 
             call_log = []
 
-            class FakeResponse:
-                def __init__(self, payload):
-                    self.status_code = 200
-                    self._payload = payload
-                def json(self):
-                    return self._payload
+            payloads = [first_response, second_response, third_response_empty]
 
-            class FakeAsyncClient:
-                async def __aenter__(self):
-                    return self
-                async def __aexit__(self, *a):
-                    return False
-                async def post(self, url, json=None):
-                    call_log.append(json)
-                    if len(call_log) == 1:
-                        return FakeResponse(first_response)
-                    if len(call_log) == 2:
-                        return FakeResponse(second_response)
-                    return FakeResponse(third_response_empty)
+            def _response_factory(url, method, json_body):
+                call_log.append(json_body)
+                idx = min(len(call_log) - 1, len(payloads) - 1)
+                return _fake_response(json.dumps(payloads[idx]).encode("utf-8"))
 
-            with patch('app.link_fetcher.httpx.AsyncClient', return_value=FakeAsyncClient()):
+            with patch('app.link_fetcher.stream_safe_url', _fake_stream_safe_url(_response_factory)):
                 text, nested, is_private = await fetch_notion_content(
                     f"https://fourpalmsvillaskedungu.notion.site/Four-Palms-{self.ROOT_ID.replace('-', '')}"
                 )
@@ -725,12 +744,8 @@ class TestNotionPageIdFromHtml(unittest.TestCase):
 
     def _run_with_html(self, html, status=200):
         async def run_test():
-            fake_res = MagicMock(status_code=status, text=html)
-            fake_client = MagicMock()
-            fake_client.get = AsyncMock(return_value=fake_res)
-            fake_client.__aenter__ = AsyncMock(return_value=fake_client)
-            fake_client.__aexit__ = AsyncMock(return_value=False)
-            with patch('httpx.AsyncClient', return_value=fake_client):
+            response = _fake_response(html.encode("utf-8"), status_code=status)
+            with patch('app.link_fetcher.stream_safe_url', _fake_stream_safe_url(lambda *a: response)):
                 return await resolve_notion_page_id_from_html("https://x.notion.site/slug")
 
         return asyncio.run(run_test())

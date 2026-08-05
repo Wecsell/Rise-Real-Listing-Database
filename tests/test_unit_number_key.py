@@ -52,7 +52,7 @@ class _FakeBase:
 @pytest.fixture
 def fake_table(monkeypatch):
     table = _FakeTable()
-    monkeypatch.setattr(ac, 'get_base', lambda: _FakeBase(table))
+    monkeypatch.setattr(ac, 'get_table', lambda _name: table)
     monkeypatch.setattr(ac, 'CACHE_UNITS', [])
     monkeypatch.setattr(ac, 'cache_is_stale', lambda: False)
     return table
@@ -126,3 +126,19 @@ class TestUnitNumberProducesDistinctRecords:
         key = fake_table.created[0]['Key']
         assert key == 'origins__villa__3br'
         assert 'Unit ID' not in fake_table.created[0]
+
+    @pytest.mark.asyncio
+    async def test_failed_existing_unit_update_returns_no_record_id(self, fake_table):
+        """A failed update must reach the sync queue as a retryable failure."""
+        ac.CACHE_UNITS = [
+            {'id': 'recExisting', 'fields': {'Key': 'baza-kedungu__smt201__1br'}}
+        ]
+        failed_update = AsyncMock(return_value={'id': None})
+
+        with patch.object(ac, 'robust_airtable_op_async', failed_update):
+            result = await ac.upsert_unit(
+                _unit('SMT201', 'Studio', 89000), 'recProj', 'Baza Kedungu', []
+            )
+
+        assert result is None
+        failed_update.assert_awaited_once()

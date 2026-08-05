@@ -5,12 +5,22 @@ import httpx
 import json
 import os
 import asyncio
-import tempfile
 from typing import Dict, Any, List, Optional, Tuple
 from google import genai
 from google.genai import types
 
 from app import content_cache
+from app.url_safety import (
+    GOOGLE_HOST_PATTERNS,
+    NOTION_HOST_PATTERNS,
+    UnsafeUrlError,
+    configured_trusted_hosts,
+    read_response_limited,
+    redact_url,
+    stream_response_to_tempfile,
+    stream_safe_url,
+    validate_url_origin,
+)
 
 try:
     from app.database import save_extraction
@@ -22,6 +32,33 @@ from app.doc_parser import parse_pdf_document
 logger = logging.getLogger("LinkFetcher")
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+def _bounded_int_env(name: str, default: int, maximum: int) -> int:
+    """Read a positive ingress limit without letting a bad env disable it."""
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, os.environ.get(name), default)
+        return default
+    return max(1, min(value, maximum))
+
+
+MAX_DOCUMENT_DOWNLOAD_BYTES = _bounded_int_env(
+    "MAX_DOCUMENT_DOWNLOAD_BYTES", 25 * 1024 * 1024, 50 * 1024 * 1024
+)
+MAX_SHEET_DOWNLOAD_BYTES = _bounded_int_env(
+    "MAX_SHEET_DOWNLOAD_BYTES", 1 * 1024 * 1024, 5 * 1024 * 1024
+)
+MAX_NOTION_HTML_BYTES = _bounded_int_env(
+    "MAX_NOTION_HTML_BYTES", 1 * 1024 * 1024, 5 * 1024 * 1024
+)
+MAX_NOTION_API_BYTES = _bounded_int_env(
+    "MAX_NOTION_API_BYTES", 2 * 1024 * 1024, 8 * 1024 * 1024
+)
+MAX_NOTION_PAGE_CHUNKS = _bounded_int_env("MAX_NOTION_PAGE_CHUNKS", 20, 100)
+MAX_NESTED_LINKS = _bounded_int_env("MAX_NESTED_LINKS", 10, 50)
+MAX_SHEET_TEXT_CHARS = _bounded_int_env("MAX_SHEET_TEXT_CHARS", 15000, 100000)
 
 SHEET_SYSTEM_PROMPT = """
 Ты — эксперт по анализу шахматок недвижимости на Бали.
@@ -69,8 +106,11 @@ def extract_gdrive_id(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 def is_notion_url(url: str) -> bool:
-    domain = urllib.parse.urlparse(url).netloc.lower()
-    return 'notion.site' in domain or 'notion.so' in domain
+    try:
+        validate_url_origin(url, allowed_hosts=NOTION_HOST_PATTERNS)
+        return True
+    except UnsafeUrlError:
+        return False
 
 _NOTION_ID_RE = re.compile(r'([0-9a-fA-F]{32})(?:[?#]|$)')
 
@@ -111,16 +151,22 @@ async def resolve_notion_page_id_from_html(url: str) -> Optional[str]:
     общая для всех страниц константа Notion, id взять неоткуда.
     """
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0,
-                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
-            res = await client.get(url)
-        if res.status_code != 200:
-            return None
+        async with stream_safe_url(
+            url,
+            timeout=20.0,
+            headers={"User-Agent": "Mozilla/5.0"},
+            allowed_hosts=NOTION_HOST_PATTERNS,
+        ) as res:
+            if res.status_code != 200:
+                return None
+            html = (await read_response_limited(res, MAX_NOTION_HTML_BYTES)).decode(
+                "utf-8", errors="replace"
+            )
     except Exception as e:
-        logger.warning(f"Не удалось загрузить HTML страницы Notion {url}: {e}")
+        logger.warning("Could not fetch Notion HTML %s: %s", redact_url(url), e)
         return None
 
-    for candidate in _NOTION_HTML_UUID_RE.findall(res.text):
+    for candidate in _NOTION_HTML_UUID_RE.findall(html):
         if candidate != _NOTION_CONSTANT_UUID:
             logger.info(f"🔎 id страницы Notion взят из HTML: {candidate} ({url})")
             return candidate
@@ -193,21 +239,29 @@ async def _fetch_notion_block_tree(domain: str, page_id: str) -> Optional[dict]:
     space_id: Optional[str] = None
 
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as http_client:
-        for index in range(0, 401, 10):
+        for index in range(0, MAX_NOTION_PAGE_CHUNKS * 10, 10):
             cursor = {"stack": []} if index == 0 else {
                 "stack": [[{"table": "block", "id": page_id, "index": index, "spaceId": space_id}]]
             }
             body = {"page": {"id": page_id}, "cursor": cursor, "verticalColumns": False}
             try:
-                res = await http_client.post(url, json=body)
+                async with stream_safe_url(
+                    url,
+                    method="POST",
+                    json_body=body,
+                    timeout=20.0,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    allowed_hosts=NOTION_HOST_PATTERNS,
+                    client=http_client,
+                ) as res:
+                    if res.status_code != 200:
+                        break
+                    raw_data = await read_response_limited(res, MAX_NOTION_API_BYTES)
+                    data = json.loads(raw_data.decode("utf-8"))
             except Exception as e:
                 logger.error(f"Ошибка запроса к Notion API ({domain}, index={index}): {e}")
                 break
 
-            if res.status_code != 200:
-                break
-
-            data = res.json()
             blocks = data.get("recordMap", {}).get("block", {})
             if not blocks:
                 break
@@ -230,6 +284,10 @@ def extract_nested_urls(text: str) -> List[str]:
     cleaned_urls = []
     for u in urls:
         u_clean = u.rstrip('.,;)]}')
+        try:
+            validate_url_origin(u_clean)
+        except UnsafeUrlError:
+            continue
         if any(kw in u_clean.lower() for kw in ['drive.google.com', 'docs.google.com', '.pdf', 'notion.site', 'notion.so']):
             if u_clean not in cleaned_urls:
                 cleaned_urls.append(u_clean)
@@ -253,26 +311,46 @@ async def download_file_from_url(url: str, suffix: str = ".pdf") -> Tuple[Option
     Возвращает (file_path, is_private).
     """
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0, headers=headers) as http_client:
-        try:
-            res = await http_client.get(url)
-            if res.status_code in (401, 403) or "ServiceLogin" in str(res.url) or "accounts.google.com" in str(res.url):
-                logger.warning(f"🔒 Доступ к ссылке ограничен (Private/Login required): {url}")
+    temp_path: Optional[str] = None
+    try:
+        async with stream_safe_url(
+            url,
+            timeout=30.0,
+            headers=headers,
+            allowed_hosts=configured_trusted_hosts(),
+        ) as res:
+            final_url = str(res.url)
+            if (
+                res.status_code in (401, 403)
+                or "ServiceLogin" in final_url
+                or "accounts.google.com" in final_url
+            ):
+                logger.warning("Private/login-required link: %s", redact_url(url))
                 return None, True
+            if res.status_code != 200:
+                logger.warning("Download returned HTTP %s: %s", res.status_code, redact_url(url))
+                return None, False
 
-            if res.status_code == 200:
-                if not _looks_like_declared_type(res.content, suffix):
-                    logger.warning(
-                        f"⚠️ Ответ 200, но содержимое не похоже на {suffix} - вероятно, "
-                        f"интерстишл антивирусной проверки Google Drive для крупного файла: {url}"
-                    )
-                    return None, False
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                temp_file.write(res.content)
-                temp_file.close()
-                return temp_file.name, False
-        except Exception as e:
-            logger.error(f" Ошибка скачивания файла {url}: {e}")
+            temp_path = await stream_response_to_tempfile(
+                res,
+                suffix=suffix,
+                max_bytes=MAX_DOCUMENT_DOWNLOAD_BYTES,
+            )
+
+        with open(temp_path, "rb") as downloaded_file:
+            signature = downloaded_file.read(32)
+        if not _looks_like_declared_type(signature, suffix):
+            logger.warning("Downloaded content does not match expected %s: %s", suffix, redact_url(url))
+            os.remove(temp_path)
+            return None, False
+        return temp_path, False
+    except UnsafeUrlError as exc:
+        logger.warning("Rejected unsafe or oversized download %s: %s", redact_url(url), exc)
+    except Exception as exc:
+        logger.error("Download failed for %s: %s", redact_url(url), exc)
+
+    if temp_path and os.path.exists(temp_path):
+        os.remove(temp_path)
     return None, False
 
 async def fetch_notion_content(url: str) -> Tuple[Optional[str], List[str], bool]:
@@ -366,6 +444,7 @@ async def process_generic_link(
     visited: Optional[set] = None,
     project_name: Optional[str] = None,
     exclude_fields: Optional[set] = None,
+    max_nested_links: int = MAX_NESTED_LINKS,
 ) -> Dict[str, Any]:
     """
     Единая точка входа для обработки любых внешних ссылок.
@@ -383,14 +462,7 @@ async def process_generic_link(
     if visited is None:
         visited = set()
         
-    url_clean = url.strip()
-    if url_clean in visited or depth > max_depth:
-        logger.warning(f"⚠️ Превышен лимит глубины ({depth}/{max_depth}) или повторный переход по ссылке: {url_clean}")
-        return {"url": url_clean, "is_private": False, "nested_urls": [], "parsed_data": None, "gaps": ["Cycle or max depth reached"]}
-        
-    visited.add(url_clean)
-    logger.info(f"🔍 Анализируем внешнюю ссылку (Глубина {depth}): {url_clean}")
-    
+    url_clean = (url or "").strip()
     result = {
         "url": url_clean,
         "is_private": False,
@@ -398,8 +470,22 @@ async def process_generic_link(
         "parsed_data": None,
         "dev_kit_url": None,
         "drive_files": None,
-        "gaps": []
+        "gaps": [],
     }
+    if url_clean in visited or depth > max_depth:
+        logger.warning(f"⚠️ Превышен лимит глубины ({depth}/{max_depth}) или повторный переход по ссылке: {url_clean}")
+        result["gaps"].append("Cycle or max depth reached")
+        return result
+
+    try:
+        validate_url_origin(url_clean)
+    except UnsafeUrlError as exc:
+        logger.warning("Rejected URL before processing %s: %s", redact_url(url_clean), exc)
+        result["gaps"].append(f"URL rejected by security policy: {exc}")
+        return result
+
+    visited.add(url_clean)
+    logger.info("Processing external link (depth %s): %s", depth, redact_url(url_clean))
 
     # 1. Google Sheets - шахматка сканируется ПЕРВОЙ (владелец, 02.08.2026):
     # её принятые предложения возвращаются вызывающему как doc_findings,
@@ -532,7 +618,16 @@ async def process_generic_link(
         # 7+ ссылок на папки Drive (Brochures/Legal/Renders/...), и break отбрасывал
         # бы все, кроме первой. Папки возвращаются мгновенно (ветка 2 не скачивает
         # их содержимое), так что обход всех ссылок дёшев.
-        for nested in nested_urls:
+        try:
+            nested_limit = max(1, min(int(max_nested_links), MAX_NESTED_LINKS))
+        except (TypeError, ValueError):
+            nested_limit = MAX_NESTED_LINKS
+        if len(nested_urls) > nested_limit:
+            result["gaps"].append(
+                f"Nested URL limit reached: processed {nested_limit} of {len(nested_urls)} links"
+            )
+
+        for nested in nested_urls[:nested_limit]:
             if nested in visited:
                 continue
             if not (extract_gdrive_id(nested) or nested.lower().endswith('.pdf') or is_notion_url(nested)):
@@ -542,6 +637,7 @@ async def process_generic_link(
                 nested, message_id, chat_id, chat_title,
                 depth=depth + 1, max_depth=max_depth, visited=visited,
                 project_name=project_name,
+                max_nested_links=nested_limit,
             )
             if nested_res.get("parsed_data"):
                 result["parsed_data"] = nested_res["parsed_data"]
@@ -578,6 +674,119 @@ async def process_generic_link(
 
     return result
 
+class _BoundedSheetResponse:
+    """Small response adapter used by the existing Google Sheet parser."""
+
+    def __init__(self, status_code: int, url: str, text: str):
+        self.status_code = status_code
+        self.url = url
+        self.text = text
+
+
+class _SafeGoogleSheetClient:
+    """Expose a tiny ``get`` API while enforcing URL and byte limits."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url: str) -> _BoundedSheetResponse:
+        async with stream_safe_url(
+            url,
+            timeout=15.0,
+            allowed_hosts=GOOGLE_HOST_PATTERNS,
+        ) as response:
+            final_url = str(response.url)
+            is_private = (
+                response.status_code in (401, 403)
+                or "ServiceLogin" in final_url
+                or "accounts.google.com" in final_url
+            )
+            content = b"" if is_private or response.status_code != 200 else await read_response_limited(
+                response, MAX_SHEET_DOWNLOAD_BYTES
+            )
+            return _BoundedSheetResponse(
+                response.status_code,
+                final_url,
+                content.decode("utf-8", errors="replace"),
+            )
+
+
+def _normalise_sheet_availability(value: Any) -> Optional[str]:
+    """Map only unambiguous source statuses to the Airtable select canon."""
+    normalised = str(value or "").strip().lower()
+    if not normalised:
+        return None
+    if "sold" in normalised:
+        return "Sold"
+    if normalised in {"available", "on sale", "for sale", "sale"}:
+        return "On sale"
+    return None
+
+
+def _sheet_payload_for_sync(
+    parsed_sheet: Dict[str, Any], fallback_project_name: Optional[str]
+) -> Tuple[Dict[str, Any], str, List[str]]:
+    """Convert the sheet model output into one durable sync-queue payload.
+
+    Storing one aggregate payload is important: the sync worker expects a
+    complete ``Projects``/``Units`` document, while a staging row per unit
+    without ``raw_json`` is never eligible for a durable Airtable export.
+    """
+    source_project = str(parsed_sheet.get("project_name") or "").strip()
+    fallback = str(fallback_project_name or "").strip()
+    project_name = source_project if source_project and source_project.lower() != "unknown project" else fallback
+    if not project_name:
+        # The row is deliberately marked for human review.  A non-empty name
+        # keeps the aggregate payload structurally valid and prevents units
+        # from becoming orphan writes in the sync worker.
+        project_name = "Unknown Project"
+
+    normalised_units: List[Dict[str, Any]] = []
+    gaps: List[str] = []
+    for index, raw_unit in enumerate(parsed_sheet.get("units") or [], start=1):
+        if not isinstance(raw_unit, dict):
+            gaps.append(f"Sheet unit {index} was not an object and was skipped")
+            continue
+
+        unit_number = str(raw_unit.get("unit_id") or raw_unit.get("unit_number") or "").strip()
+        unit_type = str(
+            raw_unit.get("unit_type") or raw_unit.get("type") or unit_number or "Unspecified"
+        ).strip()
+        unit: Dict[str, Any] = {"Unit type": unit_type}
+        if unit_number:
+            unit["Unit Number"] = unit_number
+
+        field_map = {
+            "bedrooms": "Bedrooms",
+            "area_sqm": "Area from (m2)",
+            "price_usd": "Price from (USD)",
+        }
+        for source_key, target_key in field_map.items():
+            value = raw_unit.get(source_key)
+            if value not in (None, ""):
+                unit[target_key] = value
+
+        availability = _normalise_sheet_availability(raw_unit.get("status"))
+        if availability:
+            unit["Availability"] = availability
+        elif raw_unit.get("status") not in (None, ""):
+            gaps.append(
+                f"Sheet unit {unit_number or index}: unrecognised availability {raw_unit.get('status')!r}"
+            )
+        normalised_units.append(unit)
+
+    payload: Dict[str, Any] = {
+        "Developer": {},
+        "Projects": {"Project Name": project_name},
+        "Units": normalised_units,
+        "Gaps": gaps,
+    }
+    return payload, project_name, gaps
+
+
 async def fetch_and_parse_link(
     url: str, message_id: int, chat_id: int, project_name: Optional[str] = None
 ):
@@ -590,6 +799,12 @@ async def fetch_and_parse_link(
     Возвращает summary извлечения полей карточки ({proposals, gaps, opened})
     или None, если project_name не передан либо ничего не нашлось.
     """
+    try:
+        validate_url_origin(url, allowed_hosts=GOOGLE_HOST_PATTERNS)
+    except UnsafeUrlError as exc:
+        logger.warning("Rejected Google Sheet URL %s: %s", redact_url(url), exc)
+        return None
+
     gsheet_id = extract_gsheet_id(url)
     if not gsheet_id:
         return None
@@ -605,7 +820,7 @@ async def fetch_and_parse_link(
 
     sheet_findings = None
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http_client:
+    async with _SafeGoogleSheetClient() as http_client:
         try:
             res = await http_client.get(export_csv_url)
             if res.status_code in (401, 403) or "ServiceLogin" in str(res.url):
@@ -625,7 +840,7 @@ async def fetch_and_parse_link(
                 return None
 
             if res.status_code == 200:
-                csv_text = res.text[:15000]
+                csv_text = res.text[:MAX_SHEET_TEXT_CHARS]
                 logger.info(f"Successfully downloaded Google Sheet CSV ({len(csv_text)} bytes).")
 
                 # Поля карточки (район, срок сдачи, форма владения...) - из
@@ -675,24 +890,35 @@ async def fetch_and_parse_link(
                     # Имя проекта, как его написал застройщик ВНУТРИ шахматки -
                     # не путать с параметром project_name (реальным именем
                     # карточки), от которого зависит извлечение полей выше.
-                    sheet_project_name = parsed_sheet.get("project_name", "Unknown Project")
-                    units = parsed_sheet.get("units", [])
+                    if not isinstance(parsed_sheet, dict):
+                        logger.warning(
+                            "Google Sheet parser returned %s instead of an object",
+                            type(parsed_sheet).__name__,
+                        )
+                        return sheet_findings
+
+                    raw_payload, sheet_project_name, payload_gaps = _sheet_payload_for_sync(
+                        parsed_sheet, project_name
+                    )
+                    units = raw_payload["Units"]
 
                     logger.info(f"🎯 Extracted {len(units)} units from Google Sheet for project '{sheet_project_name}'!")
-                    if save_extraction and isinstance(units, list):
-                        for unit in units:
-                            if isinstance(unit, dict):
-                                await save_extraction(
-                                    message_id=message_id,
-                                    chat_id=chat_id,
-                                    project_recid=sheet_project_name,
-                                    object_guess=f"{unit.get('unit_id')} ({unit.get('bedrooms')} BR)",
-                                    confidence=0.95,
-                                    slot="unit_price",
-                                    url_status="parsed",
-                                    why=f"Price: {unit.get('price_usd')}$, Status: {unit.get('status')}",
-                                    needs_human=True
-                                )
+                    if save_extraction:
+                        await save_extraction(
+                            message_id=message_id,
+                            chat_id=chat_id,
+                            project_recid=sheet_project_name,
+                            object_guess=f"Google Sheet aggregate: {len(units)} unit(s)",
+                            confidence=0.95,
+                            slot="unit_price",
+                            url_status="parsed",
+                            why=(
+                                f"Google Sheet parsed into {len(units)} unit(s)"
+                                + (f"; {len(payload_gaps)} normalisation gap(s)" if payload_gaps else "")
+                            ),
+                            needs_human=True,
+                            raw_json=raw_payload,
+                        )
         except Exception as e:
             logger.error(f"Error fetching/parsing Google Sheet {url}: {e}")
 

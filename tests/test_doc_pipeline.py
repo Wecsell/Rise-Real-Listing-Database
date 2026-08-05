@@ -593,7 +593,7 @@ class TestGapsWriteSafety(unittest.TestCase):
                 return FakeTable()
 
         async def run_test():
-            with patch('app.airtable_client.get_base', return_value=FakeBase()):
+            with patch('app.airtable_client.get_table', return_value=FakeTable()):
                 return await save_findings_to_gaps("rec1", {
                     "proposals": [{"field": "District", "value": "Badung", "citation": "ok",
                                    "quotes": [], "needs_human": False, "source_file": "x.pdf"}],

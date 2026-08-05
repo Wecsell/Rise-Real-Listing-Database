@@ -18,26 +18,66 @@ Legal-папке Four Palms лежат JPEG с KITAP/паспортами дир
   для них единственный путь - скачать и загрузить, files.copy тут неприменим.
 """
 import asyncio
-import io
 import logging
 import os
 import re
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
-import httpx
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 
 from app.drive_auth import get_drive_service
+from app.url_safety import (
+    UnsafeUrlError,
+    configured_trusted_hosts,
+    redact_url,
+    stream_response_to_tempfile,
+    stream_safe_url,
+    validate_url_origin,
+)
 
 logger = logging.getLogger("DriveMirror")
 
-ROOT_FOLDER_ID = os.environ.get("GDRIVE_MIRROR_ROOT_ID", "1ec1sDa_CmBtjGSmW4VIAyqdFHjfye8Jn")
+# Mirroring is a write operation.  It must never silently fall back to a
+# production folder when a deployment is misconfigured.
+ROOT_FOLDER_ID = os.environ.get("GDRIVE_MIRROR_ROOT_ID", "").strip() or None
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 IMAGE_MIME_PREFIX = "image/"
 
 _DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+_ALLOWED_EXTERNAL_IMAGE_TYPES = frozenset({
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+})
+
+
+def _bounded_int_env(name: str, default: int, maximum: int) -> int:
+    """Return a positive bounded integer without making a bad env fatal."""
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, os.environ.get(name), default)
+        return default
+    return max(1, min(value, maximum))
+
+
+MAX_EXTERNAL_IMAGE_BYTES = _bounded_int_env(
+    "MAX_EXTERNAL_IMAGE_BYTES", 10 * 1024 * 1024, 25 * 1024 * 1024
+)
+MAX_EXTERNAL_IMAGES_PER_PROJECT = _bounded_int_env(
+    "MAX_EXTERNAL_IMAGES_PER_PROJECT", 10, 25
+)
+
+
+def require_mirror_root_id(root_id: Optional[str] = None) -> str:
+    """Return the configured mirror root or stop before any Drive write."""
+    resolved = str(root_id or ROOT_FOLDER_ID or "").strip()
+    if not resolved:
+        raise RuntimeError(
+            "GDRIVE_MIRROR_ROOT_ID must be explicitly configured before mirroring files"
+        )
+    return resolved
 
 # Документы, удостоверяющие личность. План (Э1, skip-лист) требует не скачивать
 # и не парсить их; для зеркала это отдельный, более жёсткий запрет - копия живёт
@@ -89,14 +129,14 @@ def _create_child_folder(service, parent_id: str, name: str) -> str:
 
 
 def get_or_create_folder_path(
-    service, path_parts: List[str], root_id: str = ROOT_FOLDER_ID
+    service, path_parts: List[str], root_id: Optional[str] = None
 ) -> str:
     """
     Находит/создаёт путь /{Project Name}/{Unit Type}/ под корнем зеркала.
     Идемпотентно по конструкции: ищет существующую подпапку по имени прежде
     чем создавать, повторный вызов с тем же путём не плодит дубли папок.
     """
-    current = root_id
+    current = require_mirror_root_id(root_id)
     for part in path_parts:
         if not part:
             continue
@@ -164,48 +204,84 @@ async def mirror_external_image(
     загрузить. Идемпотентность та же, что у mirror_drive_image - проверка
     по имени в целевой папке перед загрузкой.
     """
+    try:
+        validate_url_origin(url, allowed_hosts=configured_trusted_hosts())
+    except UnsafeUrlError as exc:
+        logger.warning("Rejected unsafe external image URL %s: %s", redact_url(url), exc)
+        return {"status": "skipped", "name": name or "image", "reason": "unsafe URL"}
+
+    url_path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+    filename = name or os.path.basename(url_path.rstrip("/")) or "image"
+    # The name becomes a Drive filename.  Keep it predictable and prevent URL
+    # paths such as ../../foo or control characters from leaking into Drive.
+    filename = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(". ") or "image"
+    filename = filename[:180]
+
     service = get_drive_service()
-    filename = name or (url.rstrip("/").rsplit("/", 1)[-1] or "image")
 
     existing = await asyncio.to_thread(_find_existing_file, service, dest_folder_id, filename)
     if existing:
         return {"status": "exists", "name": filename, "file_id": existing}
 
+    temp_path: Optional[str] = None
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True, timeout=30.0, headers=_DOWNLOAD_HEADERS
-        ) as client:
-            res = await client.get(url)
-    except Exception as e:
-        return {"status": "error", "name": filename, "reason": str(e)}
+        async with stream_safe_url(
+            url,
+            timeout=30.0,
+            headers=_DOWNLOAD_HEADERS,
+            allowed_hosts=configured_trusted_hosts(),
+        ) as response:
+            if response.status_code != 200:
+                return {
+                    "status": "error",
+                    "name": filename,
+                    "reason": f"HTTP {response.status_code}",
+                }
 
-    if res.status_code != 200:
-        return {"status": "error", "name": filename, "reason": f"HTTP {res.status_code}"}
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type not in _ALLOWED_EXTERNAL_IMAGE_TYPES:
+                return {"status": "skipped", "name": filename, "reason": "not a supported image"}
 
-    content_type = res.headers.get("content-type", "").split(";")[0].strip()
-    if not _is_image(content_type):
-        return {"status": "skipped", "name": filename, "reason": "not an image"}
+            suffix = os.path.splitext(filename)[1].lower()
+            if not suffix or len(suffix) > 10:
+                suffix = ".img"
+            temp_path = await stream_response_to_tempfile(
+                response,
+                suffix=suffix,
+                max_bytes=MAX_EXTERNAL_IMAGE_BYTES,
+            )
 
-    def _upload():
-        media = MediaIoBaseUpload(io.BytesIO(res.content), mimetype=content_type, resumable=False)
-        return service.files().create(
-            body={"name": filename, "parents": [dest_folder_id]},
-            media_body=media, fields="id", supportsAllDrives=True,
-        ).execute()
+        def _upload():
+            media = MediaFileUpload(temp_path, mimetype=content_type, resumable=False)
+            return service.files().create(
+                body={"name": filename, "parents": [dest_folder_id]},
+                media_body=media, fields="id", supportsAllDrives=True,
+            ).execute()
 
-    try:
         uploaded = await asyncio.to_thread(_upload)
         return {"status": "uploaded", "name": filename, "file_id": uploaded["id"]}
+    except UnsafeUrlError as exc:
+        logger.warning("External image fetch rejected for %s: %s", redact_url(url), exc)
+        return {"status": "skipped", "name": filename, "reason": str(exc)}
     except HttpError as e:
         logger.warning(f"⚠️ Загрузка внешнего изображения не удалась для {filename}: {e}")
         return {"status": "error", "name": filename, "reason": str(e)}
+    except Exception as exc:
+        logger.warning("External image fetch/upload failed for %s: %s", redact_url(url), exc)
+        return {"status": "error", "name": filename, "reason": str(exc)}
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError as exc:
+                logger.warning("Could not remove temporary image %s: %s", temp_path, exc)
 
 
 def mirror_project_drive_files(
     project_name: str,
     drive_files: List[Dict[str, Any]],
     unit_type: Optional[str] = None,
-    root_id: str = ROOT_FOLDER_ID,
+    root_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Точка входа Э6 для файлов, уже развёрнутых list_drive_folder_recursive.
@@ -215,9 +291,10 @@ def mirror_project_drive_files(
     Возвращает сводку по каждому файлу плюс gaps - человекочитаемые записи
     об отказах, готовые к слиянию через app.gaps.merge_gaps.
     """
+    resolved_root_id = require_mirror_root_id(root_id)
     service = get_drive_service()
     base_parts = [project_name] + ([unit_type] if unit_type else [])
-    dest_folder_id = get_or_create_folder_path(service, base_parts, root_id)
+    dest_folder_id = get_or_create_folder_path(service, base_parts, resolved_root_id)
 
     # Структура источника повторяется, а не сплющивается: у одного проекта
     # рендеры разложены по виллам и по типам съёмки (Villa 1/Interior,
@@ -231,7 +308,7 @@ def mirror_project_drive_files(
         if rel_path in folder_cache:
             return folder_cache[rel_path]
         parts = [p for p in rel_path.split("/") if p]
-        folder_id = get_or_create_folder_path(service, base_parts + parts, root_id)
+        folder_id = get_or_create_folder_path(service, base_parts + parts, resolved_root_id)
         folder_cache[rel_path] = folder_id
         return folder_id
 
@@ -286,7 +363,7 @@ def mirror_drive_folder(
     folder_id: str,
     project_name: str,
     max_depth: int = 5,
-    root_id: str = ROOT_FOLDER_ID,
+    root_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Зеркалирует папку Drive целиком, сохраняя её собственное имя верхним уровнем:
@@ -299,11 +376,12 @@ def mirror_drive_folder(
     """
     from app.drive_folder import list_drive_folder_recursive
 
+    resolved_root_id = require_mirror_root_id(root_id)
     service = get_drive_service()
     files = list_drive_folder_recursive(folder_id, max_depth=max_depth)
     folder_name = _prefix_with_source_folder_name(service, folder_id, files)
 
-    summary = mirror_project_drive_files(project_name, files, root_id=root_id)
+    summary = mirror_project_drive_files(project_name, files, root_id=resolved_root_id)
     summary["source_folder_name"] = folder_name
     return summary
 
@@ -312,16 +390,17 @@ def mirror_listed_drive_folder(
     folder_id: str,
     files: List[Dict[str, Any]],
     project_name: str,
-    root_id: str = ROOT_FOLDER_ID,
+    root_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Как mirror_drive_folder, но для уже полученного list_drive_folder_recursive()
     списка файлов - не делает повторный листинг той же папки.
     """
+    resolved_root_id = require_mirror_root_id(root_id)
     service = get_drive_service()
     folder_name = _prefix_with_source_folder_name(service, folder_id, files)
 
-    summary = mirror_project_drive_files(project_name, files, root_id=root_id)
+    summary = mirror_project_drive_files(project_name, files, root_id=resolved_root_id)
     summary["source_folder_name"] = folder_name
     return summary
 
@@ -330,27 +409,40 @@ async def mirror_project_external_images(
     project_name: str,
     image_urls: List[str],
     unit_type: Optional[str] = None,
-    root_id: str = ROOT_FOLDER_ID,
+    root_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Точка входа Э6 для изображений не с Drive (найдены как ссылки, например
     внутри содержимого Notion). Та же целевая папка, что и у Drive-файлов
     того же проекта - зеркало не различает происхождение на выходе.
     """
+    resolved_root_id = require_mirror_root_id(root_id)
     service = get_drive_service()
     path_parts = [project_name] + ([unit_type] if unit_type else [])
     dest_folder_id = await asyncio.to_thread(
-        get_or_create_folder_path, service, path_parts, root_id
+        get_or_create_folder_path, service, path_parts, resolved_root_id
     )
 
+    unique_urls = list(dict.fromkeys(url for url in (image_urls or []) if isinstance(url, str)))
     results = []
-    for url in image_urls or []:
+    for url in unique_urls[:MAX_EXTERNAL_IMAGES_PER_PROJECT]:
         results.append(await mirror_external_image(url, dest_folder_id))
+
+    if len(unique_urls) > MAX_EXTERNAL_IMAGES_PER_PROJECT:
+        results.append({
+            "status": "skipped",
+            "name": "additional external images",
+            "reason": f"limit {MAX_EXTERNAL_IMAGES_PER_PROJECT}",
+        })
 
     gaps = [
         f"Drive mirror failed for {r['name']}: {r['reason']}"
         for r in results if r["status"] == "error"
     ]
+    if len(unique_urls) > MAX_EXTERNAL_IMAGES_PER_PROJECT:
+        gaps.append(
+            f"External image limit reached: processed {MAX_EXTERNAL_IMAGES_PER_PROJECT} of {len(unique_urls)}"
+        )
     return {"dest_folder_id": dest_folder_id, "results": results, "gaps": gaps}
 
 

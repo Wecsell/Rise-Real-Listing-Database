@@ -37,7 +37,3 @@ out_repr.txt
 .coverage
 htmlcov/
 logs/
-
-# Локальный проброс порта Postgres для живых тестов на dev-машине - в проде
-# сервисы ходят по внутренней docker-сети по имени, порт наружу не нужен.
-docker-compose.override.yml

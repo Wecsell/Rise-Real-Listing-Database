@@ -3,7 +3,6 @@ import re
 import io
 import json
 import logging
-import requests
 import pandas as pd
 from typing import Optional, Dict, Any, List
 from app.gemini_parser import client, resolve_model_name, ParsedExtraction
@@ -60,17 +59,16 @@ def fetch_google_sheet_csv(url: str) -> Optional[str]:
     """
     Скачивает содержимое таблицы Google Sheets в формате CSV.
     """
-    csv_url = convert_google_sheet_url_to_csv(url)
-    if not csv_url:
-        return None
-        
-    try:
-        response = requests.get(csv_url, timeout=15)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        logger.error(f"Failed to fetch Google Sheet CSV from {csv_url}: {e}")
-        return None
+    # Live sheet ingestion belongs to app.link_fetcher.fetch_and_parse_link:
+    # it validates allow-listed HTTPS origins and redirects, checks DNS for
+    # non-public targets, and streams under a hard byte limit.  This legacy
+    # synchronous API had an unbounded requests.get path, so fail closed
+    # rather than retain a second unsafe network boundary.
+    if convert_google_sheet_url_to_csv(url):
+        logger.warning(
+            "fetch_google_sheet_csv is disabled; use app.link_fetcher.fetch_and_parse_link"
+        )
+    return None
 
 async def parse_chessboard_table(csv_content: str) -> List[Dict[str, Any]]:
     """

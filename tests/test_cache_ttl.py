@@ -42,7 +42,7 @@ def fresh_cache(monkeypatch):
     monkeypatch.setattr(ac, 'CACHE_PROJECTS', [])
     monkeypatch.setattr(ac, 'CACHE_UNITS', [])
     base = FakeBase()
-    monkeypatch.setattr(ac, 'get_base', lambda: base)
+    monkeypatch.setattr(ac, 'get_table', lambda name: base.table(name))
     return base
 
 

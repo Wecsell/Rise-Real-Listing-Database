@@ -59,7 +59,7 @@ Rise-Real-Listing-Database/
 │   ├── link_fetcher.py    # Скрипт для извлечения информации по ссылкам из сообщений.
 │   └── history_scanner.py # Сканирование старых сообщений чата при первом запуске.
 │
-├── docker-compose.yml     # Конфигурация контейнеров (бот, postgres, redis).
+├── docker-compose.yml     # Конфигурация listener, PostgreSQL и opt-in профилей.
 ├── Dockerfile             # Сборка образа для бота на базе Python.
 ├── init.sql               # Инициализация схемы таблиц Postgres.
 └── .env                   # Файл с секретами (API ключи, пароли БД).
@@ -69,21 +69,49 @@ Rise-Real-Listing-Database/
 
 ## Развертывание и Запуск
 
-Система работает внутри **Docker**. Это значит, что для запуска не нужно настраивать систему и устанавливать Python вручную.
+Основной production-контур работает внутри **Docker**: по умолчанию запускаются только PostgreSQL и Telegram listener. Образ содержит исходный код приложения; монтируется только `./data` для сессии Telegram и SQLite-кэша, а не каталог `./app`.
+
+PostgreSQL не публикуется наружу: проверяемый `docker-compose.override.yml` привязывает его только к `127.0.0.1:5432` (при необходимости порт меняется через `POSTGRES_HOST_PORT`). Контейнеры обращаются к БД по внутренней Docker-сети. Listener и Postgres имеют healthcheck; listener стартует только после готовности БД.
+
+Redis больше не используется кодом и исключён из Compose и runtime-зависимостей. Если от прежней конфигурации остался Redis-контейнер, он не участвует в новом контуре; удаляйте его отдельно только после проверки, не удаляя том данных автоматически.
 
 **Перезапуск бота (применение нового кода):**
 ```bash
-docker-compose up -d --build listener
+docker compose up -d --build listener
 ```
 
 **Просмотр логов бота в реальном времени:**
 ```bash
-docker-compose logs -f listener
+docker compose logs -f listener
 ```
 
 **Принудительная выгрузка в Airtable (без ожидания понедельника):**
 ```bash
-docker-compose exec listener python app/sync_job.py
+docker compose --profile maintenance run --rm sync
+```
+
+`sync` — одноразовый maintenance-service без restart policy. Перед реальной выгрузкой обязательно проверьте `DRY_RUN` и статус review-записей.
+
+Полевой бот и обработчик не входят в запуск по умолчанию, чтобы не создать второго Telegram polling-процесса. Для запуска именно контейнерного варианта используйте:
+
+```bash
+docker compose --profile field up -d field_bot field_processor
+```
+
+Не запускайте одновременно эти сервисы и локальные `python manage.py start field_bot` / `field_processor`: фиксированные имена контейнеров защищают от масштабирования внутри Compose, но не могут заблокировать отдельный процесс на хосте.
+
+Для локального запуска тестов используйте отдельный dev-набор зависимостей (в production-образ он не входит):
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+На машине без Python доступен изолированный Docker test-profile: он не читает `.env`, не получает сеть и использует `requirements-dev.txt`.
+
+```bash
+docker compose --profile test build test
+docker compose --profile test run --rm test pytest -q
 ```
 
 ---
@@ -94,7 +122,7 @@ docker-compose exec listener python app/sync_job.py
 Выгрузка данных настроена на сервере через системный планировщик Linux `cron`.
 Команда `crontab -e` содержит строку:
 ```bash
-0 9 * * 1 cd ~/Rise-Real-Listing-Database && /usr/bin/docker-compose exec -T listener python app/sync_job.py >> sync.log 2>&1
+0 9 * * 1 cd ~/Rise-Real-Listing-Database && /usr/bin/docker compose --profile maintenance run --rm sync >> sync.log 2>&1
 ```
 *(Запуск каждый понедельник в 09:00)*
 
@@ -103,4 +131,4 @@ docker-compose exec listener python app/sync_job.py
 1. Откройте `.env` файл (`nano .env`)
 2. Измените `AIRTABLE_BASE_ID` на ID продакшен-базы (`app2IEMPr6R3GelVP`).
 3. Убедитесь, что `DRY_RUN=0`.
-4. Перезапустите бота: `docker-compose up -d listener`.
+4. Перезапустите бота: `docker compose up -d listener`.

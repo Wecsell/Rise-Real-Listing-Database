@@ -213,7 +213,10 @@ class TestUnitType:
         ('villa', 'Villa'),
         ('  Studio  ', 'Studio'),
         ('2BR villa with pool', 'Villa'),
-        ('mini villa', 'Villa'),
+        # 'Mini Villa' стало отдельной живой опцией Units.Unit type (добавлена
+        # 03.08.2026 пакетной записью) — exact-match со схемой теперь
+        # приоритетнее alias-свёртки к 'Villa', см. sanitize_unit_type().
+        ('mini villa', 'Mini Villa'),
         ('bungalow', 'Villa'),
         ('residence', 'Villa'),
         ('villa 2br', 'Villa'),

@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import unittest
+from contextlib import asynccontextmanager
 from unittest.mock import patch, MagicMock, AsyncMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -15,6 +16,28 @@ from app.drive_mirror import (
     mirror_project_external_images,
     get_or_create_folder_path,
 )
+
+
+def _fake_stream_response(content: bytes, content_type: str, status_code: int = 200):
+    """Stand in for the httpx.Response yielded by app.url_safety.stream_safe_url."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = {"content-type": content_type}
+
+    async def aiter_bytes():
+        yield content
+
+    resp.aiter_bytes = aiter_bytes
+    return resp
+
+
+def _stream_safe_url_stub(response):
+    @asynccontextmanager
+    async def _stub(url, *, method="GET", json_body=None, headers=None, timeout=20.0,
+                     allowed_hosts=None, max_redirects=5, client=None):
+        yield response
+
+    return _stub
 
 
 def _service_with_lookup(existing_files=None, copy_result=None, copy_error=None, create_folder_id="new_folder"):
@@ -125,7 +148,7 @@ class TestMirrorProjectDriveFiles(unittest.TestCase):
             {"id": "f2", "name": "blocked.jpg", "mimeType": "image/jpeg"},
             {"id": "f3", "name": "deed.pdf", "mimeType": "application/pdf"},
         ]
-        summary = mirror_project_drive_files("Four Palms Villas", drive_files)
+        summary = mirror_project_drive_files("Four Palms Villas", drive_files, root_id="test-root-id")
 
         self.assertEqual(len(summary["results"]), 3)
         self.assertEqual(len(summary["gaps"]), 1)
@@ -244,7 +267,7 @@ class TestSourceStructureIsPreserved(unittest.TestCase):
             {"id": "c", "name": "3.jpg", "mimeType": "image/jpeg",
              "path": "Exterior/Latest Renders"},
         ]
-        summary = mirror_project_drive_files("Four Palms Villas", drive_files)
+        summary = mirror_project_drive_files("Four Palms Villas", drive_files, root_id="test-root-id")
 
         created_names = [n for n, _ in created_paths]
         self.assertIn("Interior", created_names)
@@ -272,7 +295,7 @@ class TestSourceStructureIsPreserved(unittest.TestCase):
             {"id": "a", "name": "deed.pdf", "mimeType": "application/pdf", "path": "Legal"},
             {"id": "b", "name": "KTP.jpg", "mimeType": "image/jpeg", "path": "Legal"},
         ]
-        mirror_project_drive_files("Four Palms Villas", drive_files)
+        mirror_project_drive_files("Four Palms Villas", drive_files, root_id="test-root-id")
 
         self.assertNotIn("Legal", created_names)
 
@@ -312,7 +335,7 @@ class TestMirrorDriveFolderKeepsItsOwnName(unittest.TestCase):
             {"id": "i1", "name": "still.jpg", "mimeType": "image/jpeg", "path": "Stills"},
         ]
 
-        summary = mirror_drive_folder("src_folder", "Four Palms Villas")
+        summary = mirror_drive_folder("src_folder", "Four Palms Villas", root_id="test-root-id")
 
         self.assertEqual(summary["source_folder_name"], "Renders")
         self.assertIn("Renders", created)
@@ -342,7 +365,7 @@ class TestMirrorDriveFolderKeepsItsOwnName(unittest.TestCase):
         mock_get_service.return_value = service
 
         already_listed = [{"id": "i1", "name": "1.jpg", "mimeType": "image/jpeg", "path": ""}]
-        summary = mirror_listed_drive_folder("src_folder", already_listed, "Four Palms Villas")
+        summary = mirror_listed_drive_folder("src_folder", already_listed, "Four Palms Villas", root_id="test-root-id")
 
         mock_list.assert_not_called()
         self.assertEqual(summary["source_folder_name"], "Renders")
@@ -354,15 +377,7 @@ class TestMirrorExternalImage(unittest.TestCase):
 
     def test_non_drive_image_is_downloaded_and_uploaded(self):
         async def run_test():
-            fake_response = MagicMock()
-            fake_response.status_code = 200
-            fake_response.headers = {"content-type": "image/png"}
-            fake_response.content = b"\x89PNG fake bytes"
-
-            fake_client = MagicMock()
-            fake_client.get = AsyncMock(return_value=fake_response)
-            fake_client.__aenter__ = AsyncMock(return_value=fake_client)
-            fake_client.__aexit__ = AsyncMock(return_value=False)
+            fake_response = _fake_stream_response(b"\x89PNG fake bytes", "image/png")
 
             service = MagicMock()
             service.files.return_value.list.return_value.execute.return_value = {"files": []}
@@ -371,7 +386,7 @@ class TestMirrorExternalImage(unittest.TestCase):
             service.files.return_value.create.return_value = create_exec
 
             with patch('app.drive_mirror.get_drive_service', return_value=service), \
-                 patch('httpx.AsyncClient', return_value=fake_client):
+                 patch('app.drive_mirror.stream_safe_url', _stream_safe_url_stub(fake_response)):
                 result = await mirror_external_image(
                     "https://notion.so/image-uploads/plan.png", "dest_folder"
                 )
@@ -383,21 +398,13 @@ class TestMirrorExternalImage(unittest.TestCase):
 
     def test_non_image_content_type_is_skipped(self):
         async def run_test():
-            fake_response = MagicMock()
-            fake_response.status_code = 200
-            fake_response.headers = {"content-type": "text/html"}
-            fake_response.content = b"<html></html>"
-
-            fake_client = MagicMock()
-            fake_client.get = AsyncMock(return_value=fake_response)
-            fake_client.__aenter__ = AsyncMock(return_value=fake_client)
-            fake_client.__aexit__ = AsyncMock(return_value=False)
+            fake_response = _fake_stream_response(b"<html></html>", "text/html")
 
             service = MagicMock()
             service.files.return_value.list.return_value.execute.return_value = {"files": []}
 
             with patch('app.drive_mirror.get_drive_service', return_value=service), \
-                 patch('httpx.AsyncClient', return_value=fake_client):
+                 patch('app.drive_mirror.stream_safe_url', _stream_safe_url_stub(fake_response)):
                 result = await mirror_external_image(
                     "https://notion.so/not-an-image", "dest_folder"
                 )
@@ -415,13 +422,13 @@ class TestMirrorExternalImage(unittest.TestCase):
             }
 
             with patch('app.drive_mirror.get_drive_service', return_value=service), \
-                 patch('httpx.AsyncClient') as mock_client_cls:
+                 patch('app.drive_mirror.stream_safe_url') as mock_stream_safe_url:
                 result = await mirror_external_image(
                     "https://notion.so/image-uploads/plan.png", "dest_folder"
                 )
 
             self.assertEqual(result["status"], "exists")
-            mock_client_cls.assert_not_called()
+            mock_stream_safe_url.assert_not_called()
 
         asyncio.run(run_test())
 

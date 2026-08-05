@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import re
+import hashlib
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -166,6 +167,11 @@ PREFERRED_MODELS = ('gemini-3.5-flash-lite', 'gemini-3.5-flash',
 
 _cached_model_name = None
 
+# Changing either the extraction contract or the model may change the answer
+# for identical source text.  Keep the cache namespace explicit as an extra
+# guard for changes outside the prompt/schema payload below.
+MESSAGE_CACHE_VERSION = "2"
+
 
 def resolve_model_name() -> str:
     """
@@ -212,6 +218,33 @@ def resolve_model_name() -> str:
     return _cached_model_name
 
 
+def _message_cache_context(
+    chat_title: Optional[str], model_name: str, existing_projects: Optional[List[str]]
+) -> str:
+    """Build a stable cache context for every input that can alter parsing.
+
+    ``parse_message`` augments the system prompt with projects already known
+    for a developer.  Reusing a result produced before that list, the model,
+    or the response schema changed can silently assign a message to the wrong
+    project.  The fingerprint makes those variants intentionally distinct.
+    """
+    known_projects = sorted(
+        str(project).strip()
+        for project in (existing_projects or [])
+        if project and str(project).strip()
+    )
+    contract = {
+        "cache_version": MESSAGE_CACHE_VERSION,
+        "chat_title": chat_title or "",
+        "existing_projects": known_projects,
+        "model": model_name,
+        "response_schema": ParsedExtraction.model_json_schema(),
+        "system_prompt": SYSTEM_PROMPT,
+    }
+    serialized = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 async def parse_message(text: str, chat_title: str = None) -> dict:
     if not client:
         logger.warning("GEMINI_API_KEY is not configured.")
@@ -220,21 +253,22 @@ async def parse_message(text: str, chat_title: str = None) -> dict:
     if not text or len(text.strip()) < 3:
         return {"is_relevant": False, "reason": "Message too short"}
 
-    # Один и тот же текст может прийти дважды: пересылка в чате, повторный
-    # скан истории при перезапуске listener. Проверяем кэш до похода в
-    # Airtable за списком проектов застройщика — попадание экономит и его.
-    cache_key = content_cache.hash_text(text, context=chat_title or '')
-    cached = await asyncio.to_thread(content_cache.get, cache_key)
-    if cached is not None:
-        logger.info(f"💾 Cache hit for message (chat='{chat_title}'), skipping Gemini call")
-        return cached
-    logger.info(f"Cache miss (chat='{chat_title}'), calling Gemini...")
-
     model_name = resolve_model_name()
 
     try:
         from app.airtable_client import get_projects_by_developer
         existing_projects = get_projects_by_developer(chat_title)
+
+        # The cache key includes every value that changes the model request,
+        # including the developer's current project list.  Correctness wins
+        # over a stale cache hit when another worker has just created a project.
+        cache_context = _message_cache_context(chat_title, model_name, existing_projects)
+        cache_key = content_cache.hash_text(text, context=cache_context)
+        cached = await asyncio.to_thread(content_cache.get, cache_key)
+        if cached is not None:
+            logger.info(f"💾 Cache hit for message (chat='{chat_title}'), skipping Gemini call")
+            return cached
+        logger.info(f"Cache miss (chat='{chat_title}'), calling Gemini...")
         
         dynamic_prompt = SYSTEM_PROMPT
         if chat_title:

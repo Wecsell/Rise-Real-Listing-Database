@@ -4,6 +4,7 @@ import pytest
 import pytest_asyncio
 import urllib.request
 import urllib.error
+import app.healthcheck as healthcheck
 from app.healthcheck import start_healthcheck_server, set_health_checker
 
 @pytest.fixture(autouse=True)
@@ -90,7 +91,24 @@ async def test_healthcheck_exception_500(server):
     status, body = await fetch(f"{server}/healthcheck")
     assert status == 500
     assert body["status"] == "unhealthy"
-    assert "Telegram RPC call failed" in body["details"]["error"]
+    # Details remain safe to expose; the full exception is in service logs.
+    assert body["details"]["error"] == "health checker failed"
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_callback_timeout_is_unhealthy(server, monkeypatch):
+    monkeypatch.setattr(healthcheck, "CALLBACK_TIMEOUT_SECONDS", 0.01)
+
+    async def slow_checker():
+        await asyncio.sleep(1)
+        return True, {}
+
+    set_health_checker(slow_checker)
+
+    status, body = await fetch(f"{server}/healthcheck")
+    assert status == 500
+    assert body["status"] == "unhealthy"
+    assert body["details"]["error"] == "health checker timed out"
 
 @pytest.mark.asyncio
 async def test_healthcheck_not_found(server):

@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import difflib
+import threading
 import requests
 from pyairtable import Api
 from datetime import datetime
@@ -37,6 +38,8 @@ _SCHEMA_FIELDS = {}
 # Нужен, чтобы ловить не только отсутствие поля, но и запись в вычисляемое:
 # 'Unit ID' оказался формулой и молча ронял всю запись юнита (02.08.2026).
 _SCHEMA_FIELD_TYPES = {}
+_TABLE_IDS = {}
+_SCHEMA_LOAD_LOCK = threading.Lock()
 
 
 def _load_schema_options() -> dict:
@@ -57,17 +60,71 @@ def _load_schema_options() -> dict:
     url = f'https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables'
     req = urllib.request.Request(url, headers={'Authorization': f'Bearer {AIRTABLE_TOKEN}'})
     result = {}
+    table_ids = {}
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.load(resp)
 
     for table in data.get('tables', []):
-        _SCHEMA_FIELDS[table['name']] = {f['name'] for f in table.get('fields', [])}
+        table_name = table.get('name')
+        table_id = table.get('id')
+        if not table_name:
+            continue
+        if table_id:
+            table_ids[table_name] = table_id
+        _SCHEMA_FIELDS[table_name] = {f['name'] for f in table.get('fields', [])}
         for field in table.get('fields', []):
-            _SCHEMA_FIELD_TYPES[(table['name'], field['name'])] = field.get('type')
+            _SCHEMA_FIELD_TYPES[(table_name, field['name'])] = field.get('type')
             choices = field.get('options', {}).get('choices')
             if choices:
-                result[(table['name'], field['name'])] = [c['name'] for c in choices]
+                result[(table_name, field['name'])] = [c['name'] for c in choices]
+    _TABLE_IDS.clear()
+    _TABLE_IDS.update(table_ids)
     return result
+
+
+def _ensure_schema_metadata() -> None:
+    """Load table IDs, fields and select options once in a thread-safe way."""
+    global _SCHEMA_OPTIONS
+    if _SCHEMA_OPTIONS is not None:
+        return
+    with _SCHEMA_LOAD_LOCK:
+        if _SCHEMA_OPTIONS is not None:
+            return
+        try:
+            _SCHEMA_OPTIONS = _load_schema_options()
+            logger.info(
+                "Airtable schema loaded: %s selects, %s table IDs.",
+                len(_SCHEMA_OPTIONS),
+                len(_TABLE_IDS),
+            )
+        except Exception as exc:
+            logger.error("Failed to load Airtable schema: %s", exc)
+            _SCHEMA_OPTIONS = {}
+            _TABLE_IDS.clear()
+
+
+def get_table_id(table_name: str):
+    """Resolve a table display name to its Airtable table ID from metadata."""
+    if not table_name:
+        return None
+    if str(table_name).startswith("tbl"):
+        return str(table_name)
+    _ensure_schema_metadata()
+    table_id = _TABLE_IDS.get(table_name)
+    if not table_id:
+        logger.error("Airtable table ID not found for %r; refusing name-based request.", table_name)
+    return table_id
+
+
+def get_table(table_name: str):
+    """Return a pyairtable table addressed by ID, never by display name."""
+    base = get_base()
+    if not base:
+        return None
+    table_id = get_table_id(table_name)
+    if not table_id:
+        return None
+    return base.table(table_id)
 
 
 def get_field_type(table: str, field: str):
@@ -91,14 +148,7 @@ def field_exists(table: str, field: str) -> bool:
 
 def get_select_options(table: str, field: str, fallback=None) -> list:
     """Актуальные значения селекта из базы. При сбое — запасной список."""
-    global _SCHEMA_OPTIONS
-    if _SCHEMA_OPTIONS is None:
-        try:
-            _SCHEMA_OPTIONS = _load_schema_options()
-            logger.info(f"Схема Airtable прочитана: {len(_SCHEMA_OPTIONS)} селектов")
-        except Exception as e:
-            logger.error(f"Не удалось прочитать схему Airtable, работаем по запасным спискам: {e}")
-            _SCHEMA_OPTIONS = {}
+    _ensure_schema_metadata()
     return _SCHEMA_OPTIONS.get((table, field)) or (fallback or [])
 
 
@@ -134,14 +184,14 @@ def get_agency_phones() -> set:
     if _AGENCY_PHONES is not None and (time.time() - _AGENCY_LOADED_AT) < CACHE_TTL_SECONDS:
         return _AGENCY_PHONES
 
-    base = get_base()
-    if not base:
+    table = get_table('Agencies')
+    if not table:
         return _AGENCY_PHONES or set()
 
     try:
         from app.dedup import extract_phones
         phones = set()
-        for record in base.table('Agencies').all(fields=['Phones']):
+        for record in table.all(fields=['Phones']):
             phones.update(extract_phones(record['fields'].get('Phones')))
         _AGENCY_PHONES = phones
         _AGENCY_LOADED_AT = time.time()
@@ -182,14 +232,17 @@ def init_cache(force: bool = False):
     global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_INITIALIZED, CACHE_LOADED_AT
     if not force and not cache_is_stale():
         return
-    base = get_base()
-    if not base:
+    developer_table = get_table('Developer')
+    projects_table = get_table('Projects')
+    units_table = get_table('Units')
+    if not all((developer_table, projects_table, units_table)):
+        logger.error("Airtable cache not initialized because one or more table IDs are unavailable.")
         return
     logger.info("Initializing Airtable cache (minimal fields)...")
 
-    CACHE_DEVELOPERS = base.table('Developer').all()
-    CACHE_PROJECTS = base.table('Projects').all()
-    CACHE_UNITS = base.table('Units').all()
+    CACHE_DEVELOPERS = developer_table.all()
+    CACHE_PROJECTS = projects_table.all()
+    CACHE_UNITS = units_table.all()
 
     CACHE_INITIALIZED = True
     CACHE_LOADED_AT = time.time()
@@ -794,11 +847,9 @@ async def upsert_developer(dev_data: dict) -> str:
     if cache_is_stale():
         await init_cache_async()
         
-    base = get_base()
-    if not base:
+    table = get_table('Developer')
+    if not table:
         return None
-
-    table = base.table('Developer')
     existing = CACHE_DEVELOPERS
     
     dev_name = dev_data.get('Developer')
@@ -873,11 +924,9 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
     if cache_is_stale():
         await init_cache_async()
         
-    base = get_base()
-    if not base:
+    table = get_table('Projects')
+    if not table:
         return None
-
-    table = base.table('Projects')
     proj_name = proj_data.get('Project Name')
 
     # Названия нет или вместо него общее слово ('VILLA', 'Unknown Project',
@@ -1077,12 +1126,10 @@ async def mark_project_units_sold(proj_id: str):
         return
     if cache_is_stale():
         await init_cache_async()
-    base = get_base()
-    if not base:
+    table_primary = get_table('Units')
+    table_secondary = get_table('Units (Secondary)')
+    if not table_primary or not table_secondary:
         return
-        
-    table_primary = base.table('Units')
-    table_secondary = base.table('Units (Secondary)')
     
     for u in list(CACHE_UNITS):
         p_links = u.get('fields', {}).get('Project Name', [])
@@ -1109,12 +1156,10 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     if cache_is_stale():
         await init_cache_async()
         
-    base = get_base()
-    if not base:
-        return None
-
     table_name = 'Units (Secondary)' if is_secondary else 'Units'
-    table = base.table(table_name)
+    table = get_table(table_name)
+    if not table:
+        return None
     
     # Нормализуем Unit type ДО генерации ключа, чтобы ключи были стабильными
     raw_unit_type = unit_data.get('Unit type')
@@ -1231,7 +1276,7 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
         if not record or not record.get('id'):
             logger.error(f"Failed to update Unit {key}")
-            return rec_id
+            return None
         
         # Обновляем кэш
         for i, c in enumerate(CACHE_UNITS):

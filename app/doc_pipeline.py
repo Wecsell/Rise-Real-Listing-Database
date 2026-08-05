@@ -527,7 +527,10 @@ async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> boo
     summary = {**summary, "mirror_airtable_fields": mirror_fields}
 
     def _write():
-        table = ac.get_base().table("Projects")
+        table = ac.get_table("Projects")
+        if not table:
+            logger.error("Airtable Projects table is unavailable; Gaps were not updated.")
+            return False
         record = table.get(project_id)
         fields_dict = record.get("fields", {}) or {}
         current_gaps = fields_dict.get("Gaps")

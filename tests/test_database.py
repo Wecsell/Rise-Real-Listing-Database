@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import unittest
+from unittest.mock import AsyncMock, patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -72,11 +73,13 @@ class TestCheckDbPing(unittest.TestCase):
 
 
 class _FakeExecuteConn:
-    def __init__(self):
+    def __init__(self, result="UPDATE 1"):
         self.executed = []
+        self.result = result
 
     async def execute(self, query, *args):
         self.executed.append((query, args))
+        return self.result
 
 
 class TestSilentLossWithoutPostgres(unittest.TestCase):
@@ -115,6 +118,47 @@ class TestSilentLossWithoutPostgres(unittest.TestCase):
             url_status="parsed", why="Price: 100000$", needs_human=True,
         ))
         self.assertEqual(len(conn.executed), 1)
+        query, args = conn.executed[0]
+        self.assertIn("WHERE NOT EXISTS", query)
+        self.assertIn("ON CONFLICT (ingest_key)", query)
+        self.assertEqual(len(args[10]), 64)
+
+    def test_history_rescan_key_is_stable_but_link_sources_stay_distinct(self):
+        history_first = db._extraction_ingest_key(
+            message_id=7,
+            chat_id=11,
+            slot="history_backfill",
+            object_guess="history_backfill",
+            why="first model phrasing",
+            raw_json={"Projects": {"Project Name": "A"}},
+        )
+        history_second = db._extraction_ingest_key(
+            message_id=7,
+            chat_id=11,
+            slot="history_backfill",
+            object_guess="history_backfill",
+            why="later model phrasing",
+            raw_json={"Projects": {"Project Name": "B"}},
+        )
+        link_first = db._extraction_ingest_key(
+            message_id=7,
+            chat_id=11,
+            slot="link_fetch",
+            object_guess="Parsed from link: https://example.test/a",
+            why="ok",
+            raw_json={"Projects": {"Project Name": "A"}},
+        )
+        link_second = db._extraction_ingest_key(
+            message_id=7,
+            chat_id=11,
+            slot="link_fetch",
+            object_guess="Parsed from link: https://example.test/b",
+            why="ok",
+            raw_json={"Projects": {"Project Name": "A"}},
+        )
+
+        self.assertEqual(history_first, history_second)
+        self.assertNotEqual(link_first, link_second)
 
     def test_save_fact_warns_and_does_not_raise_without_pool(self):
         db.pool = None
@@ -132,6 +176,68 @@ class TestSilentLossWithoutPostgres(unittest.TestCase):
         asyncio.run(db.save_fact(project_recid="rec123", old_value=0, new_value="430000"))
         args = conn.executed[0][1]
         self.assertEqual(args[2], "0")
+
+
+class TestDatabaseLifecycle(unittest.IsolatedAsyncioTestCase):
+
+    async def test_create_pool_retries_after_transient_failure(self):
+        expected_pool = _FakePool(_FakeConn())
+
+        class _FakeAsyncpg:
+            def __init__(self):
+                self.calls = 0
+
+            async def create_pool(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("Postgres is still starting")
+                return expected_pool
+
+        fake_asyncpg = _FakeAsyncpg()
+        with (
+            patch.object(db, "asyncpg", fake_asyncpg),
+            patch.object(db.asyncio, "sleep", AsyncMock()),
+        ):
+            pool = await db.create_pool_with_retry(
+                "postgresql://test",
+                attempts=2,
+                retry_base_seconds=0,
+                retry_max_seconds=0,
+                connect_timeout_seconds=1,
+            )
+
+        self.assertIs(pool, expected_pool)
+        self.assertEqual(fake_asyncpg.calls, 2)
+
+    async def test_approval_releases_only_review_pending_row(self):
+        original_pool = db.pool
+        conn = _FakeExecuteConn("UPDATE 1")
+        db.pool = _FakePool(conn)
+        try:
+            approved = await db.approve_pending_extraction(42)
+        finally:
+            db.pool = original_pool
+
+        self.assertTrue(approved)
+        query, args = conn.executed[0]
+        self.assertIn("needs_human = FALSE", query)
+        self.assertIn("sync_status = 'pending'", query)
+        self.assertEqual(args, (42,))
+
+    async def test_migrations_add_durable_sync_queue_fields(self):
+        conn = _FakeExecuteConn()
+        pool = _FakePool(conn)
+
+        ready = await db.ensure_database_schema(pool)
+
+        self.assertTrue(ready)
+        sql = "\n".join(query for query, _args in conn.executed)
+        self.assertIn("sync_claim_token", sql)
+        self.assertIn("sync_lease_until", sql)
+        self.assertIn("sync_next_retry_at", sql)
+        self.assertIn("idx_extractions_sync_ready", sql)
+        self.assertIn("ingest_key", sql)
+        self.assertIn("uq_extractions_ingest_key", sql)
 
 
 if __name__ == '__main__':
