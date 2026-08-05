@@ -20,6 +20,8 @@ from app.link_fetcher import (
     fetch_notion_content,
     _notion_rich_text_to_text_and_links,
     _walk_notion_blocks,
+    _normalise_sheet_availability,
+    _sheet_payload_for_sync,
 )
 
 
@@ -799,6 +801,52 @@ class TestAllNestedNotionLinksAreVisited(unittest.TestCase):
                 self.assertIn(url, visited, f"{url} не был посещён - действует ли ещё break?")
 
         asyncio.run(run_test())
+
+
+class TestSheetAvailabilityNormalisation(unittest.TestCase):
+    """
+    Регрессия 05.08.2026 (живой тест на шахматке K-Village, 36 юнитов):
+    'Blocked' - валидная опция базы, но нормализатор её не узнавал; 'Resale'
+    в базе вообще нет, юнит всё ещё реально продаётся (владелец, кейс
+    Villa 12A), но статус тихо терялся вместо явной пометки.
+    """
+
+    def test_blocked_maps_to_the_live_select_option(self):
+        self.assertEqual(_normalise_sheet_availability('Blocked'), 'Blocked')
+        self.assertEqual(_normalise_sheet_availability('blocked'), 'Blocked')
+
+    def test_resale_maps_to_on_sale(self):
+        self.assertEqual(_normalise_sheet_availability('Resale'), 'On sale')
+
+    def test_sold_and_on_sale_still_work(self):
+        self.assertEqual(_normalise_sheet_availability('Sold'), 'Sold')
+        self.assertEqual(_normalise_sheet_availability('On sale'), 'On sale')
+
+    def test_unrecognised_status_still_returns_none(self):
+        self.assertIsNone(_normalise_sheet_availability('Held for negotiation'))
+
+    def test_resale_unit_keeps_its_origin_visible_in_gaps(self):
+        """Обновляем Availability, но не тихо - происхождение остаётся в Gaps."""
+        parsed_sheet = {
+            'project_name': 'K-Village',
+            'units': [
+                {'unit_id': '1BR Villa 12A', 'status': 'Resale',
+                 'area_sqm': 86, 'price_usd': 245000},
+            ],
+        }
+        payload, _, gaps = _sheet_payload_for_sync(parsed_sheet, 'K-Village')
+        unit = payload['Units'][0]
+        self.assertEqual(unit['Availability'], 'On sale')
+        self.assertTrue(any('resale' in g.lower() for g in gaps))
+
+    def test_blocked_unit_produces_no_gap(self):
+        parsed_sheet = {
+            'project_name': 'K-Village',
+            'units': [{'unit_id': '1BR Villa 15A', 'status': 'Blocked'}],
+        }
+        payload, _, gaps = _sheet_payload_for_sync(parsed_sheet, 'K-Village')
+        self.assertEqual(payload['Units'][0]['Availability'], 'Blocked')
+        self.assertEqual(gaps, [])
 
 
 if __name__ == '__main__':

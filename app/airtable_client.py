@@ -205,6 +205,7 @@ def get_agency_phones() -> set:
 CACHE_DEVELOPERS = []
 CACHE_PROJECTS = []
 CACHE_UNITS = []
+CACHE_UNITS_SECONDARY = []
 CACHE_INITIALIZED = False
 CACHE_LOADED_AT = 0.0
 
@@ -229,7 +230,7 @@ def cache_is_stale() -> bool:
 
 def init_cache(force: bool = False):
     """Синхронная версия для обратной совместимости (блокирующая)"""
-    global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_INITIALIZED, CACHE_LOADED_AT
+    global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_UNITS_SECONDARY, CACHE_INITIALIZED, CACHE_LOADED_AT
     if not force and not cache_is_stale():
         return
     developer_table = get_table('Developer')
@@ -244,9 +245,28 @@ def init_cache(force: bool = False):
     CACHE_PROJECTS = projects_table.all()
     CACHE_UNITS = units_table.all()
 
+    # Отдельный кэш для вторички: upsert_unit(is_secondary=True) обязан
+    # матчиться только против записей своей таблицы. Раньше матчинг шёл по
+    # CACHE_UNITS (только первичка) независимо от is_secondary — при
+    # совпадении Key апдейт вторички уходил на ID из Units, но через
+    # эндпоинт Units (Secondary), и Airtable тихо переписывал ПЕРВИЧНУЮ
+    # запись данными вторички (найдено живым тестом 05.08.2026, K-Village).
+    units_secondary_table = get_table('Units (Secondary)')
+    if units_secondary_table:
+        try:
+            CACHE_UNITS_SECONDARY = units_secondary_table.all()
+        except Exception as exc:
+            logger.warning("Could not load Units (Secondary) cache: %s", exc)
+            CACHE_UNITS_SECONDARY = []
+    else:
+        CACHE_UNITS_SECONDARY = []
+
     CACHE_INITIALIZED = True
     CACHE_LOADED_AT = time.time()
-    logger.info(f"Cache initialized: {len(CACHE_DEVELOPERS)} devs, {len(CACHE_PROJECTS)} projects, {len(CACHE_UNITS)} units.")
+    logger.info(
+        f"Cache initialized: {len(CACHE_DEVELOPERS)} devs, {len(CACHE_PROJECTS)} projects, "
+        f"{len(CACHE_UNITS)} units, {len(CACHE_UNITS_SECONDARY)} secondary units."
+    )
 
 async def init_cache_async(force: bool = False):
     """Асинхронная инициализация в отдельном потоке (не блокирует event loop)"""
@@ -1151,15 +1171,22 @@ async def mark_project_units_sold(proj_id: str):
 
 async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list, is_secondary: bool = False) -> str:
     """Создает или обновляет Unit (в первичном 'Units' или во вторичном 'Units (Secondary)')."""
-    global CACHE_UNITS
-    
+    global CACHE_UNITS, CACHE_UNITS_SECONDARY
+
     if cache_is_stale():
         await init_cache_async()
-        
+
     table_name = 'Units (Secondary)' if is_secondary else 'Units'
     table = get_table(table_name)
     if not table:
         return None
+
+    # Первичка и вторичка - РАЗНЫЕ таблицы Airtable с независимой нумерацией
+    # записей. Матчинг по Key обязан идти против кэша своей же таблицы -
+    # иначе апдейт по ID из чужой таблицы уходит на эндпоинт этой таблицы
+    # и тихо переписывает чужую запись (живой инцидент 05.08.2026, см.
+    # комментарий у CACHE_UNITS_SECONDARY).
+    unit_cache = CACHE_UNITS_SECONDARY if is_secondary else CACHE_UNITS
     
     # Нормализуем Unit type ДО генерации ключа, чтобы ключи были стабильными
     raw_unit_type = unit_data.get('Unit type')
@@ -1198,7 +1225,7 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
         else:
             key = f"{proj_slug}__{u_type}__{bed_token}"
     
-    existing = [u for u in CACHE_UNITS if u.get('fields', {}).get('Key') == key]
+    existing = [u for u in unit_cache if u.get('fields', {}).get('Key') == key]
 
     # Сохраняем все значения, кроме None и пустых строк
     fields = {k: v for k, v in unit_data.items() if v is not None and str(v).strip() != ""}
@@ -1288,13 +1315,13 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
         if not record or not record.get('id'):
             logger.error(f"Failed to update Unit {key}")
             return None
-        
-        # Обновляем кэш
-        for i, c in enumerate(CACHE_UNITS):
+
+        # Обновляем кэш (своей таблицы)
+        for i, c in enumerate(unit_cache):
             if c['id'] == rec_id:
-                CACHE_UNITS[i] = record
+                unit_cache[i] = record
                 break
-                
+
         return rec_id
     else:
         logger.info(f"Creating unit '{key}'")
@@ -1302,5 +1329,5 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
         if not record or not record.get('id'):
             logger.error(f"Failed to create Unit {key}")
             return None
-        CACHE_UNITS.append(record)
+        unit_cache.append(record)
         return record['id']

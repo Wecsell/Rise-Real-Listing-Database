@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app import listener
+from app import drive_mirror, listener
 from app.drive_mirror import mirror_project_drive_files
 from app.link_fetcher import process_generic_link
 from app.url_safety import UnsafeUrlError, validate_url_origin, validate_public_url
@@ -34,7 +34,10 @@ def test_card_whitelist_is_explicit_and_denies_by_default():
     assert listener.is_card_sender_authorized(100, allowed_user_ids="") is False
 
 
-def test_mirror_requires_an_explicit_root_folder_before_drive_access():
+def test_mirror_requires_an_explicit_root_folder_before_drive_access(monkeypatch):
+    # Isolated from the real environment: a deployment with GDRIVE_MIRROR_ROOT_ID
+    # configured must still fail closed for a caller that explicitly passes none.
+    monkeypatch.setattr(drive_mirror, "ROOT_FOLDER_ID", None)
     with patch("app.drive_mirror.get_drive_service") as get_service:
         with pytest.raises(RuntimeError, match="GDRIVE_MIRROR_ROOT_ID"):
             mirror_project_drive_files("Test project", [], root_id=None)

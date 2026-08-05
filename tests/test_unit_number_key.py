@@ -29,15 +29,20 @@ import app.airtable_client as ac
 
 
 class _FakeTable:
+    _id_counter = 0  # shared across instances, like real Airtable record IDs
+
     def __init__(self):
         self.created = []
+        self.updated = []
 
     def create(self, fields=None, **kwargs):
         payload = fields if fields is not None else kwargs.get('fields', {})
         self.created.append(payload)
-        return {'id': f'recNew{len(self.created)}', 'fields': payload}
+        _FakeTable._id_counter += 1
+        return {'id': f'recNew{_FakeTable._id_counter}', 'fields': payload}
 
     def update(self, rec_id, fields=None, **kwargs):
+        self.updated.append((rec_id, fields or {}))
         return {'id': rec_id, 'fields': fields or {}}
 
 
@@ -199,3 +204,72 @@ class TestUnitNumberProducesDistinctRecords:
 
         assert result is None
         failed_update.assert_awaited_once()
+
+
+class TestPrimaryAndSecondaryUnitsAreIsolated:
+    """
+    Живой инцидент 05.08.2026 (K-Village): upsert_unit(is_secondary=True)
+    матчил "existing" против CACHE_UNITS (только первичка) независимо от
+    is_secondary. При совпадении Key апдейт уходил на ID из Units через
+    эндпоинт Units (Secondary) - Airtable тихо переписывал ПЕРВИЧНУЮ запись
+    данными вторички вместо создания отдельной записи во вторичке.
+
+    Primary 1BR villa ($180k/64.1m2) превратилась в $245k/86m2 (вторичка) в
+    одной и той же записи rec... - потеря первичных данных застройщика.
+    """
+
+    @pytest.fixture
+    def two_tables(self, monkeypatch):
+        primary = _FakeTable()
+        secondary = _FakeTable()
+
+        def fake_get_table(name):
+            return secondary if name == 'Units (Secondary)' else primary
+
+        monkeypatch.setattr(ac, 'get_table', fake_get_table)
+        monkeypatch.setattr(ac, 'cache_is_stale', lambda: False)
+        monkeypatch.setattr(ac, 'CACHE_UNITS', [])
+        monkeypatch.setattr(ac, 'CACHE_UNITS_SECONDARY', [])
+        return primary, secondary
+
+    @pytest.mark.asyncio
+    async def test_secondary_write_creates_its_own_record_not_updates_primary(self, two_tables):
+        primary, secondary = two_tables
+
+        primary_id = await ac.upsert_unit(
+            {'Unit type': 'Villa', 'Bedrooms': 1, 'Area from (m2)': 64.1, 'Price from (USD)': 180000},
+            'recProj', 'K-Village', [], is_secondary=False,
+        )
+        secondary_id = await ac.upsert_unit(
+            {'Unit type': 'Villa', 'Bedrooms': 1, 'Area from (m2)': 86, 'Price from (USD)': 245000},
+            'recProj', 'K-Village', [], is_secondary=True,
+        )
+
+        # Разные записи в разных таблицах, не один и тот же ID.
+        assert primary_id != secondary_id
+        assert len(primary.created) == 1
+        assert len(secondary.created) == 1
+
+        # Первичные данные остаются нетронутыми - $180k/64.1m2, не $245k/86m2.
+        assert primary.created[0]['Price from(USD)'] == 180000
+        assert primary.created[0]['Area from (m\xb2)'] == 64.1
+        assert secondary.created[0]['Price from(USD)'] == 245000
+
+    @pytest.mark.asyncio
+    async def test_secondary_upsert_never_calls_update_on_the_primary_table(self, two_tables):
+        """Даже с совпадающим Key вторичка не должна апдейтить чужую таблицу."""
+        primary, secondary = two_tables
+        ac.CACHE_UNITS = [
+            {'id': 'recPrimaryExisting', 'fields': {'Key': 'k-village__villa__1br'}}
+        ]
+
+        await ac.upsert_unit(
+            {'Unit type': 'Villa', 'Bedrooms': 1, 'Area from (m2)': 86, 'Price from (USD)': 245000},
+            'recProj', 'K-Village', [], is_secondary=True,
+        )
+
+        # Вторичка создала свою запись, первичная таблица не получила ни
+        # апдейта (это и был баг), ни левого create.
+        assert len(secondary.created) == 1
+        assert len(primary.created) == 0
+        assert len(primary.updated) == 0

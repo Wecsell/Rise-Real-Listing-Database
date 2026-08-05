@@ -723,6 +723,14 @@ def _normalise_sheet_availability(value: Any) -> Optional[str]:
         return "Sold"
     if normalised in {"available", "on sale", "for sale", "sale"}:
         return "On sale"
+    if normalised == "blocked":
+        return "Blocked"
+    if normalised == "resale":
+        # Живая опция базы не различает "от застройщика" и "перепродажа
+        # инвестором" - юнит по-прежнему реально продаётся (владелец,
+        # 05.08.2026, кейс K-Village Villa 12A). Помечаем откуда взялся
+        # статус, чтобы происхождение не терялось молча.
+        return "On sale"
     return None
 
 
@@ -769,9 +777,15 @@ def _sheet_payload_for_sync(
             if value not in (None, ""):
                 unit[target_key] = value
 
-        availability = _normalise_sheet_availability(raw_unit.get("status"))
+        raw_status = raw_unit.get("status")
+        availability = _normalise_sheet_availability(raw_status)
         if availability:
             unit["Availability"] = availability
+            if str(raw_status or "").strip().lower() == "resale":
+                gaps.append(
+                    f"Sheet unit {unit_number or index}: resale from a previous buyer, "
+                    f"not a fresh developer unit"
+                )
         elif raw_unit.get("status") not in (None, ""):
             gaps.append(
                 f"Sheet unit {unit_number or index}: unrecognised availability {raw_unit.get('status')!r}"
