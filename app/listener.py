@@ -18,7 +18,7 @@ load_dotenv(override=False)
 from app.access import is_allowed
 from app.database import close_db, init_db, save_extraction, save_message
 from app.gemini_parser import parse_message
-from app.healthcheck import start_healthcheck_server
+from app.healthcheck import monitor_health_transitions, start_healthcheck_server
 from app.history_scanner import scan_chat_metadata_and_history
 from app.link_fetcher import process_generic_link
 from app.url_safety import redact_url
@@ -392,6 +392,19 @@ async def main():
         await start_healthcheck_server(
             port=_bounded_int_env("HEALTHCHECK_PORT", 8080, 65535),
             health_checker=check_system_health,
+        )
+        asyncio.create_task(
+            monitor_health_transitions(
+                check_system_health,
+                on_unhealthy=lambda details: notify_admin(
+                    client, f"Healthcheck unhealthy: {details}"
+                ),
+                on_recovered=lambda: notify_admin(client, "Healthcheck recovered"),
+                interval_seconds=_bounded_int_env(
+                    "HEALTH_MONITOR_INTERVAL_SECONDS", 60, 3600
+                ),
+            ),
+            name="listener-health-monitor",
         )
         worker_task = asyncio.create_task(parser_worker(), name="listener-parser-worker")
 

@@ -1168,24 +1168,31 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     # Генерация ключа для юнита. Канон: project__unitno__Nbr при наличии номера; иначе project__type__Nbr__views БЕЗ цены
     u_type = str(clean_unit_type or 'none').lower()
     beds = str(unit_data.get('Bedrooms', '0'))
-    unit_no = unit_data.get('Unit Number') 
-    
+    unit_no = unit_data.get('Unit Number')
+
     view_raw = unit_data.get('View', '')
     if isinstance(view_raw, list):
         view = '-'.join(str(v).lower() for v in view_raw)
     else:
         view = str(view_raw).lower()
-    
+
     proj_slug = re.sub(r'[^a-z0-9-]', '', str(proj_name).lower().replace(' ', '-'))[:15]
-    
+
+    # У студии Bedrooms по определению не заполняется, поэтому запасное
+    # значение '0' попадало в ключ как '0br' - неотличимо от юнита другого
+    # типа, у которого число спален просто не извлеклось (владелец,
+    # 05.08.2026; тот же паттерн уже приводил к браку 25.07). Только для
+    # Studio используем явный токен, а не общий 'Nbr'.
+    bed_token = 'studio' if u_type == 'studio' else f"{beds}br"
+
     if unit_no:
-        key = f"{proj_slug}__{str(unit_no).lower()}__{beds}br"
+        key = f"{proj_slug}__{str(unit_no).lower()}__{bed_token}"
     else:
         view_slug = re.sub(r'[^a-z0-9]+', '-', view).strip('-')
         if view_slug and view_slug != 'none':
-            key = f"{proj_slug}__{u_type}__{beds}br__{view_slug}"
+            key = f"{proj_slug}__{u_type}__{bed_token}__{view_slug}"
         else:
-            key = f"{proj_slug}__{u_type}__{beds}br"
+            key = f"{proj_slug}__{u_type}__{bed_token}"
     
     existing = [u for u in CACHE_UNITS if u.get('fields', {}).get('Key') == key]
 

@@ -133,6 +133,52 @@ async def handle_request(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await writer.wait_closed()
 
 
+async def monitor_health_transitions(
+    checker: HealthChecker,
+    on_unhealthy: Callable[[dict], Awaitable[None]],
+    on_recovered: Optional[Callable[[], Awaitable[None]]] = None,
+    interval_seconds: float = 60.0,
+    iterations: Optional[int] = None,
+) -> None:
+    """Poll ``checker`` and alert on state transitions, not on every poll.
+
+    Docker's own HEALTHCHECK only marks the container unhealthy internally -
+    nobody is paged unless someone happens to run ``docker ps``. This closes
+    that gap without depending on Docker: it runs its own clock, and calls
+    ``on_unhealthy``/``on_recovered`` exactly once per transition so a
+    prolonged outage doesn't spam the same alert every interval.
+
+    ``iterations`` bounds the loop for tests; production callers leave it
+    unset and let the task run until cancelled.
+    """
+    was_healthy = True
+    count = 0
+    while iterations is None or count < iterations:
+        await asyncio.sleep(interval_seconds)
+        count += 1
+        try:
+            is_healthy, details = await checker()
+        except Exception:
+            logger.exception("Health monitor: checker raised unexpectedly")
+            is_healthy, details = False, {"error": "checker raised"}
+
+        if was_healthy and not is_healthy:
+            logger.error("Health check transitioned to UNHEALTHY: %s", details)
+            try:
+                await on_unhealthy(details)
+            except Exception:
+                logger.exception("Health monitor: failed to deliver unhealthy alert")
+        elif not was_healthy and is_healthy:
+            logger.info("Health check recovered")
+            if on_recovered is not None:
+                try:
+                    await on_recovered()
+                except Exception:
+                    logger.exception("Health monitor: failed to deliver recovery alert")
+
+        was_healthy = is_healthy
+
+
 async def start_healthcheck_server(
     host: str = "0.0.0.0", port: int = 8080,
     health_checker: Optional[HealthChecker] = None,

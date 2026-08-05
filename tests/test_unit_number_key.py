@@ -128,6 +128,41 @@ class TestUnitNumberProducesDistinctRecords:
         assert 'Unit ID' not in fake_table.created[0]
 
     @pytest.mark.asyncio
+    async def test_studio_key_uses_studio_token_not_bedroom_count(self, fake_table):
+        """
+        Регрессия на вопрос владельца 05.08.2026: у Studio Bedrooms по
+        определению не заполняется, поэтому запасное значение '0' в
+        upsert_unit() уходило в ключ как '0br' - неотличимо от юнита
+        другого типа, у которого число спален просто не извлеклось.
+        """
+        await ac.upsert_unit(
+            {'Unit type': 'Studio', 'Price from (USD)': 89000},
+            'recProj', 'Gapura', [],
+        )
+        key = fake_table.created[0]['Key']
+        assert key == 'gapura__studio__studio'
+        assert '0br' not in key
+
+    @pytest.mark.asyncio
+    async def test_studio_key_with_unit_number_also_uses_studio_token(self, fake_table):
+        await ac.upsert_unit(
+            _unit('B39', 'Studio', 89000, bedrooms=None),
+            'recProj', 'Coco Hills', [],
+        )
+        key = fake_table.created[0]['Key']
+        assert key == 'coco-hills__b39__studio'
+
+    @pytest.mark.asyncio
+    async def test_non_studio_unfilled_bedrooms_still_falls_back_to_0br(self, fake_table):
+        """Поведение для остальных типов юнитов сознательно не менялось."""
+        await ac.upsert_unit(
+            {'Unit type': 'Villa', 'Price from (USD)': 537000},
+            'recProj', 'Origins', [],
+        )
+        key = fake_table.created[0]['Key']
+        assert key == 'origins__villa__0br'
+
+    @pytest.mark.asyncio
     async def test_failed_existing_unit_update_returns_no_record_id(self, fake_table):
         """A failed update must reach the sync queue as a retryable failure."""
         ac.CACHE_UNITS = [

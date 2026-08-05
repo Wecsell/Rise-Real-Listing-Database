@@ -4,8 +4,13 @@ import pytest
 import pytest_asyncio
 import urllib.request
 import urllib.error
+from unittest.mock import AsyncMock
 import app.healthcheck as healthcheck
-from app.healthcheck import start_healthcheck_server, set_health_checker
+from app.healthcheck import (
+    monitor_health_transitions,
+    set_health_checker,
+    start_healthcheck_server,
+)
 
 @pytest.fixture(autouse=True)
 def reset_checker():
@@ -139,3 +144,81 @@ async def test_healthcheck_concurrency_under_load(server):
     for status, data in results[:10]:
         assert status == 200
         assert data["status"] == "ok"
+
+
+class TestMonitorHealthTransitions:
+    """
+    Docker сам по себе только помечает контейнер unhealthy внутри себя -
+    никто не узнаёт об этом, пока не зайдёт и не посмотрит `docker ps`
+    руками. monitor_health_transitions() закрывает этот пробел: должен
+    звать on_unhealthy/on_recovered РОВНО на переходах, а не на каждом
+    опросе, иначе долгий простой заспамит один и тот же алерт.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fast_clock(self, monkeypatch):
+        monkeypatch.setattr(healthcheck.asyncio, "sleep", AsyncMock())
+
+    @pytest.mark.asyncio
+    async def test_alerts_once_on_healthy_to_unhealthy_transition(self):
+        results = [
+            (True, {}), (True, {}), (False, {"database_ping_ok": False}), (False, {}),
+        ]
+        checker = AsyncMock(side_effect=results)
+        on_unhealthy = AsyncMock()
+
+        await monitor_health_transitions(
+            checker, on_unhealthy=on_unhealthy, interval_seconds=0, iterations=len(results)
+        )
+
+        on_unhealthy.assert_awaited_once_with({"database_ping_ok": False})
+
+    @pytest.mark.asyncio
+    async def test_alerts_once_on_recovery(self):
+        results = [(True, {}), (False, {}), (False, {}), (True, {}), (True, {})]
+        checker = AsyncMock(side_effect=results)
+        on_recovered = AsyncMock()
+
+        await monitor_health_transitions(
+            checker,
+            on_unhealthy=AsyncMock(),
+            on_recovered=on_recovered,
+            interval_seconds=0,
+            iterations=len(results),
+        )
+
+        on_recovered.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_alert_while_continuously_healthy(self):
+        checker = AsyncMock(return_value=(True, {}))
+        on_unhealthy = AsyncMock()
+
+        await monitor_health_transitions(
+            checker, on_unhealthy=on_unhealthy, interval_seconds=0, iterations=5
+        )
+
+        on_unhealthy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_checker_exception_counts_as_unhealthy(self):
+        checker = AsyncMock(side_effect=[RuntimeError("boom"), (False, {})])
+        on_unhealthy = AsyncMock()
+
+        await monitor_health_transitions(
+            checker, on_unhealthy=on_unhealthy, interval_seconds=0, iterations=2
+        )
+
+        on_unhealthy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_alert_delivery_failure_does_not_crash_the_loop(self):
+        results = [(True, {}), (False, {}), (True, {})]
+        checker = AsyncMock(side_effect=results)
+        on_unhealthy = AsyncMock(side_effect=RuntimeError("Telegram API down too"))
+
+        await monitor_health_transitions(
+            checker, on_unhealthy=on_unhealthy, interval_seconds=0, iterations=len(results)
+        )
+
+        on_unhealthy.assert_awaited_once()
