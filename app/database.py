@@ -44,6 +44,22 @@ def _float_env(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Temporary MVP switch: the operator-facing review command from
+# app.database.approve_pending_extraction() does not exist yet (only a CLI
+# flag on sync_job.py does), so gating every extraction behind needs_human
+# would stall the pipeline entirely. While this is set, new extractions skip
+# the review queue and sync straight through. Unset it once a real review UI
+# ships — see the P0 chat-filter fix for why fail-closed matters here too.
+MVP_SKIP_HUMAN_REVIEW = _bool_env("MVP_SKIP_HUMAN_REVIEW", False)
+
+
 async def create_pool_with_retry(
     database_url: Optional[str] = None,
     *,
@@ -309,6 +325,12 @@ async def save_extraction(
         slot = (slot or "")[:50]
         # A missing value must never become SQL NULL and evade the review gate.
         needs_human = True if needs_human is None else bool(needs_human)
+        if MVP_SKIP_HUMAN_REVIEW and needs_human:
+            logger.info(
+                "MVP_SKIP_HUMAN_REVIEW=1: extraction [%s] for %r (project %s) skips human review.",
+                slot, object_guess, project_recid,
+            )
+            needs_human = False
         json_str = json.dumps(raw_json) if raw_json is not None else None
         ingest_key = _extraction_ingest_key(
             message_id=message_id,

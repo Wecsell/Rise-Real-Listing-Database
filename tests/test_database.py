@@ -178,6 +178,62 @@ class TestSilentLossWithoutPostgres(unittest.TestCase):
         self.assertEqual(args[2], "0")
 
 
+class TestMvpSkipHumanReview(unittest.TestCase):
+    """
+    MVP_SKIP_HUMAN_REVIEW — временный переключатель: пока в Telegram нет
+    команды подтверждения (только `python -m app.sync_job --approve ID`),
+    needs_human=True держал бы каждую находку в очереди навсегда. Флаг
+    выключен по умолчанию — эти тесты фиксируют оба состояния.
+    """
+
+    def setUp(self):
+        self._orig_pool = db.pool
+        self._orig_flag = db.MVP_SKIP_HUMAN_REVIEW
+
+    def tearDown(self):
+        db.pool = self._orig_pool
+        db.MVP_SKIP_HUMAN_REVIEW = self._orig_flag
+
+    def test_flag_off_by_default_keeps_needs_human_true(self):
+        conn = _FakeExecuteConn()
+        db.pool = _FakePool(conn)
+        db.MVP_SKIP_HUMAN_REVIEW = False
+        asyncio.run(db.save_extraction(
+            message_id=1, chat_id=1, project_recid="Mangata",
+            object_guess="Unit 1 (2 BR)", confidence=0.95, slot="unit_price",
+            url_status="parsed", why="Price: 100000$", needs_human=True,
+        ))
+        _, args = conn.executed[0]
+        self.assertTrue(args[8])
+
+    def test_flag_on_forces_needs_human_false(self):
+        conn = _FakeExecuteConn()
+        db.pool = _FakePool(conn)
+        db.MVP_SKIP_HUMAN_REVIEW = True
+        with self.assertLogs('Database', level='INFO') as log:
+            asyncio.run(db.save_extraction(
+                message_id=1, chat_id=1, project_recid="Mangata",
+                object_guess="Unit 1 (2 BR)", confidence=0.95, slot="unit_price",
+                url_status="parsed", why="Price: 100000$", needs_human=True,
+            ))
+        _, args = conn.executed[0]
+        self.assertFalse(args[8])
+        self.assertTrue(any("MVP_SKIP_HUMAN_REVIEW" in m for m in log.output))
+
+    def test_flag_on_does_not_flip_an_explicit_false(self):
+        """Already-approved rows (needs_human=False) stay untouched either way."""
+        conn = _FakeExecuteConn()
+        db.pool = _FakePool(conn)
+        db.MVP_SKIP_HUMAN_REVIEW = True
+        asyncio.run(db.save_extraction(
+            message_id=1, chat_id=1, project_recid="Mangata",
+            object_guess="Unit 1 (2 BR)", confidence=0.95, slot="unit_price",
+            url_status="parsed", why="Price: 100000$", needs_human=False,
+        ))
+        _, args = conn.executed[0]
+        self.assertFalse(args[8])
+
+
 class TestDatabaseLifecycle(unittest.IsolatedAsyncioTestCase):
 
     async def test_create_pool_retries_after_transient_failure(self):

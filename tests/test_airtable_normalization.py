@@ -206,16 +206,32 @@ class TestUnitType:
     """
     Раньше функция могла вернуть 'Hotel' и 'Hotel room', которых в селекте
     Units.Unit type нет — Airtable отвергал такую запись целиком.
+
+    monkeypatch держит тесты офлайн, тем же способом, что и TestLandZoning
+    ниже: без него sanitize_unit_type ходит в живую базу через
+    get_valid_unit_types(), и тест плывёт при любом дрейфе живой схемы
+    (например, когда 'Mini Villa' стала отдельной опцией 03.08.2026).
     """
+
+    @pytest.fixture(autouse=True)
+    def _offline_schema(self, monkeypatch):
+        import app.airtable_client as ac
+        live_unit_types = [
+            'Villa', 'Apartment', 'Loft', 'Studio', 'Townhouse', 'Penthouse',
+            'Mini Villa', '-', "Developer's stock",
+        ]
+        monkeypatch.setattr(
+            ac, 'get_select_options',
+            lambda table, field, fallback=None: live_unit_types
+        )
 
     @pytest.mark.parametrize("raw,expected", [
         ('Villa', 'Villa'),
         ('villa', 'Villa'),
         ('  Studio  ', 'Studio'),
         ('2BR villa with pool', 'Villa'),
-        # 'Mini Villa' стало отдельной живой опцией Units.Unit type (добавлена
-        # 03.08.2026 пакетной записью) — exact-match со схемой теперь
-        # приоритетнее alias-свёртки к 'Villa', см. sanitize_unit_type().
+        # 'Mini Villa' — отдельная живая опция Units.Unit type: exact-match
+        # со схемой приоритетнее alias-свёртки к 'Villa', см. sanitize_unit_type().
         ('mini villa', 'Mini Villa'),
         ('bungalow', 'Villa'),
         ('residence', 'Villa'),
