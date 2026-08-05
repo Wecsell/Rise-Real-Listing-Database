@@ -12,6 +12,11 @@ import pytest
 import app.airtable_client as ac
 from app.card_generator import format_telegram_project_post, generate_pdf_project_card
 
+pytestmark = pytest.mark.skipif(
+    not os.environ.get('AIRTABLE_TOKEN'),
+    reason="нет AIRTABLE_TOKEN — проверка живой базы пропущена (см. TestAgainstLiveBase в test_schema_check.py)",
+)
+
 
 @pytest.fixture(scope='module')
 def cache():

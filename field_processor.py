@@ -19,7 +19,8 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 logger = logging.getLogger("FieldProcessor")
 
-gemini_client = genai.Client(api_key=os.environ.get('GEMINI_API_KEY'))
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 from app.gemini_parser import SYSTEM_PROMPT, resolve_model_name
 from app.priority_parser import build_update_fields
