@@ -111,6 +111,19 @@ The active base is determined dynamically by the `AIRTABLE_BASE_ID` environment 
   once in the base UI. Clearing the box is as much interference as ticking it, so the guard strips the
   field in both directions, and `tools_manual_intake.py` rejects it in its input: a review that arrives
   in a JSON file is not a review.
+- **`Active` also blocks rewrites, since 06.08.2026 (owner's request).** Until then the checkbox was a
+  view filter with no other effect — a verified project and its units were overwritten by the next parse
+  exactly like an unverified one. Now `upsert_project`, `upsert_unit`, `mark_project_units_sold` and
+  `doc_pipeline.save_findings_to_gaps` all check the existing record's `Active` before writing and skip
+  entirely if it is set. `upsert_unit` returns the truthy sentinel `airtable_client.SKIPPED_ACTIVE`, not
+  `None`, when it skips — callers such as `field_processor.py` and `app/sync_job.py` read a falsy result
+  as a write failure, and a plain `None` made an Active project look like a broken write (Field Staging
+  retried forever every 30s; the sync queue burned its retries and landed in `failed`). Manual runs
+  (`tools_manual_intake.py`) force a cache refresh before writing, since a checkbox ticked seconds ago in
+  the UI can otherwise sit outside the ~10-minute cache TTL and the guard would silently miss it.
+  `tools_merge_duplicates.py` — the one place that writes `Active` at all, clearing it on the losing
+  side of a merge — now skips a pair entirely if either the keeper or the loser is Active, rather than
+  merging over a human's verification.
 - `Status` is **not** a review flag. It is derived entirely from `gaps` and recomputed on every run, so a
   human verdict placed there would be silently overwritten. `Verified` means only "no gaps were found" —
   a machine's claim about completeness. As of 06.08.2026 the bot had set it on 451 units and 57 projects
