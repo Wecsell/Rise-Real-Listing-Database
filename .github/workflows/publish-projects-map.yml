@@ -1,0 +1,56 @@
+name: Publish projects map
+
+# Перегенерирует projects_map.html из живой Airtable и публикует его на
+# gh-pages как index.html. Карта не геокодирует — координаты идут в маркер
+# как есть, поэтому актуальность зависит только от того, свежие ли данные
+# в Airtable, а не от того, что изменилось в коде.
+#
+# Триггеры:
+#   - push в main — на случай, если поменялся сам tools_build_projects_map.py;
+#   - расписание раз в час — потому что данные в Airtable меняются без
+#     единого коммита в этот репозиторий, а именно из-за них карта
+#     расходится с базой;
+#   - workflow_dispatch — ручной запуск из вкладки Actions.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools_build_projects_map.py'
+      - '.github/workflows/publish-projects-map.yml'
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Установить зависимости
+        run: pip install python-dotenv
+
+      - name: Собрать карту
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        run: |
+          mkdir -p _site
+          python tools_build_projects_map.py --out _site/index.html
+
+      - name: Опубликовать на gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          publish_branch: gh-pages
+          keep_files: false
+          commit_message: 'Автообновление карты проектов'
