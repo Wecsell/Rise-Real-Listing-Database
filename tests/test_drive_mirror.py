@@ -10,6 +10,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from app.drive_mirror import (
     mirror_drive_image,
     mirror_project_drive_files,
+    pick_cover_image,
     mirror_drive_folder,
     mirror_listed_drive_folder,
     mirror_external_image,
@@ -299,6 +300,66 @@ class TestSourceStructureIsPreserved(unittest.TestCase):
 
         self.assertNotIn("Legal", created_names)
 
+    @patch('app.drive_mirror.get_drive_service')
+    def test_subfolder_separates_render_sets_of_one_unit_type(self, mock_get_service):
+        """Несколько наборов рендеров у одного типа юнита не сливаются в одну папку.
+
+        Регресс K-Village (06.08.2026): в источнике 1BR разложен на три папки по
+        номерам вилл ("1-7 | 8-14 | 15-22"). Все три зеркалировались с
+        unit_type='1BR' в /K-Village/1BR/, и файлы с одинаковыми именами из
+        разных наборов отбрасывались со статусом 'exists' - 6 рендеров разных
+        вилл потерялись.
+        """
+        service = MagicMock()
+        service.files.return_value.list.side_effect = (
+            lambda q, **kw: MagicMock(**{"execute.return_value": {"files": []}})
+        )
+        created_parents = {}
+
+        def create_side_effect(body, **kwargs):
+            folder_id = f"id_{body['name']}"
+            created_parents[body["name"]] = body.get("parents", [None])[0]
+            return MagicMock(**{"execute.return_value": {"id": folder_id}})
+
+        service.files.return_value.create.side_effect = create_side_effect
+        service.files.return_value.copy.return_value = MagicMock(
+            **{"execute.return_value": {"id": "copied"}}
+        )
+        mock_get_service.return_value = service
+
+        drive_files = [{"id": "a", "name": "1.jpg", "mimeType": "image/jpeg", "path": ""}]
+        summary = mirror_project_drive_files(
+            "K-Village", drive_files, unit_type="1BR", subfolder="Villas 1-7",
+            root_id="test-root-id",
+        )
+
+        # Вложенность /K-Village/1BR/Villas 1-7/, а не сплющенная /K-Village/1BR/
+        self.assertEqual(created_parents["1BR"], "id_K-Village")
+        self.assertEqual(created_parents["Villas 1-7"], "id_1BR")
+        self.assertEqual(summary["dest_folder_id"], "id_Villas 1-7")
+
+    @patch('app.drive_mirror.get_drive_service')
+    def test_subfolder_is_optional(self, mock_get_service):
+        """Без subfolder путь остаётся прежним - старые вызовы не ломаются."""
+        service = MagicMock()
+        service.files.return_value.list.side_effect = (
+            lambda q, **kw: MagicMock(**{"execute.return_value": {"files": []}})
+        )
+        service.files.return_value.create.side_effect = (
+            lambda body, **kw: MagicMock(**{"execute.return_value": {"id": f"id_{body['name']}"}})
+        )
+        service.files.return_value.copy.return_value = MagicMock(
+            **{"execute.return_value": {"id": "copied"}}
+        )
+        mock_get_service.return_value = service
+
+        drive_files = [{"id": "a", "name": "1.jpg", "mimeType": "image/jpeg", "path": ""}]
+        summary = mirror_project_drive_files(
+            "K-Village", drive_files, unit_type="1BR", root_id="test-root-id",
+        )
+
+        self.assertEqual(summary["dest_folder_id"], "id_1BR")
+
 
 class TestMirrorDriveFolderKeepsItsOwnName(unittest.TestCase):
     """
@@ -483,3 +544,157 @@ class TestExtractMirrorAirtableFields(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCoverImagePriority(unittest.TestCase):
+    """
+    Обложка проекта: сначала общий план комплекса, иначе экстерьер
+    (правило владельца, 06.08.2026).
+
+    Ключевые слова ищутся в пути, а не в имени: у застройщиков файлы называются
+    "1.jpg"/"4.jpg", смысл несёт только имя папки.
+    """
+
+    @staticmethod
+    def _item(path, name, status="copied", file_id=None):
+        return {"status": status, "name": name, "path": path,
+                "file_id": file_id or f"id_{path}_{name}"}
+
+    def test_masterplan_beats_exterior(self):
+        results = [
+            self._item("Exterior", "1.jpg"),
+            self._item("Masterplan", "aerial.jpg"),
+        ]
+        self.assertEqual(pick_cover_image(results)["path"], "Masterplan")
+
+    def test_exterior_beats_interior(self):
+        """Регресс K-Village: обложкой становился санузел, потому что он первым
+        приходил из Drive API."""
+        results = [
+            self._item("SU_1", "enhanced_wc cam02 (2).png"),
+            self._item("Living", "2.jpg"),
+            self._item("Exterior", "4.jpg"),
+        ]
+        self.assertEqual(pick_cover_image(results)["path"], "Exterior")
+
+    def test_layout_is_last_resort(self):
+        """Планировка - линейная графика, обложкой становится только если
+        других картинок нет вообще."""
+        results = [
+            self._item("Layout", "Villa_type_7.png"),
+            self._item("Bedroom", "9.jpg"),
+        ]
+        self.assertEqual(pick_cover_image(results)["path"], "Bedroom")
+
+        only_layout = [self._item("Layout", "Villa_type_7.png")]
+        self.assertEqual(pick_cover_image(only_layout)["path"], "Layout")
+
+    def test_russian_keywords_are_recognised(self):
+        results = [
+            self._item("Спальня", "1.jpg"),
+            self._item("Экстерьер", "2.jpg"),
+        ]
+        self.assertEqual(pick_cover_image(results)["path"], "Экстерьер")
+
+    def test_document_scan_is_never_a_cover(self):
+        results = [self._item("Legal", "SLF reg.jpeg")]
+        self.assertIsNone(pick_cover_image(results))
+
+    def test_failed_copies_are_not_candidates(self):
+        results = [
+            {"status": "error", "name": "1.jpg", "path": "Masterplan", "reason": "denied"},
+            self._item("Living", "2.jpg"),
+        ]
+        self.assertEqual(pick_cover_image(results)["path"], "Living")
+
+    def test_no_candidates_returns_none(self):
+        self.assertIsNone(pick_cover_image([]))
+
+    def test_choice_is_stable_within_a_rank(self):
+        """На одних данных обложка не должна меняться от прогона к прогону."""
+        results = [
+            self._item("Exterior", "4.jpg"),
+            self._item("Exterior", "1.jpg"),
+        ]
+        first = pick_cover_image(results)["name"]
+        self.assertEqual(first, pick_cover_image(list(results))["name"])
+        self.assertEqual(first, "4.jpg", "берётся первый в исходном порядке")
+
+
+class TestDeveloperLevelInMirrorPath(unittest.TestCase):
+    """
+    Зеркало повторяет структуру базы: Developer -> Project -> Unit
+    (решение владельца, 06.08.2026). Без уровня застройщика в корне зеркала
+    лежали проекты вперемешку от всех застройщиков.
+    """
+
+    @staticmethod
+    def _service(created):
+        service = MagicMock()
+        service.files.return_value.list.side_effect = (
+            lambda q, **kw: MagicMock(**{"execute.return_value": {"files": []}})
+        )
+
+        def create_side_effect(body, **kwargs):
+            created.append((body["name"], body.get("parents", [None])[0]))
+            return MagicMock(**{"execute.return_value": {"id": f"id_{body['name']}"}})
+
+        service.files.return_value.create.side_effect = create_side_effect
+        service.files.return_value.copy.return_value = MagicMock(
+            **{"execute.return_value": {"id": "copied"}}
+        )
+        return service
+
+    @patch('app.drive_mirror.get_drive_service')
+    def test_full_chain_developer_project_unit(self, mock_get_service):
+        created = []
+        mock_get_service.return_value = self._service(created)
+
+        drive_files = [{"id": "a", "name": "1.jpg", "mimeType": "image/jpeg", "path": ""}]
+        summary = mirror_project_drive_files(
+            "K-Village", drive_files, unit_type="1BR", subfolder="Villas 1-7",
+            developer="PCE", root_id="test-root-id",
+        )
+
+        parents = dict(created)
+        self.assertEqual(parents["PCE"], "test-root-id")
+        self.assertEqual(parents["K-Village"], "id_PCE")
+        self.assertEqual(parents["1BR"], "id_K-Village")
+        self.assertEqual(parents["Villas 1-7"], "id_1BR")
+        self.assertEqual(summary["dest_folder_id"], "id_Villas 1-7")
+
+    @patch('app.drive_mirror.get_drive_service')
+    def test_without_developer_path_is_unchanged(self, mock_get_service):
+        """Старые вызовы без застройщика продолжают работать как раньше."""
+        created = []
+        mock_get_service.return_value = self._service(created)
+
+        drive_files = [{"id": "a", "name": "1.jpg", "mimeType": "image/jpeg", "path": ""}]
+        mirror_project_drive_files("K-Village", drive_files, unit_type="1BR",
+                                   root_id="test-root-id")
+
+        parents = dict(created)
+        self.assertEqual(parents["K-Village"], "test-root-id")
+        self.assertNotIn("PCE", parents)
+
+
+class TestDriveDepthLimitIsConfigurable(unittest.TestCase):
+    """
+    Регресс: жёсткий лимит глубины 5 молча обрезал листинг у застройщиков с
+    глубокой структурой (кит Y-WAY уходит на шесть уровней), из-за чего часть
+    рендеров не попадала в зеркало.
+    """
+
+    def test_default_depth_allows_six_levels(self):
+        from app.drive_folder import DEFAULT_MAX_DEPTH
+        self.assertGreaterEqual(DEFAULT_MAX_DEPTH, 6)
+
+    def test_env_override_is_bounded(self):
+        from app.drive_folder import _bounded_depth_env, _MAX_DEPTH_CEILING
+        with patch.dict(os.environ, {"GDRIVE_MAX_DEPTH": "999"}):
+            self.assertEqual(_bounded_depth_env("GDRIVE_MAX_DEPTH", 8, _MAX_DEPTH_CEILING),
+                             _MAX_DEPTH_CEILING)
+        with patch.dict(os.environ, {"GDRIVE_MAX_DEPTH": "нехорошо"}):
+            self.assertEqual(_bounded_depth_env("GDRIVE_MAX_DEPTH", 8, _MAX_DEPTH_CEILING), 8)
+        with patch.dict(os.environ, {"GDRIVE_MAX_DEPTH": "0"}):
+            self.assertEqual(_bounded_depth_env("GDRIVE_MAX_DEPTH", 8, _MAX_DEPTH_CEILING), 8)

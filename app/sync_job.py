@@ -20,7 +20,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.airtable_client import upsert_developer, upsert_project, upsert_unit
+from app.airtable_client import (CHANNEL_TG, upsert_developer, upsert_project,
+                                 upsert_unit)
 from app.database import (
     approve_pending_extraction,
     close_db,
@@ -242,6 +243,12 @@ async def _sync_payload(payload: Mapping[str, Any]) -> None:
     """Run ordered Airtable upserts and fail if any requested write did not stick."""
     _validate_payload(payload)
     gaps = list(payload.get("Gaps") or [])
+    # Чат-источник кладёт listener в тот же payload. Без него Source остаётся
+    # заглушкой, а Units."Group with agency" - пустым.
+    chat_title = payload.get("chat_title") or None
+    # Канал попадания материала. По умолчанию Telegram: это единственный
+    # работающий сейчас автоматический путь (WhatsApp ещё не реализован).
+    channel = payload.get("channel") or CHANNEL_TG
     dev_id = None
     project_id = None
 
@@ -253,7 +260,8 @@ async def _sync_payload(payload: Mapping[str, Any]) -> None:
 
     project_data = payload.get("Projects") or {}
     if project_data.get("Project Name"):
-        project_id = await upsert_project(dict(project_data), dev_id, gaps)
+        project_id = await upsert_project(dict(project_data), dev_id, gaps,
+                                          chat_title=chat_title, channel=channel)
         if not project_id:
             raise AirtableWriteError("Project upsert returned no record ID")
 
@@ -263,7 +271,8 @@ async def _sync_payload(payload: Mapping[str, Any]) -> None:
             continue
         if not project_id or not project_name:
             raise PayloadValidationError("unit cannot be linked to a project")
-        unit_id = await upsert_unit(dict(unit), project_id, project_name, gaps)
+        unit_id = await upsert_unit(dict(unit), project_id, project_name, gaps,
+                                    chat_title=chat_title, channel=channel)
         if not unit_id:
             raise AirtableWriteError("Unit upsert returned no record ID")
 

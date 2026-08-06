@@ -10,11 +10,14 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from app import content_cache
+from app import llm_gate
 
 logger = logging.getLogger("GeminiParser")
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Клиент не создаётся, пока разбор выключен (llm_gate): наличие ключа в
+# окружении не должно само по себе включать обращения к API.
+client = genai.Client(api_key=GEMINI_API_KEY) if llm_gate.llm_enabled() else None
 
 class DeveloperData(BaseModel):
     Developer: Optional[str] = None
@@ -30,7 +33,10 @@ class ProjectData(BaseModel):
     Location: Optional[str] = None
     Location_Link: Optional[str] = Field(default=None, alias="Location Link")
     Coordinates_for_Map: Optional[str] = Field(default=None, alias="Coordinates(for Map)")
-    Developer_Link: Optional[str] = Field(default=None, alias="Developer Link")
+    # Projects."Developer Link" здесь НЕ объявляется: это lookup имени
+    # застройщика через связь Developer, то есть дубль того, что и так видно в
+    # поле Developer. Пока поле было в схеме ответа, модель имела право его
+    # вернуть, а запись в lookup роняет ВЕСЬ проект с 422 (убрано 06.08.2026).
     Property_Type: Optional[List[str]] = Field(default=None, alias="Property Type")
     Total_Units: Optional[int] = Field(default=None, alias="Total Units")
     Price_From_USD: Optional[float] = Field(default=None, alias="Price From (USD)")
@@ -94,7 +100,11 @@ SYSTEM_PROMPT = """
 
 1. Developer (Застройщик):
 - Developer: Точное имя застройщика. Если в тексте прямо не указано имя девелопера, используй название чата/канала из КОНТЕКСТА.
-- Contacts: Telegram-канал, телефон или контакты отдела продаж.
+- Contacts: СПОСОБ СВЯЗИ, а не имя. Одних имён ("Тим, Герман") недостаточно — по ним нельзя написать.
+  Собирай ссылки и номера: wa.me/<цифры>, @telegram_username, телефон, email отдела продаж.
+  Номер приводи к ссылке WhatsApp через phone_formatter.format_single_phone (0813... -> 62813...).
+  Имя оставляй только рядом с контактом: "Tim: https://wa.me/6282144353695".
+  Кнопки "WhatsApp" на сайте застройщика — это ссылки wa.me, номер зашит в href, доставай оттуда.
 - Language: "English", "Ru" или "Id".
 - Country of developer: Страна происхождения девелопера (если упоминается).
 - Notes: Важные заметки или прямая транскрипция аудио от агента.
@@ -111,16 +121,22 @@ SYSTEM_PROMPT = """
   Penestanan -> "Ubud"; Sidemen -> "Karangasem".
   Если понятно только что объект на южном полуострове, но не ясен конкретный район — ставь "Bukit".
 - Location: точное название местности как в источнике (например "Berawa", "Bingin", "Pecatu"). Заполняй всегда, когда оно известно, даже если District сведен к более крупному.
-- Location Link: Ссылка на Google Maps.
 - Coordinates(for Map): СТРОГО "долгота, широта" — сначала число около 115, потом отрицательное около -8.
   Это обратный порядок относительно Google Maps: в ссылке после @ идет "широта,долгота" (сначала -8..., потом 115...),
   их надо ПОМЕНЯТЬ МЕСТАМИ. Пример: ссылка .../@-8.638668,115.106234 -> записать "115.106234, -8.638668".
   Карта Airtable читает именно такой порядок, при обратном точки встают не туда.
+  Короткая ссылка (maps.app.goo.gl/..., goo.gl/maps/..., bit.ly/...) координат НЕ содержит: из нее
+  ничего не выводи и не угадывай. Ставь поле в Gaps — координаты достанет человек или инструмент,
+  раскрыв редирект до полного вида .../@-8.638668,115.106234.
 - Location Link: ссылка на Google Maps в обычном порядке "широта,долгота" — местами НЕ менять.
 - Property Type: Массив строк. СТРОГО только эти значения: ["Villa"], ["Apartment"], ["Studio"], ["Townhouse"].
 - Price From (USD) / Price To (USD): Диапазон цен в USD (число без валютных знаков).
 - Construction stage: СТРОГО один из: "Off-plan / Pre-sales", "Foundation", "Structure", "Finishing", "Completed".
 - Distance to beach: Дистанция до пляжа в метрах (число).
+  Если в источнике только время пешком — пересчитай по средней скорости пешехода 5 км/ч
+  (83 м в минуту) и округли до сотен: "5 минут пешком"/"5 minutes walk" -> 400.
+  Пересчитывай ТОЛЬКО время пешком. Время на машине/байке ("10 минут до Чангу") в метры не переводи —
+  это про дорогу, а не про расстояние; такие фразы оставляй в Gaps.
 - View: Массив строк из: ["Ocean", "Jungle", "Rice Fields", "Garden / Courtyard", "Mountains", "Water Features", "City / Neighborhood", "No View"].
 - Property Management: Название управляющей компании или условия (например, "70/30", "Fixed ROI 10%", "Self-management").
 - Handover Date: Дата сдачи проекта СТРОГО в формате YYYY-MM-DD (например: Q1 2027 -> 2027-03-31, Q2 2027 -> 2027-06-30, Q3 2027 -> 2027-09-30, Q4 2027 / Late 2027 -> 2027-12-31, Mid 2026 -> 2026-06-30).
@@ -131,6 +147,11 @@ SYSTEM_PROMPT = """
 - Extension Term (years): Условия продления (например "25 years", "30 years fixed").
 - Renewal Right: СТРОГО один из: "Guaranteed at Market Price", "Fixed Price", "Priority at Market Price", "Prepaid".
 - Land Zoning Color: СТРОГО один из: "Residential", "Tourism/Mixed", "Brown", "Green", "Red/Commercial".
+  В документах застройщика зона называется цветом на карте RTRW, а не значением Airtable. Перевод:
+  розовый/pink, "tourist designation", "pariwisata" -> "Tourism/Mixed"; желтый/yellow, "perumahan" -> "Residential";
+  зеленый/green, "сельхоз", "green belt" -> "Green"; красный/red, "commercial" -> "Red/Commercial".
+  Цвет бери только если он назван в источнике. По престижности или туристичности района НЕ выводи:
+  "проект в туристической зоне Нуса-Дуа" — это не основание ставить "Tourism/Mixed".
   (Этот список сверяется с живой базой в app.schema_check и очищается перед записью в
   app.airtable_client.sanitize_land_zoning - если он опять устареет, запись не упадёт
   молча, но лучше держать его синхронным.)
@@ -147,9 +168,30 @@ SYSTEM_PROMPT = """
 - Bathrooms: Количество ванных комнат (число).
 - Pool: СТРОГО один из: "Yes(Private)", "Yes(Shared)", "No".
 - Availability: СТРОГО один из: "On sale", "Blocked", "Sold".
+- Stage: НЕ ЗАПОЛНЯЙ. Это lookup из Projects."Construction stage" — стадия подтягивается из проекта
+  автоматически. Попытка записи упадёт с 422, как и в любое вычисляемое поле.
+- Area: НЕ ЗАПОЛНЯЙ. Тоже lookup (район из связанного проекта), а не обычный select.
+- Freehold: СТРОГО "yes" или "not" — со строчной буквы и именно "not", а не "no".
+- Terrace/Balcony: СТРОГО "Yes" или "Not" (не "No"). У виллы с садом терраса есть — ставь "Yes".
+- Pool, Gym, Restaurant, Spa, Co-working: инфраструктура комплекса относится и к юниту.
+  "фитнес и йога-зона" -> Gym; "ресторан и лаунж" -> Restaurant; "приватный бассейн" -> Pool "Yes(Private)".
+- Цену, площадь и наличие НЕ бери из рекламного поста в чате: их источник — только шахматка
+  (см. rules.md, иерархия источников). Пост обычно описывает спецпредложение на один лот, а запись
+  в базе описывает тип юнита целиком.
 
 ОБЩИЕ ПРАВИЛА:
 - Заполняй только те поля, где есть фактические данные. Не придумывай неверные числа.
+- Поле "Active" НЕ ЗАПОЛНЯЙ никогда, ни в проекте, ни в юните. Это отметка о ручной проверке
+  человеком и признак видимости записи в интерфейсе; её ставит только человек в Airtable.
+  Значение, пришедшее от модели, всё равно будет отброшено (airtable_client.HUMAN_ONLY_FIELDS).
+- Поле "Status" тоже не заполняй: оно считается из списка пропусков автоматически.
+- Поле "Source" не заполняй: его ставит код по каналу, через который материал попал к нам
+  ("TG: <чат>", "WA: <чат>", "Manual"). Адрес самого материала (Notion, сайт застройщика) источником
+  НЕ является — ссылка на него всё равно пришла из чата или от владельца.
+- Данные соседнего проекта того же застройщика переноси, ТОЛЬКО если источник прямо это утверждает
+  ("участок и локация те же, что у Y-WAY", "due diligence общий"). Тогда переносятся поля участка:
+  Land Zoning Color, Ownership Type, Handover Permits, координаты. Сроки, цены и стадию строительства
+  не переноси никогда — они у проектов на одном участке разные.
 - Помещай имена всех пропущенных или не найденных полей в массив `Gaps` на уровне JSON.
 - Указывай итоговый коэффициент уверенности `confidence` от 0.0 до 1.0. Если данные фрагментарны или противоречивы, ставь confidence < 0.7.
 """
@@ -247,8 +289,12 @@ def _message_cache_context(
 
 async def parse_message(text: str, chat_title: str = None) -> dict:
     if not client:
-        logger.warning("GEMINI_API_KEY is not configured.")
-        return {"is_relevant": False, "reason": "No GEMINI_API_KEY set"}
+        # is_relevant=False здесь НЕ ставится: это утверждение «в сообщении нет
+        # данных», которое мы не проверяли. Разбор не выполнялся — так и пишем,
+        # иначе сообщение застройщика тихо теряется (см. app/llm_gate.py).
+        result = llm_gate.manual_required(f"parse_message({(text or '')[:40]!r})")
+        result["is_relevant"] = None
+        return result
 
     if not text or len(text.strip()) < 3:
         return {"is_relevant": False, "reason": "Message too short"}

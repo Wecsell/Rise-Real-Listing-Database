@@ -6,6 +6,7 @@ import threading
 import requests
 from pyairtable import Api
 from datetime import datetime
+from typing import Optional
 
 from app.naming import (is_placeholder_name, next_placeholder_name,
                         placeholders_never_match)
@@ -342,6 +343,190 @@ BUKIT_HINTS = ('букит', 'bukit', 'south kuta', 'badung selatan')
 # чтобы schema_check сверял их с живой базой, а не со второй копией списка.
 VALID_STAGES = {"Off-plan / Pre-sales", "Foundation", "Structure", "Finishing", "Completed"}
 VALID_POOL_VALUES = {"No", "Yes(Private)", "Yes(Shared)"}
+
+# Поля, которые заполняет ТОЛЬКО человек. Код их не пишет — ни при создании,
+# ни при обновлении записи.
+#
+# 'Active' — признак ручной проверки и ворота видимости в интерфейсе
+# (владелец, 06.08.2026). Отдельное поле нужно потому, что Status для этого не
+# годится: он производный, целиком считается из gaps, и любой следующий прогон
+# затёр бы человеческий вердикт. Отсюда же и запрет на запись: галочка, которую
+# бот может снять, ничего не гарантирует.
+#
+# Верно и обратное направление: Status='Verified' означает лишь «пропусков не
+# найдено», это утверждение машины о полноте, а не проверка человеком. На
+# 06.08.2026 бот сам проставил его 451 юниту и 57 проектам.
+HUMAN_ONLY_FIELDS = frozenset({'Active'})
+
+# Значение Source, когда источник неизвестен. Исторически этой строкой
+# подписывались ВСЕ записи независимо от группы, поэтому она осталась только
+# как честная заглушка "источник не записан", а не как описание источника.
+UNKNOWN_SOURCE = "TG: Rise Real Bali Chat"
+
+# Каналы попадания материалов в базу. Список закрытый и короткий, потому что
+# путей ровно три (владелец, 06.08.2026): либо ссылку присылает владелец, либо
+# её вытаскивает прослушка Telegram, либо - когда будет готово - WhatsApp.
+#
+# Notion, сайт застройщика, агентский кабинет каналами НЕ являются: парсер сам
+# туда не попадает, ссылка на них всегда приходит одним из трёх путей. Писать в
+# Source адрес материала - значит потерять, кто его дал. Пять записей в базе
+# подписаны так ошибочно (URL вместо канала).
+#
+# Внутри TG и WA это может быть и группа, и личный чат - в папке Telegram лежит
+# и то и то. Поэтому подпись не утверждает "группа", а называет сам чат.
+CHANNEL_TG = "TG"
+CHANNEL_WA = "WA"
+CHANNEL_MANUAL = "Manual"
+KNOWN_CHANNELS = (CHANNEL_TG, CHANNEL_WA, CHANNEL_MANUAL)
+
+
+SOURCE_SEPARATOR = " | "
+# Сколько чатов держим в Source. Связей может быть много, но поле читает
+# человек: список из десяти чатов перестаёт отвечать на вопрос "где у нас
+# контакт по этому проекту".
+MAX_SOURCE_CHATS = 3
+
+
+def _source_rank(value: Optional[str]) -> int:
+    """
+    Насколько источник ценен: 1 - живая связь с чатом, 0 - связи нет.
+
+    UNKNOWN_SOURCE считается нулём, хотя выглядит как TG-подпись: это
+    историческая заглушка "источник не записан", которой помечены ~700 записей.
+    Благодаря этому она вытесняется настоящим названием чата, а не соседствует
+    с ним. Старые значения вида URL - тоже ноль: адрес материала не говорит,
+    через кого он к нам попал.
+    """
+    text = (value or "").strip()
+    if not text or text == CHANNEL_MANUAL or text == UNKNOWN_SOURCE:
+        return 0
+    return 1 if text.split(":")[0].strip() in (CHANNEL_TG, CHANNEL_WA) else 0
+
+
+def source_move_gap(new_source: str) -> str:
+    """Человекочитаемая пометка о переезде проекта в новый чат."""
+    return (f"Проект появился в новом чате ({new_source}) — проверьте, "
+            f"не сменился ли застройщик и куда переехали продажи")
+
+
+def is_source_move(existing: Optional[str], incoming: Optional[str]) -> bool:
+    """
+    Проект всплыл в ЕЩЁ ОДНОМ чате при уже известной связи.
+
+    Обычно у проекта один чат, поэтому это не рядовое событие: продажи
+    переехали в новую группу либо застройщик перепродал проект. Молча
+    дописывать такое в Source нельзя - на запись должен посмотреть человек,
+    не сменился ли застройщик.
+
+    Повышение с "Manual" и вытеснение заглушки сюда НЕ попадают: там связи
+    раньше не было, ничего не переезжало.
+    """
+    old, new = (existing or "").strip(), (incoming or "").strip()
+    if not old or not new:
+        return False
+    if _source_rank(old) != 1 or _source_rank(new) != 1:
+        return False
+    return new not in [c.strip() for c in old.split(SOURCE_SEPARATOR)]
+
+
+def resolve_source(existing: Optional[str], incoming: Optional[str]) -> str:
+    """
+    Новое значение Source с учётом уже записанного.
+
+    Правило одностороннее (владелец, 06.08.2026): "Manual" повышается до
+    названия чата, когда проект находится в прослушке, но обратно НЕ
+    понижается. Иначе ручной импорт по уже найденному проекту затирал бы
+    связь, ради которой всё и делается: агенту нужно видеть, через какой чат
+    у нас есть контакт по этому объекту.
+
+    Разные чаты одного ранга не вытесняют друг друга, а складываются. Обычно у
+    проекта один верный чат: агентство - это мы, а в чатах сидят застройщики,
+    поэтому дублировать связи незачем. Но если проект всплыл в чате с другим
+    названием, это само по себе факт: продажи переехали в новую группу либо
+    застройщик перепродал проект. Затирать прежний чат тогда нельзя - теряется
+    история. Порядок в поле хронологический: левее - откуда пришли, правее -
+    где проект сейчас.
+    """
+    old, new = (existing or "").strip(), (incoming or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new
+
+    old_rank, new_rank = _source_rank(old), _source_rank(new)
+    if new_rank > old_rank:
+        return new
+    if new_rank < old_rank:
+        return old
+
+    # Одинаковый ранг. У связей копим список, у "Manual"/заглушки копить нечего.
+    if new_rank == 0:
+        return old
+    chats = [c.strip() for c in old.split(SOURCE_SEPARATOR) if c.strip()]
+    if new in chats:
+        return old
+    chats.append(new)
+    return SOURCE_SEPARATOR.join(chats[:MAX_SOURCE_CHATS])
+
+
+def source_label(chat_title: Optional[str] = None, channel: str = CHANNEL_TG) -> str:
+    """
+    Подпись источника в формате "канал: чат".
+
+    Manual идёт без уточнения: ссылку прислал владелец, имя человека в базе не
+    хранится (решение владельца, 06.08.2026).
+    """
+    if channel == CHANNEL_MANUAL:
+        return CHANNEL_MANUAL
+    if channel not in KNOWN_CHANNELS:
+        logger.warning("Неизвестный канал источника %r, пишу как %s", channel, CHANNEL_TG)
+        channel = CHANNEL_TG
+    title = (chat_title or "").strip()
+    return f"{channel}: {title}" if title else UNKNOWN_SOURCE
+
+
+# Типы полей Airtable, в которые физически нельзя писать. Держим здесь же, где
+# и запись: schema_check только предупреждает о таких полях, а отсеивать их
+# нужно до отправки. Список совпадает с schema_check.COMPUTED_FIELD_TYPES,
+# который его и проверяет на согласованность.
+COMPUTED_FIELD_TYPES = frozenset({
+    'formula', 'rollup', 'count', 'lookup', 'multipleLookupValues',
+    'autoNumber', 'createdTime', 'lastModifiedTime',
+    'createdBy', 'lastModifiedBy', 'button',
+})
+
+
+def strip_computed_fields(table: str, fields: dict, where: str = "") -> dict:
+    """
+    Убирает поля, которые Airtable считает вычисляемыми. Правит dict на месте.
+
+    Нужен потому, что 422 роняет ВСЮ запись, а не отбрасывает одно поле: один
+    лишний ключ - и проект с юнитами не сохраняется целиком. Полагаться на
+    статические списки тут нельзя (rules.md §3): поле становится формулой или
+    lookup в интерфейсе Airtable, без единой правки в коде. Так уже случилось
+    с 'Unit ID' (02.08.2026), с Units.'Area' и Units.'Stage', а в схеме ответа
+    модели до 06.08.2026 лежал Projects.'Developer Link' - lookup имени
+    застройщика, который модель имела право вернуть в любой момент.
+
+    Тип берём из живой схемы. Если схему прочитать не удалось, get_field_type
+    вернёт None и поле останется - предохранитель не должен молча вычищать
+    данные из-за недоступности метаданных.
+    """
+    for name in list(fields):
+        if get_field_type(table, name) in COMPUTED_FIELD_TYPES:
+            fields.pop(name)
+            logger.warning("Поле %s.%r вычисляемое — значение отброшено до записи%s",
+                           table, name, f" ({where})" if where else "")
+    return fields
+
+
+def strip_human_only_fields(fields: dict, where: str = "") -> dict:
+    """Убирает из payload поля ручной проверки. Возвращает тот же dict."""
+    for name in HUMAN_ONLY_FIELDS & fields.keys():
+        fields.pop(name)
+        logger.warning("Поле %r заполняется только вручную — значение отброшено%s",
+                       name, f" ({where})" if where else "")
+    return fields
 
 def sanitize_area(raw_area, valid_areas, is_project=False):
     if not raw_area:
@@ -937,8 +1122,16 @@ async def upsert_developer(dev_data: dict) -> str:
             return record['id']
         return None
 
-async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
-    """Создает или обновляет Project. Возвращает Record ID."""
+async def upsert_project(proj_data: dict, dev_id: str, gaps: list,
+                         chat_title: Optional[str] = None,
+                         channel: str = CHANNEL_TG) -> str:
+    """
+    Создает или обновляет Project. Возвращает Record ID.
+
+    chat_title - название чата-источника. Раньше Source был константой
+    "TG: Rise Real Bali Chat" на КАЖДОЙ записи, поэтому ни один проект не знал,
+    из какой группы пришёл, и восстановить это задним числом уже нельзя.
+    """
     global CACHE_PROJECTS
     
     if cache_is_stale():
@@ -1071,13 +1264,28 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
         except (ValueError, TypeError):
             pass
 
+    strip_human_only_fields(fields, f"project {proj_name!r}")
+
+    # Source не перезаписываем слепо: связь с чатом ценнее ручного импорта.
+    old_source = (match or {}).get('fields', {}).get('Source')
+    new_source = source_label(chat_title, channel)
+    # Переезд в новый чат уходит в gaps, а не в Status напрямую: Status здесь
+    # производный от gaps и на следующем прогоне пересчитался бы, затерев
+    # пометку. Заодно человек видит причину, а не просто "Needs data".
+    if is_source_move(old_source, new_source):
+        gaps = list(gaps or []) + [source_move_gap(new_source)]
+        logger.warning("Проект %r появился в новом чате %s — нужна проверка застройщика",
+                       proj_name, new_source)
     fields['Status'] = "Needs data" if gaps else "Verified"
-    fields['Source'] = "TG: Rise Real Bali Chat"
+    fields['Source'] = resolve_source(old_source, new_source)
     fields['Last updated'] = datetime.now().isoformat()
     if gaps:
         fields['Gaps'] = ", ".join(gaps)
     else:
         fields['Gaps'] = "" # Очищаем gaps если их нет
+
+    # Последним, вплотную к записи: см. тот же комментарий в upsert_unit.
+    strip_computed_fields('Projects', fields, f"project {proj_name!r}")
 
     if match:
         rec_id = match['id']
@@ -1169,7 +1377,9 @@ async def mark_project_units_sold(proj_id: str):
 
             await robust_airtable_op_async(table_secondary.create, fields=sec_fields)
 
-async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list, is_secondary: bool = False) -> str:
+async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
+                      is_secondary: bool = False, chat_title: Optional[str] = None,
+                      channel: str = CHANNEL_TG) -> str:
     """Создает или обновляет Unit (в первичном 'Units' или во вторичном 'Units (Secondary)')."""
     global CACHE_UNITS, CACHE_UNITS_SECONDARY
 
@@ -1300,13 +1510,30 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
             fields[f] = safe_float(fields[f])
 
     fields['Key'] = key
+    strip_human_only_fields(fields, f"unit {key}")
+    # 'Group with agency' здесь НЕ заполняется: с 06.08.2026 это lookup на
+    # Source, то есть группа подтягивается сама. Достаточно правильного Source.
+    old_source = existing[0]['fields'].get('Source') if existing else None
+    new_source = source_label(chat_title, channel)
+    if is_source_move(old_source, new_source):
+        gaps = list(gaps or []) + [source_move_gap(new_source)]
+        logger.warning("Юнит %r появился в новом чате %s — нужна проверка застройщика",
+                       key, new_source)
     fields['Status'] = "Needs data" if gaps else "Verified"
-    fields['Source'] = "TG: Rise Real Bali Chat"
+    fields['Source'] = resolve_source(
+        existing[0]['fields'].get('Source') if existing else None,
+        source_label(chat_title, channel),
+    )
     fields['Last updated'] = datetime.now().isoformat()
     if gaps:
         fields['Gaps'] = ", ".join(gaps)
     else:
         fields['Gaps'] = ""
+
+    # Предохранитель стоит последним, вплотную к записи: любое поле, добавленное
+    # в payload выше, тоже должно через него пройти. Когда он стоял раньше по
+    # тексту, запись 'Group with agency' проскакивала мимо и роняла юнит с 422.
+    strip_computed_fields(table_name, fields, f"unit {key}")
 
     if existing:
         rec_id = existing[0]['id']

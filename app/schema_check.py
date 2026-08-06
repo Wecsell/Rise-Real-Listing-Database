@@ -36,9 +36,14 @@ from app.airtable_client import (
     get_field_type,
     get_select_options,
 )
+from app.airtable_client import HUMAN_ONLY_FIELDS
 from app.priority_parser import AIRTABLE_PRIORITY
 
 logger = logging.getLogger("SchemaCheck")
+
+# Таблицы, где заведён флаг ручной проверки. Developer в список не входит:
+# проверяются и показываются проекты и юниты, а не застройщик.
+HUMAN_ONLY_TABLES = ('Projects', 'Units', 'Units (Secondary)')
 
 # Поля, в которые код действительно пишет. Если поля нет в базе, Airtable
 # отвергает весь апдейт записи с 422, а не игнорирует одно поле.
@@ -50,10 +55,14 @@ REQUIRED_FIELDS = {
         'Handover Date', 'Ownership Type', 'Land Zoning Color',
         'Handover Permits', 'Link to Developer’s Kit (Rus)',
         'Link to Developer’s Kit (Eng)', 'Availability Chart', 'Developer',
-        'Img', 'Renders', 'Source', 'Status', 'Gaps', 'Last updated', 'Active',
+        'Img', 'Renders', 'Source', 'Status', 'Gaps', 'Last updated',
     ],
     'Units': [
-        'Project Name', 'Unit type', 'Area', 'Area from (m²)',
+        # 'Area' сюда не входит: в живой базе это lookup района из связанного
+        # проекта, и airtable_client.strip_computed_fields снимает его с payload
+        # до отправки. Пока поле стояло в списке, проверка честно ругалась, что
+        # код пишет в lookup (06.08.2026).
+        'Project Name', 'Unit type', 'Area from (m²)',
         'Land Area (m²)', 'Price from(USD)', 'Bedrooms', 'Bathrooms',
         'Pool', 'Availability', 'Key', 'Img', 'Source', 'Status',
         'Gaps', 'Last updated',
@@ -149,6 +158,23 @@ def check_schema_drift() -> List[str]:
                 problems.append(
                     f"[ошибка схемы: read-only поле] {table}.{name!r} является формулой/read-only. "
                     f"Попытка записи вызовет падение 422."
+                )
+
+    # 2c. Поля ручной проверки: код в них не пишет, поэтому 422 они не вызовут,
+    #     но существовать обязаны — на 'Active' держится фильтр видимости во
+    #     view. Если поле пропадёт из таблицы, фильтр начнёт скрывать всё или
+    #     показывать всё, и заметить это по логам будет нельзя.
+    for table in HUMAN_ONLY_TABLES:
+        for name in HUMAN_ONLY_FIELDS:
+            if not field_exists(table, name):
+                problems.append(
+                    f"[поле ручной проверки отсутствует] {table}.{name!r} — на нём держится "
+                    f"видимость записей в интерфейсе"
+                )
+            if name in REQUIRED_FIELDS.get(table, []):
+                problems.append(
+                    f"[ошибка схемы: поле ручной проверки] {table}.{name!r} попало в список полей "
+                    f"записи — код не должен его писать (см. airtable_client.HUMAN_ONLY_FIELDS)"
                 )
 
     # 3. Проверка соответствия значений селектов

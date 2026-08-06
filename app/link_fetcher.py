@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 from app import content_cache
+from app import llm_gate
 from app.url_safety import (
     GOOGLE_HOST_PATTERNS,
     NOTION_HOST_PATTERNS,
@@ -31,7 +32,8 @@ from app.doc_parser import parse_pdf_document
 
 logger = logging.getLogger("LinkFetcher")
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Через llm_gate, а не по наличию ключа: см. app/llm_gate.py.
+client = genai.Client(api_key=GEMINI_API_KEY) if llm_gate.llm_enabled() else None
 
 
 def _bounded_int_env(name: str, default: int, maximum: int) -> int:

@@ -337,6 +337,11 @@ async def main():
                 message_id, chat_id, chat_title, text = await parse_queue.get()
                 try:
                     parsed_data = await parse_message(text, chat_title=chat_title)
+                    # Чат-источник кладём в payload, а не только в промпт: без
+                    # этого запись не знает, откуда пришла, и Units."Group with
+                    # agency" заполнить нечем (см. sync_job._sync_payload).
+                    if isinstance(parsed_data, dict) and chat_title:
+                        parsed_data["chat_title"] = chat_title
                     if parsed_data.get("is_relevant"):
                         projects = parsed_data.get("Projects", {}) or {}
                         project_name = projects.get("Project Name") or "UNKNOWN"
