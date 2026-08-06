@@ -32,6 +32,8 @@ schema.json
 notes_export.txt
 project_mapping.json
 out_repr.txt
+suspicious_devs.json
+underfilled_v2.json
 
 # Отчеты покрытия
 .coverage
