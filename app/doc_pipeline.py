@@ -533,6 +533,15 @@ async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> boo
             return False
         record = table.get(project_id)
         fields_dict = record.get("fields", {}) or {}
+
+        # Active — ручная пометка «проверено человеком» (владелец, 06.08.2026):
+        # пока она стоит, карточку не трогает ни upsert_project/upsert_unit,
+        # ни этот путь. Без проверки здесь бот безусловно переписывал бы
+        # Gaps — то самое поле, где живёт список вопросов застройщику.
+        if fields_dict.get("Active"):
+            logger.info(f"Карточка {project_id} отмечена Active — Gaps/Renders/Img не обновлены")
+            return False
+
         current_gaps = fields_dict.get("Gaps")
         merged_gaps = merge_into_gaps(current_gaps, format_findings_block(summary))
 

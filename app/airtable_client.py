@@ -358,6 +358,26 @@ VALID_POOL_VALUES = {"No", "Yes(Private)", "Yes(Shared)"}
 # 06.08.2026 бот сам проставил его 451 юниту и 57 проектам.
 HUMAN_ONLY_FIELDS = frozenset({'Active'})
 
+# Возвращается вместо record id, когда запись пропущена ОСОЗНАННО (проект
+# отмечен Active) — в отличие от None, который означает сбой записи.
+# Значение ИСТИННОЕ: все вызывающие сейчас проверяют результат только как
+# `if not unit_id: <считать сбоем>` и не используют его как ссылку на запись
+# (field_processor.py, app/sync_job.py, tools_manual_intake.py) — с обычным
+# None это превращало Active-проект в "сбой записи": в field_processor
+# карточка Field Staging навсегда оставалась непривязанной и переобрабатывалась
+# каждые 30 секунд, в sync_job сжигала все ретраи и уходила в failed.
+class _Skipped(str):
+    def __bool__(self):
+        return True
+
+SKIPPED_ACTIVE = _Skipped('skipped: project is Active')
+
+
+def is_project_active(proj_id: str) -> bool:
+    """Для отчётов вызывающего кода: стоит ли Active у проекта с этим id в кэше."""
+    record = next((p for p in CACHE_PROJECTS if p['id'] == proj_id), None)
+    return bool(record and record.get('fields', {}).get('Active'))
+
 # Значение Source, когда источник неизвестен. Исторически этой строкой
 # подписывались ВСЕ записи независимо от группы, поэтому она осталась только
 # как честная заглушка "источник не записан", а не как описание источника.
@@ -722,14 +742,33 @@ def safe_float(val):
     except (ValueError, TypeError):
         return val
 
+# Поля, которые разрешено ОЧИЩАТЬ явной пустой строкой.
+#
+# Обычную пустоту обёртка вырезает: разбор с полупустым результатом не должен
+# затирать уже накопленные данные. Но Gaps живёт по обратному правилу —
+# upsert_project и upsert_unit специально ставят его в "", когда пропусков не
+# осталось, и эта запись обязана дойти. Пока Gaps резался наравне со всеми,
+# очистить его было нельзя ни при каких данных: заполнив последний пробел,
+# карточка получала Status='Verified' и продолжала показывать старый список
+# вопросов, который по регламенту уходит застройщику.
+#
+# None по-прежнему режется у всех: это «нечего сказать», а не «очистить».
+CLEARABLE_FIELDS = frozenset({'Gaps'})
+
+
+def _drop_empty(fields: dict) -> dict:
+    return {k: v for k, v in fields.items()
+            if v is not None and (str(v).strip() != "" or k in CLEARABLE_FIELDS)}
+
+
 def robust_airtable_op(func, *args, fields=None, **kwargs):
     """Синхронная обертка для безопасного выполнения с детальной диагностикой ошибок"""
     try:
         if 'fields' in kwargs:
-            kwargs['fields'] = {k: v for k, v in kwargs['fields'].items() if v is not None and str(v).strip() != ""}
+            kwargs['fields'] = _drop_empty(kwargs['fields'])
         elif fields:
-            kwargs['fields'] = {k: v for k, v in fields.items() if v is not None and str(v).strip() != ""}
-        
+            kwargs['fields'] = _drop_empty(fields)
+
         return func(*args, **kwargs)
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else None
@@ -1224,6 +1263,16 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list,
     existing = CACHE_PROJECTS
     match, score = fuzzy_match_project(proj_name, existing, area=fields.get('District'), dev_id=dev_id)
 
+    # 'Active' — ручная пометка «проверено человеком», и по просьбе владельца
+    # (06.08.2026) она теперь означает именно защиту: пока галочка стоит, ни
+    # проект, ни его юниты не перезаписываются следующим прогоном. Раньше
+    # HUMAN_ONLY_FIELDS запрещал коду только САМ писать эту галочку — запись
+    # проекта проверку не читала вообще, и Active была витриной без функции.
+    if match and match.get('fields', {}).get('Active'):
+        logger.info("Проект %r отмечен Active — обновление и юниты пропущены (ID: %s)",
+                    proj_name, match['id'])
+        return match['id']
+
     # Map field names from JSON schema to Airtable schema
     if 'Link to Dev Kit (Rus)' in fields:
         fields["Link to Developer’s Kit (Rus)"] = fields.pop('Link to Dev Kit (Rus)')
@@ -1354,6 +1403,11 @@ async def mark_project_units_sold(proj_id: str):
         return
     if cache_is_stale():
         await init_cache_async()
+
+    if is_project_active(proj_id):
+        logger.info("Проект %r отмечен Active — юниты не помечены Sold", proj_id)
+        return
+
     table_primary = get_table('Units')
     table_secondary = get_table('Units (Secondary)')
     if not table_primary or not table_secondary:
@@ -1390,6 +1444,16 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     table = get_table(table_name)
     if not table:
         return None
+
+    # Юнит наследует защиту проекта: если проект отмечен Active человеком,
+    # его юниты тоже не перезаписываются, независимо от того, кто вызывает
+    # upsert_unit (ручной ввод или, в будущем, автоматический разбор). Ищем
+    # проект по id, а не по имени — оно уже разрешено вызывающим кодом.
+    project_record = next((p for p in CACHE_PROJECTS if p['id'] == proj_id), None)
+    if project_record and project_record.get('fields', {}).get('Active'):
+        logger.info("Проект %r отмечен Active — юнит %r пропущен",
+                    proj_name, unit_data.get('Unit type'))
+        return SKIPPED_ACTIVE
 
     # Первичка и вторичка - РАЗНЫЕ таблицы Airtable с независимой нумерацией
     # записей. Матчинг по Key обязан идти против кэша своей же таблицы -

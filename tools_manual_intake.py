@@ -97,6 +97,28 @@ def validate_payload(payload: dict) -> list:
     return errors
 
 
+def _merged_with_existing(fields: dict, dev_id: str = None) -> dict:
+    """
+    Поля будущей записи поверх уже существующих в Airtable.
+
+    Пропуски считаются ПО ЗАПИСИ, а не по присланному файлу (rules.md, Step 4).
+    Разница видна на частичном дозаполнении: у Rise Villas кит и шахматка в
+    базе стояли, но в payload их не было — и Gaps уехали бы к застройщику
+    вопросом о том, что он уже прислал.
+
+    Существующей записи может не быть (новый проект) — тогда вернётся то же,
+    что пришло.
+    """
+    existing = airtable_client.fuzzy_match_project(
+        fields.get('Project Name'), airtable_client.CACHE_PROJECTS,
+        fields.get('District'), dev_id,
+    )
+    match = existing[0] if isinstance(existing, tuple) else existing
+    if not match:
+        return fields
+    return {**match.get('fields', {}), **fields}
+
+
 async def run(payload: dict, apply: bool) -> int:
     if llm_gate.backend() != llm_gate.BACKEND_OFF:
         logger.info("LLM_BACKEND=%s — автоматический разбор включён, ручной ввод всё равно допустим",
@@ -109,7 +131,11 @@ async def run(payload: dict, apply: bool) -> int:
             print(f"  - {e}")
         return 1
 
-    await airtable_client.init_cache_async()
+    # force=True: обычный TTL кэша — до 10 минут, а Active могли поставить в
+    # интерфейсе только что, прямо перед этим запуском. Устаревший кэш без
+    # свежей галочки — тихий провал самой защиты Active, а не мелочь: ручной
+    # прогон разовый, лишний запрос к Airtable здесь ничего не стоит.
+    await airtable_client.init_cache_async(force=True)
 
     source = payload["source"]
     dev_data = dict(payload.get("developer") or {})
@@ -121,7 +147,7 @@ async def run(payload: dict, apply: bool) -> int:
     if not apply:
         for proj in projects:
             fields = {k: v for k, v in proj.items() if k not in ('units', 'secondary_units')}
-            missing = gaps.project_gaps(fields)
+            missing = gaps.project_gaps(_merged_with_existing(fields))
             print(f"  {proj['Project Name']}")
             print(f"    полей к записи: {len(fields)}")
             print(f"    юнитов: {len(proj.get('units') or [])} первичных, "
@@ -137,23 +163,38 @@ async def run(payload: dict, apply: bool) -> int:
 
     for proj in projects:
         fields = {k: v for k, v in proj.items() if k not in ('units', 'secondary_units')}
-        project_gaps = gaps.project_gaps(fields)
+        project_gaps = gaps.project_gaps(_merged_with_existing(fields, dev_id))
         proj_id = await airtable_client.upsert_project(fields, dev_id, project_gaps)
         print(f"  Project {fields['Project Name']!r} -> {proj_id}")
-        if project_gaps:
+        if proj_id and airtable_client.is_project_active(proj_id):
+            print("    Active — обновление проекта пропущено, поля из файла не записаны")
+        elif project_gaps:
             print(f"    Gaps: {project_gaps}")
 
         # Вторичка пишется ПОСЛЕ первички и в свою таблицу: перепутанный порядок
         # уже приводил к тому, что вторичные записи перетирали первичные.
+        written = skipped = 0
         for unit in (proj.get('units') or []):
-            await airtable_client.upsert_unit(unit, proj_id, fields['Project Name'],
-                                              gaps.unit_gaps(unit), is_secondary=False)
+            r = await airtable_client.upsert_unit(unit, proj_id, fields['Project Name'],
+                                                  gaps.unit_gaps(unit), is_secondary=False)
+            if r is airtable_client.SKIPPED_ACTIVE:
+                skipped += 1
+            elif r:
+                written += 1
         for unit in (proj.get('secondary_units') or []):
-            await airtable_client.upsert_unit(unit, proj_id, fields['Project Name'],
-                                              gaps.unit_gaps(unit), is_secondary=True)
-        total = len(proj.get('units') or []) + len(proj.get('secondary_units') or [])
-        if total:
-            print(f"    юнитов записано: {total}")
+            r = await airtable_client.upsert_unit(unit, proj_id, fields['Project Name'],
+                                                  gaps.unit_gaps(unit), is_secondary=True)
+            if r is airtable_client.SKIPPED_ACTIVE:
+                skipped += 1
+            elif r:
+                written += 1
+        # Печатаем то, что реально произошло, а не длину входного списка —
+        # иначе Active-проект получает лживый отчёт "записано N", записав 0
+        # (владелец поставил галочку, следующий прогон не должен об этом врать).
+        if written:
+            print(f"    юнитов записано: {written}")
+        if skipped:
+            print(f"    юнитов пропущено (проект Active): {skipped}")
 
     return 0
 

@@ -77,6 +77,35 @@ class TestProjectGaps:
         assert len(gaps) >= 8
 
 
+class TestAirtableFieldNames:
+    """
+    Пропуски считаются по записи, ПРОЧИТАННОЙ ИЗ AIRTABLE, а там у двух полей
+    имена другие, чем в контракте парсера: airtable_client переименовывает
+    'Link to Dev Kit (Rus)' -> 'Link to Developer’s Kit (Rus)' и
+    'Area from (m2)' -> 'Area from (m²)' при записи.
+
+    Пока gaps знал только имена парсера, эти два пропуска не закрывались
+    ничем: каждый проект вечно требовал презентацию, каждый юнит — площадь,
+    и оба уезжали в список вопросов застройщику как выдуманные.
+    """
+
+    def test_kit_link_under_airtable_name_closes_gap(self):
+        gaps = project_gaps({'Link to Developer’s Kit (Rus)': 'https://example.com/kit.pdf'})
+        assert 'презентация проекта' not in gaps
+
+    def test_kit_link_under_parser_name_still_closes_gap(self):
+        gaps = project_gaps({'Link to Dev Kit (Rus)': 'https://example.com/kit.pdf'})
+        assert 'презентация проекта' not in gaps
+
+    def test_area_under_airtable_name_closes_gap(self):
+        gaps = unit_gaps({'Area from (m²)': 153.5})
+        assert 'площадь' not in gaps
+
+    def test_area_under_parser_name_still_closes_gap(self):
+        gaps = unit_gaps({'Area from (m2)': 153.5})
+        assert 'площадь' not in gaps
+
+
 class TestConditionalLeaseTerm:
     """Срок аренды осмысленно спрашивать только у leasehold."""
 
