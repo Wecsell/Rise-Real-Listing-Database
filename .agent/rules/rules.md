@@ -30,8 +30,24 @@ The active base is determined dynamically by the `AIRTABLE_BASE_ID` environment 
 - Never modify formula fields (`Unit ID`, `Price per m²`).
 - Image URL format: `https://drive.google.com/thumbnail?id={FILE_ID}&sz=w2000`.
 - All column names and select values are in **English**.
-- Units are tracked **by type** ("Studio with pool", "Villa Sunrise 1BR"), not per physical unit.
-  Availability is `On sale` / `Sold` for the whole type.
+- 🚨 **`Units` holds TYPOLOGY, never the individual lots.** This is the single most repeated
+  mistake in this base (owner, 07.08.2026 — restated after it kept happening). A chessboard with
+  32 one-bedroom apartments of the same layout is **ONE** record, not 32. Group the developer's
+  lot list by typology first, write one row per typology. Availability is `On sale` / `Sold` for
+  the whole type; per-lot numbers, floors and statuses do **not** belong here.
+  - Two genuinely different products that collide on the same type+bedrooms (Kuara's 1BR
+    "Garden Villa" 65 m² vs 1BR "River House" 123 m²) are separated by passing the product name
+    in `Unit Number` — it lands in `Unit ID` and makes the `Key` unique. That is the ONLY reason
+    to create a second row for the same bedroom count.
+  - `Total Units` on the **project** is where the physical count goes (16 villas, 274 suites).
+  - **Enforced at write time, not just cleanup.** `tools_manual_intake.validate_payload()` calls
+    `airtable_client.find_typology_violations()` — a payload where several `units` entries share
+    type+bedrooms+price+area and differ only by a lot-code `Unit Number` (`a4`, `alt220`, `unit 12`)
+    is rejected outright with an actionable message. A payload where the differing token is a real
+    product name (`Topaz` vs `Jade-Pool-1st-floor`) passes untouched — same heuristic used to
+    unwind the 250-record cleanup on 07.08.2026 (see `unit-dedup-check-key-token-not-just-price`
+    in memory). If this check ever fires, don't work around it — collapse the payload to one row
+    per typology before retrying.
 - `Units.Stage` and `Units.Area` are **lookups** from the linked project, not editable selects. Writing
   to either fails the whole record with 422. Stage follows `Projects.Construction stage` by itself.
 - Complex-wide amenities belong on the unit too — a buyer of one villa gets the shared gym. "фитнес и

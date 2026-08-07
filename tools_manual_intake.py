@@ -94,6 +94,16 @@ def validate_payload(payload: dict) -> list:
             if key not in known and not airtable_client.field_exists('Projects', key):
                 errors.append(f"{name}: поля {key!r} нет в таблице Projects")
 
+    # Units — это типология, не физические лоты (rules.md, §Airtable canon).
+    # 07.08.2026 так набралось 250+ лишних записей одной и той же типологии
+    # (COCO Hills — 49 штук на один тип). Ловим на входе, а не чистим потом.
+    for proj in projects:
+        name = proj.get("Project Name", "?")
+        for scope_name, scope in (("units", proj.get("units")),
+                                  ("secondary_units", proj.get("secondary_units"))):
+            for msg in airtable_client.find_typology_violations(scope or []):
+                errors.append(f"{name} ({scope_name}): {msg}")
+
     return errors
 
 

@@ -1431,6 +1431,66 @@ async def mark_project_units_sold(proj_id: str):
 
             await robust_airtable_op_async(table_secondary.create, fields=sec_fields)
 
+_LOT_CODE_WORDS = {'unit', 'row', 'lot', 'block', 'villa', 'floor', 'nbr', 'apt', 'no'}
+
+
+def looks_like_lot_code(unit_no) -> bool:
+    """'Unit Number' — номер физического лота (a4, alt220, unit 12, row a 3),
+    а не название отдельного продукта (topaz, jade-pool-1st-floor)?
+
+    Эвристика: после вычитания цифр и служебных слов (unit/row/block/villa/
+    floor...) от каждого слова остаётся не больше 3 букв. Настоящее имя
+    продукта всегда оставляет более длинное слово ('topaz', 'signature').
+    Используется на записи (find_typology_violations, ниже) и при уборке
+    задним числом (см. память unit-dedup-check-key-token-not-just-price) —
+    одна и та же проверка, чтобы поведение не расходилось.
+    """
+    words = re.findall(r'[a-z]+', str(unit_no or '').lower())
+    return all(w in _LOT_CODE_WORDS or len(w) <= 3 for w in words)
+
+
+def find_typology_violations(units: list) -> list:
+    """Прогон payload'а ПЕРЕД записью: не пытается ли он завести один и тот
+    же тип юнита несколько раз под видом разных физических лотов.
+
+    07.08.2026 обнаружено постфактум: в Units скопилось 250+ таких дублей
+    (COCO Hills — 49 записей на одну типологию, AZORIA — 45). Канон таблицы —
+    типология, не лот (см. .agent/rules/rules.md, «Units holds TYPOLOGY»).
+    Эта проверка ловит саму ошибку на входе, а не чистит её потом.
+
+    Возвращает читаемые сообщения об ошибке, по одному на найденную группу
+    дублей; пустой список — писать можно.
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for u in units or []:
+        if not isinstance(u, dict):
+            continue
+        sig = (
+            sanitize_unit_type(u.get('Unit type')),
+            u.get('Bedrooms'),
+            u.get('Price from(USD)'),
+            u.get('Area from (m²)'),
+        )
+        groups[sig].append(u)
+
+    errors = []
+    for sig, group in groups.items():
+        if len(group) < 2:
+            continue
+        unit_nos = [g.get('Unit Number') for g in group]
+        if all(looks_like_lot_code(n) for n in unit_nos):
+            utype, beds, price, area = sig
+            errors.append(
+                f"{len(group)} записей одного типа ({utype}, {beds} спален, цена {price}) "
+                f"различаются только номером лота ({unit_nos[:5]}...) — это одна типология, "
+                f"не {len(group)}. Оставь ОДНУ запись (можно без 'Unit Number'), "
+                f"а число физических юнитов укажи в Projects.Total Units."
+            )
+    return errors
+
+
 async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
                       is_secondary: bool = False, chat_title: Optional[str] = None,
                       channel: str = CHANNEL_TG) -> str:
