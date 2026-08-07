@@ -19,8 +19,14 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 logger = logging.getLogger("FieldProcessor")
 
+from app import llm_gate
+
+# Клиент создаётся только через общий рубильник, как в gemini_parser. Раньше
+# здесь стояла проверка на один лишь GEMINI_API_KEY — из-за неё LLM_BACKEND=off
+# на этот процесс не действовал, а при пустом ключе каждая находка помечалась
+# Status='Error' вместо честного "разбор не выполнялся" (найдено 07.08.2026).
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if llm_gate.llm_enabled() else None
 
 from app.gemini_parser import SYSTEM_PROMPT, resolve_model_name
 from app.priority_parser import build_update_fields
@@ -234,6 +240,15 @@ async def promote_confirmed_findings():
 
 
 async def parse_new_findings():
+    # Разбор выключен рубильником — находки ОСТАЮТСЯ в статусе 'New' и ждут
+    # включения. Прежний код доходил до gemini_client=None, падал на upload и
+    # ставил Status='Error': находка выглядела бракованной, хотя её просто
+    # никто не смотрел, и после включения модели она бы уже не подхватилась
+    # фильтром {Status}='New'.
+    if gemini_client is None:
+        llm_gate.note_manual_mode("parse_new_findings (Field Staging)")
+        return
+
     logger.info("Проверяем новые записи в Field Staging...")
     # Берем все записи со Status = New
     # Формула — первичный фильтр, needs_parsing — страховка на случай, если

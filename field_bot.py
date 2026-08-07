@@ -12,6 +12,7 @@ if sys.platform == 'win32':
         except Exception:
             pass
 
+import asyncio
 import time
 import logging
 from dotenv import load_dotenv
@@ -166,7 +167,10 @@ async def save_finding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions[chat_id] = {'photos': [], 'audios': [], 'location': None}
         await update.message.reply_text("🎉 Успешно сохранено в Field Staging! Можно ехать к следующему билборду.", reply_markup=KEYBOARD)
     except Exception as e:
-        logger.error(f"Ошибка Airtable: {e}")
+        # exc_info обязателен: без трейсбека сообщение "Ошибка Airtable" врёт про
+        # источник сбоя. Так отсутствие `import asyncio` полгода выглядело отказом
+        # Airtable, хотя запрос до сети не доходил вообще (найдено 07.08.2026).
+        logger.error("Не удалось сохранить находку в Field Staging: %s", e, exc_info=True)
         await update.message.reply_text(f"❌ Ошибка при сохранении в Airtable: {e}", reply_markup=KEYBOARD)
 
 async def handle_gpx(update: Update, context: ContextTypes.DEFAULT_TYPE):
