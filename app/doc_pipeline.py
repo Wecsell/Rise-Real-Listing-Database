@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from typing import Any, Dict, List, Optional, Set
 
@@ -55,6 +56,7 @@ async def fill_fields_from_drive_files(
     project_fields: Optional[Dict[str, Any]],
     drive_files: List[Dict[str, Any]],
     budget: int = DEFAULT_OPEN_BUDGET,
+    exclude_fields: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
     Главная точка связки: что удалось предложить по пустым полям карточки.
@@ -64,9 +66,14 @@ async def fill_fields_from_drive_files(
       gaps      - человекочитаемые записи о том, что НЕ удалось и почему
       opened    - сколько документов реально открыто (для контроля бюджета)
 
+    exclude_fields (владелец, 02.08.2026): шахматка сканируется ПЕРВОЙ и уже
+    что-то предложила по этим полям - документы Drive под них не открываем.
+    Иначе бюджет открытия документов (по умолчанию 5, папки реально бывают на
+    сотни файлов) тратится на то, что уже найдено, а не на то, чего не хватает.
+
     Ничего не пишет в Airtable: предложения проходят через Confirmed.
     """
-    empty = empty_required_fields(project_fields)
+    empty = empty_required_fields(project_fields) - (exclude_fields or set())
     if not empty:
         return {"proposals": [], "gaps": [], "opened": 0}
 
@@ -197,6 +204,7 @@ async def run_for_project(
     drive_files: List[Dict[str, Any]],
     budget: int = DEFAULT_OPEN_BUDGET,
     write_gaps: bool = True,
+    exclude_fields: Optional[Set[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     То же самое, но карточка берётся из живой базы по имени проекта.
@@ -204,6 +212,9 @@ async def run_for_project(
     Нужна отдельная функция, потому что вызывающий код (link_fetcher) знает имя
     проекта, но не его текущие поля - а без них нельзя понять, что пусто, и
     роутер начнёт открывать документы под уже заполненные поля.
+
+    exclude_fields пробрасывается в fill_fields_from_drive_files - см. её
+    докстринг: это находки шахматки, обработанной раньше документов Drive.
 
     Возвращает None, если проект в базе не найден: открывать документы «на
     всякий случай», не зная чего не хватает, план запрещает прямо.
@@ -221,12 +232,102 @@ async def run_for_project(
         return None
 
     summary = await fill_fields_from_drive_files(
-        record.get("fields", {}), drive_files, budget=budget
+        record.get("fields", {}), drive_files, budget=budget, exclude_fields=exclude_fields
     )
     summary["project_id"] = record["id"]
     summary["project_name"] = record.get("fields", {}).get("Project Name")
 
     if write_gaps:
+        await save_findings_to_gaps(record["id"], summary)
+    return summary
+
+
+_CSV_EMPTY_CELLS_RE = re.compile(r"\s*,\s*(?:,\s*)+")
+
+
+def _readable_csv(text: str) -> str:
+    """
+    Сворачивает подряд идущие запятые пустых ячеек CSV в ' | ' для читаемости.
+
+    Шахматка попадает в extract_field() как есть, и её дословные цитаты
+    выглядели так: «Sanur,,Available units», «Land color,,,,Red,,Trades &
+    services city area» - технически верно (значение то же), но нечитаемо
+    человеку, который подтверждает предложение (замер 03.08.2026, Mångata).
+    Одиночная запятая (обычный текст) не трогается - регулярка требует
+    минимум двух подряд.
+    """
+    return _CSV_EMPTY_CELLS_RE.sub(" | ", text or "")
+
+
+async def fill_project_fields_from_text(
+    project_fields: Optional[Dict[str, Any]],
+    text: str,
+    source_name: str,
+) -> Dict[str, Any]:
+    """
+    Извлекает пустые поля карточки из ОДНОГО текстового источника целиком -
+    без роутинга и бюджета, потому что источник один и его не выбирают.
+
+    Для шахматки (владелец, 02.08.2026): «шахматка сканируется первой, из неё
+    заполняется та часть полей, которую можно; дальше в других материалах
+    ищем то, чего нет, и не смотрим туда, где не найдём то, что нужно».
+    Возвращаемые proposals/gaps идут в тот же формат, что и у
+    fill_fields_from_drive_files, чтобы combine_findings мог их объединить
+    с находками документов Drive без специального случая.
+    """
+    text = _readable_csv(text)
+    empty = empty_required_fields(project_fields)
+    if not empty or not (text or "").strip():
+        return {"proposals": [], "gaps": [], "opened": 0}
+
+    proposals: List[Dict[str, Any]] = []
+    gaps: List[str] = []
+    for field in sorted(empty):
+        if not question_for(field):
+            continue
+        result = await extract_field(text, field)
+        result["source_file"] = source_name
+        if result.get("accepted"):
+            proposals.append(result)
+        else:
+            gaps.append(f"{field} ({source_name}): {result.get('reason')}")
+
+    logger.info(
+        f"📊 Шахматка '{source_name}': {len(proposals)} предложений из {len(empty)} пустых полей"
+    )
+    return {"proposals": proposals, "gaps": gaps, "opened": 1}
+
+
+async def run_for_project_from_sheet(
+    project_name: str,
+    sheet_text: str,
+    source_name: str,
+    write_gaps: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    То же самое, что run_for_project(), но источник - текст шахматки целиком,
+    а не файлы папки Drive. Точка входа для ссылок на Google Sheets: шахматка
+    обрабатывается ПЕРВОЙ, и её принятые предложения затем передаются в
+    fill_fields_from_drive_files как exclude_fields - документы Drive
+    открываются только под то, что шахматка не закрыла.
+    """
+    import app.airtable_client as ac
+
+    try:
+        record = await asyncio.to_thread(_find_project_record, ac, project_name)
+    except Exception as e:
+        logger.error(f"Не удалось прочитать карточку проекта '{project_name}': {e}")
+        return None
+
+    if not record:
+        logger.info(f"Проект '{project_name}' не найден в базе - разбор шахматки пропущен")
+        return None
+
+    summary = await fill_project_fields_from_text(record.get("fields", {}), sheet_text, source_name)
+    summary["project_id"] = record["id"]
+    summary["project_name"] = record.get("fields", {}).get("Project Name")
+
+    if write_gaps and (summary["proposals"] or summary["gaps"]):
         await save_findings_to_gaps(record["id"], summary)
     return summary
 
@@ -244,12 +345,123 @@ GAPS_SECTION_START = "--- AUTO: разбор документов (бот) ---"
 GAPS_SECTION_END = "--- /AUTO ---"
 
 
+def unwrap_findings(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Приводит результат к плоскому виду {proposals, gaps, opened}.
+
+    Разбор документов приходит в двух формах:
+      - плоско, как его вернул doc_pipeline.run_for_project();
+      - вложенным в 'doc_findings', как его отдаёт link_fetcher.process_generic_link().
+
+    Писатель обязан понимать обе. Пока он понимал только первую, пакетный прогон
+    отдавал ему внешний словарь, и proposals/opened молча превращались в [] и 0:
+    46 карточек получили секцию AUTO без единого предложения при «открыто
+    документов: 0», хотя извлечение отрабатывало (02.08.2026).
+    """
+    docs = summary.get("doc_findings")
+    if not isinstance(docs, dict):
+        return summary
+
+    flat = dict(summary)
+    flat["proposals"] = docs.get("proposals") or summary.get("proposals") or []
+    flat["opened"] = docs.get("opened") or summary.get("opened") or 0
+    # gaps верхнего уровня уже включают docs['gaps'] (link_fetcher домерживает их
+    # туда), поэтому внешний список приоритетнее - он полнее.
+    flat["gaps"] = summary.get("gaps") or docs.get("gaps") or []
+    return flat
+
+
+PROJECT_LINK_FIELDS = [
+    "Link to Developer’s Kit (Rus)",
+    "Link to Developer’s Kit (Eng)",
+    "Availability Chart",
+]
+
+
+def collect_project_links(fields: Dict[str, Any]) -> List[tuple]:
+    """
+    Ссылки карточки к обработке: шахматки первыми, без повторов одного URL.
+
+    Порядок (владелец, 02.08.2026): шахматка сканируется ПЕРВОЙ, независимо от
+    того, в каком поле Airtable она лежит - это таблица, а не свободный текст,
+    и написанное в ней прямо (район, зонирование, срок сдачи) надёжнее, чем
+    поиск по презентациям вслепую. Закрытые ею поля затем исключаются из
+    поиска по остальным материалам.
+
+    Дедупликация по URL обязательна: у Mangata одна и та же таблица указана и
+    в 'Link to Developer's Kit (Rus)', и в 'Availability Chart', из-за чего
+    извлечение полей отрабатывало по ней дважды и клало в Gaps два одинаковых
+    предложения Land Zoning Color (02.08.2026).
+    """
+    seen = set()
+    sheets, others = [], []
+    for key in PROJECT_LINK_FIELDS:
+        value = fields.get(key)
+        if not value:
+            continue
+        url = str(value).strip()
+        if not url.startswith("http") or url in seen:
+            continue
+        seen.add(url)
+        from app.link_fetcher import extract_gsheet_id
+        (sheets if extract_gsheet_id(url) else others).append((key, url))
+    return sheets + others
+
+
+def combine_findings(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Объединяет результаты НЕСКОЛЬКИХ ссылок одного проекта в одну сводку перед
+    единственной записью в Gaps.
+
+    save_findings_to_gaps ЗАМЕНЯЕТ секцию бота целиком при каждом вызове - так и
+    задумано, иначе повторные прогоны плодили бы копии (см. merge_into_gaps).
+    Но проект обычно закрыт несколькими ссылками (DevKit Rus + Availability
+    Chart), и запись по разу на ссылку означает, что в Gaps остаётся только
+    последняя - находки по остальным молча стираются. Обнаружено 02.08.2026 на
+    Mangata: разбор папки Drive открыл 5 документов, но результат исчез, как
+    только следом обработалась ссылка на таблицу (без doc_findings вообще).
+
+    Вызывающий код должен накопить результаты process_generic_link по всем
+    ссылкам проекта и позвать save_findings_to_gaps ОДИН раз с этой сводкой.
+    """
+    from app.drive_mirror import extract_mirror_airtable_fields
+
+    proposals: List[Dict[str, Any]] = []
+    gaps: List[str] = []
+    seen_gaps = set()
+    opened = 0
+    mirror_fields: Dict[str, Any] = {}
+
+    for r in results:
+        flat = unwrap_findings(r or {})
+        proposals.extend(flat.get("proposals") or [])
+        opened += flat.get("opened") or 0
+        for g in flat.get("gaps") or []:
+            if g not in seen_gaps:
+                seen_gaps.add(g)
+                gaps.append(g)
+
+        mf = flat.get("mirror_airtable_fields") or extract_mirror_airtable_fields(
+            flat.get("drive_mirror") or {}
+        )
+        for key, value in mf.items():
+            mirror_fields.setdefault(key, value)  # первый источник побеждает
+
+    return {
+        "proposals": proposals,
+        "gaps": gaps,
+        "opened": opened,
+        "mirror_airtable_fields": mirror_fields,
+    }
+
+
 def format_findings_block(summary: Dict[str, Any]) -> str:
     """
     Текст секции бота. Предложения помечены именно как предложения: значения
     попадают в поля только после Confirmed, и человек, читающий Gaps, должен
     видеть разницу между «нашли и записали» и «нашли, подтвердите».
     """
+    summary = unwrap_findings(summary)
     lines = [GAPS_SECTION_START]
 
     proposals = summary.get("proposals") or []
@@ -298,16 +510,38 @@ def merge_into_gaps(existing: Optional[str], block: str) -> str:
 
 async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> bool:
     """
-    Записывает секцию бота в поле Gaps карточки проекта, а также безопасные
-    поля зеркалирования Drive (Link to Developer’s Kit (Rus) и обложку Img).
+    Записывает секцию бота в поле Gaps карточки проекта, а также результат
+    зеркалирования Drive: ссылку на зеркало в Renders и обложку в Img.
+
+    Извлечённые из документов ЗНАЧЕНИЯ полей карточки по-прежнему не трогаются -
+    они доезжают туда только после Confirmed. Renders/Img - это не найденный
+    факт, а адрес нашей же копии файлов; оба пишутся только в пустое поле,
+    чужую ссылку не затираем.
     """
     import app.airtable_client as ac
     from app.drive_mirror import extract_mirror_airtable_fields
 
+    summary = unwrap_findings(summary)
+    mirror_summary = summary.get("drive_mirror") or {}
+    mirror_fields = summary.get("mirror_airtable_fields") or extract_mirror_airtable_fields(mirror_summary)
+    summary = {**summary, "mirror_airtable_fields": mirror_fields}
+
     def _write():
-        table = ac.get_base().table("Projects")
+        table = ac.get_table("Projects")
+        if not table:
+            logger.error("Airtable Projects table is unavailable; Gaps were not updated.")
+            return False
         record = table.get(project_id)
         fields_dict = record.get("fields", {}) or {}
+
+        # Active — ручная пометка «проверено человеком» (владелец, 06.08.2026):
+        # пока она стоит, карточку не трогает ни upsert_project/upsert_unit,
+        # ни этот путь. Без проверки здесь бот безусловно переписывал бы
+        # Gaps — то самое поле, где живёт список вопросов застройщику.
+        if fields_dict.get("Active"):
+            logger.info(f"Карточка {project_id} отмечена Active — Gaps/Renders/Img не обновлены")
+            return False
+
         current_gaps = fields_dict.get("Gaps")
         merged_gaps = merge_into_gaps(current_gaps, format_findings_block(summary))
 
@@ -315,12 +549,17 @@ async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> boo
         if merged_gaps != (current_gaps or "").strip():
             update_payload["Gaps"] = merged_gaps
 
-        # Проставляем отзеркалированные ссылки на личный Drive
-        mirror_summary = summary.get("drive_mirror") or {}
-        mirror_fields = summary.get("mirror_airtable_fields") or extract_mirror_airtable_fields(mirror_summary)
-
-        if mirror_fields.get("Link to Developer’s Kit (Rus)") and not fields_dict.get("Link to Developer’s Kit (Rus)"):
-            update_payload["Link to Developer’s Kit (Rus)"] = mirror_fields["Link to Developer’s Kit (Rus)"]
+        if mirror_fields.get("Renders"):
+            current_renders = fields_dict.get("Renders")
+            if not current_renders:
+                update_payload["Renders"] = mirror_fields["Renders"]
+            elif mirror_fields["Renders"] not in str(current_renders):
+                # Там уже чужая ссылка (обычно папка застройщика). Менять её -
+                # решение владельца, поэтому только сообщаем, а не затираем.
+                logger.warning(
+                    f"Renders у {project_id} занят другой ссылкой, зеркало не "
+                    f"проставлено: {mirror_fields['Renders']}"
+                )
 
         if mirror_fields.get("Img") and not fields_dict.get("Img"):
             update_payload["Img"] = mirror_fields["Img"]
@@ -329,8 +568,9 @@ async def save_findings_to_gaps(project_id: str, summary: Dict[str, Any]) -> boo
             return False
 
         result = ac.robust_airtable_op(table.update, project_id, fields=update_payload)
-        if not result or not result.get('id'):
-            logger.error(f"❌ Не удалось обновить карточку {project_id}: {result.get('error_details', 'unknown')}")
+        if not isinstance(result, dict) or not result.get('id'):
+            details = result.get('error_details', 'unknown') if isinstance(result, dict) else result
+            logger.error(f"❌ Не удалось обновить карточку {project_id}: {details}")
             return False
         return True
 

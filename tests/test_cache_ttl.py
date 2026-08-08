@@ -41,8 +41,9 @@ def fresh_cache(monkeypatch):
     monkeypatch.setattr(ac, 'CACHE_DEVELOPERS', [])
     monkeypatch.setattr(ac, 'CACHE_PROJECTS', [])
     monkeypatch.setattr(ac, 'CACHE_UNITS', [])
+    monkeypatch.setattr(ac, 'CACHE_UNITS_SECONDARY', [])
     base = FakeBase()
-    monkeypatch.setattr(ac, 'get_base', lambda: base)
+    monkeypatch.setattr(ac, 'get_table', lambda name: base.table(name))
     return base
 
 
@@ -85,7 +86,7 @@ class TestRefetchBehaviour:
     def test_second_call_does_not_hit_airtable(self, fresh_cache):
         ac.init_cache()
         reads_after_first = fresh_cache.reads
-        assert reads_after_first == 3  # Developer, Projects, Units
+        assert reads_after_first == 4  # Developer, Projects, Units, Units (Secondary)
 
         ac.init_cache()
         assert fresh_cache.reads == reads_after_first, \
@@ -98,12 +99,12 @@ class TestRefetchBehaviour:
                             lambda: loaded_at + ac.CACHE_TTL_SECONDS + 1)
 
         ac.init_cache()
-        assert fresh_cache.reads == 6, "Просроченный кэш обязан перечитать базу"
+        assert fresh_cache.reads == 8, "Просроченный кэш обязан перечитать базу"
 
     def test_force_refetches_even_when_fresh(self, fresh_cache):
         ac.init_cache()
         ac.init_cache(force=True)
-        assert fresh_cache.reads == 6
+        assert fresh_cache.reads == 8
 
 
 class TestAsyncVariant:
@@ -111,11 +112,11 @@ class TestAsyncVariant:
     @pytest.mark.asyncio
     async def test_async_refreshes_when_stale(self, fresh_cache):
         await ac.init_cache_async()
-        assert fresh_cache.reads == 3
+        assert fresh_cache.reads == 4
         assert ac.cache_is_stale() is False
 
     @pytest.mark.asyncio
     async def test_async_skips_when_fresh(self, fresh_cache):
         await ac.init_cache_async()
         await ac.init_cache_async()
-        assert fresh_cache.reads == 3
+        assert fresh_cache.reads == 4

@@ -58,10 +58,31 @@ def is_filled(value: Any) -> bool:
     return True
 
 
+# Одно и то же поле называется по-разному у парсера и в Airtable: имена слева
+# описаны в контракте gemini_parser, имена справа airtable_client подставляет
+# при записи (см. его же переименования 'Link to Dev Kit (Rus)' и
+# 'Area from (m2)'). Пропуски считаются по записи, ПРОЧИТАННОЙ ИЗ БАЗЫ, то есть
+# по правым именам, а список обязательных полей знал только левые — и эти два
+# пропуска не закрывались ничем. Каждый проект вечно требовал презентацию,
+# каждый юнит — площадь, и оба уезжали в вопросы застройщику выдуманными.
+FIELD_ALIASES = {
+    'Link to Dev Kit (Rus)': ('Link to Developer’s Kit (Rus)',),
+    'Link to Dev Kit (Eng)': ('Link to Developer’s Kit (Eng)',),
+    'Area from (m2)': ('Area from (m\xb2)',),
+    'Land Area (m2)': ('Land Area (m\xb2)',),
+}
+
+
+def _any_filled(fields: Dict[str, Any], key: str) -> bool:
+    """Заполнено ли поле под любым из своих имён."""
+    return any(is_filled(fields.get(name))
+               for name in (key, *FIELD_ALIASES.get(key, ())))
+
+
 def compute_gaps(fields: Optional[Dict[str, Any]], required: Dict[str, str]) -> List[str]:
     """Человекочитаемые имена обязательных полей, которых не хватает."""
     fields = fields or {}
-    return [label for key, label in required.items() if not is_filled(fields.get(key))]
+    return [label for key, label in required.items() if not _any_filled(fields, key)]
 
 
 def project_gaps(fields: Optional[Dict[str, Any]]) -> List[str]:

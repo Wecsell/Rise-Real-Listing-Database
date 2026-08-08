@@ -106,6 +106,19 @@ def main():
 
         for loser in losers:
             l_devs = [dev_names.get(d) for d in (loser['fields'].get('Developer') or [])]
+
+            # Active — ручная пометка «проверено человеком» (владелец,
+            # 06.08.2026). Слияние переименовывает проигравшую запись и
+            # снимает у неё Active — если это ЕЁ отмечали как проверенную,
+            # молчаливое слияние стёрло бы чужую проверку. Дозаполнение
+            # keeper'а через 'gained' туда же: если keeper Active, его
+            # содержимое менять не должен и этот скрипт.
+            if keeper['fields'].get('Active') or loser['fields'].get('Active'):
+                who = 'оставляемая' if keeper['fields'].get('Active') else 'сливаемая'
+                print(f"  ПРОПУСК   {loser['id']}  {who} запись отмечена Active — "
+                      f"слияние требует ручного решения, не трогаю")
+                continue
+
             print(f"  сливаю    {loser['id']}  застройщик={l_devs}  полей={filled_count(loser)}")
 
             moved_units = [u for u in units if loser['id'] in (u['fields'].get('Project Name') or [])]

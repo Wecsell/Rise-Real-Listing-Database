@@ -2,9 +2,11 @@ import os
 import re
 import logging
 import difflib
+import threading
 import requests
 from pyairtable import Api
 from datetime import datetime
+from typing import Optional
 
 from app.naming import (is_placeholder_name, next_placeholder_name,
                         placeholders_never_match)
@@ -33,6 +35,12 @@ VALID_UNIT_AREAS = ['Ubud', 'Cemagi', 'Kuta', 'Sumba', 'Canggu', 'Bukit', 'Mengw
 
 _SCHEMA_OPTIONS = None
 _SCHEMA_FIELDS = {}
+# (table, field) -> тип поля из живой схемы Airtable ('formula', 'number', ...).
+# Нужен, чтобы ловить не только отсутствие поля, но и запись в вычисляемое:
+# 'Unit ID' оказался формулой и молча ронял всю запись юнита (02.08.2026).
+_SCHEMA_FIELD_TYPES = {}
+_TABLE_IDS = {}
+_SCHEMA_LOAD_LOCK = threading.Lock()
 
 
 def _load_schema_options() -> dict:
@@ -53,16 +61,77 @@ def _load_schema_options() -> dict:
     url = f'https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables'
     req = urllib.request.Request(url, headers={'Authorization': f'Bearer {AIRTABLE_TOKEN}'})
     result = {}
+    table_ids = {}
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.load(resp)
 
     for table in data.get('tables', []):
-        _SCHEMA_FIELDS[table['name']] = {f['name'] for f in table.get('fields', [])}
+        table_name = table.get('name')
+        table_id = table.get('id')
+        if not table_name:
+            continue
+        if table_id:
+            table_ids[table_name] = table_id
+        _SCHEMA_FIELDS[table_name] = {f['name'] for f in table.get('fields', [])}
         for field in table.get('fields', []):
+            _SCHEMA_FIELD_TYPES[(table_name, field['name'])] = field.get('type')
             choices = field.get('options', {}).get('choices')
             if choices:
-                result[(table['name'], field['name'])] = [c['name'] for c in choices]
+                result[(table_name, field['name'])] = [c['name'] for c in choices]
+    _TABLE_IDS.clear()
+    _TABLE_IDS.update(table_ids)
     return result
+
+
+def _ensure_schema_metadata() -> None:
+    """Load table IDs, fields and select options once in a thread-safe way."""
+    global _SCHEMA_OPTIONS
+    if _SCHEMA_OPTIONS is not None:
+        return
+    with _SCHEMA_LOAD_LOCK:
+        if _SCHEMA_OPTIONS is not None:
+            return
+        try:
+            _SCHEMA_OPTIONS = _load_schema_options()
+            logger.info(
+                "Airtable schema loaded: %s selects, %s table IDs.",
+                len(_SCHEMA_OPTIONS),
+                len(_TABLE_IDS),
+            )
+        except Exception as exc:
+            logger.error("Failed to load Airtable schema: %s", exc)
+            _SCHEMA_OPTIONS = {}
+            _TABLE_IDS.clear()
+
+
+def get_table_id(table_name: str):
+    """Resolve a table display name to its Airtable table ID from metadata."""
+    if not table_name:
+        return None
+    if str(table_name).startswith("tbl"):
+        return str(table_name)
+    _ensure_schema_metadata()
+    table_id = _TABLE_IDS.get(table_name)
+    if not table_id:
+        logger.error("Airtable table ID not found for %r; refusing name-based request.", table_name)
+    return table_id
+
+
+def get_table(table_name: str):
+    """Return a pyairtable table addressed by ID, never by display name."""
+    base = get_base()
+    if not base:
+        return None
+    table_id = get_table_id(table_name)
+    if not table_id:
+        return None
+    return base.table(table_id)
+
+
+def get_field_type(table: str, field: str):
+    """Тип поля из живой схемы. None — схема не прочитана или поля нет."""
+    get_select_options(table, field)  # гарантирует, что схема загружена
+    return _SCHEMA_FIELD_TYPES.get((table, field))
 
 
 def field_exists(table: str, field: str) -> bool:
@@ -80,14 +149,7 @@ def field_exists(table: str, field: str) -> bool:
 
 def get_select_options(table: str, field: str, fallback=None) -> list:
     """Актуальные значения селекта из базы. При сбое — запасной список."""
-    global _SCHEMA_OPTIONS
-    if _SCHEMA_OPTIONS is None:
-        try:
-            _SCHEMA_OPTIONS = _load_schema_options()
-            logger.info(f"Схема Airtable прочитана: {len(_SCHEMA_OPTIONS)} селектов")
-        except Exception as e:
-            logger.error(f"Не удалось прочитать схему Airtable, работаем по запасным спискам: {e}")
-            _SCHEMA_OPTIONS = {}
+    _ensure_schema_metadata()
     return _SCHEMA_OPTIONS.get((table, field)) or (fallback or [])
 
 
@@ -123,14 +185,14 @@ def get_agency_phones() -> set:
     if _AGENCY_PHONES is not None and (time.time() - _AGENCY_LOADED_AT) < CACHE_TTL_SECONDS:
         return _AGENCY_PHONES
 
-    base = get_base()
-    if not base:
+    table = get_table('Agencies')
+    if not table:
         return _AGENCY_PHONES or set()
 
     try:
         from app.dedup import extract_phones
         phones = set()
-        for record in base.table('Agencies').all(fields=['Phones']):
+        for record in table.all(fields=['Phones']):
             phones.update(extract_phones(record['fields'].get('Phones')))
         _AGENCY_PHONES = phones
         _AGENCY_LOADED_AT = time.time()
@@ -144,6 +206,7 @@ def get_agency_phones() -> set:
 CACHE_DEVELOPERS = []
 CACHE_PROJECTS = []
 CACHE_UNITS = []
+CACHE_UNITS_SECONDARY = []
 CACHE_INITIALIZED = False
 CACHE_LOADED_AT = 0.0
 
@@ -168,21 +231,43 @@ def cache_is_stale() -> bool:
 
 def init_cache(force: bool = False):
     """Синхронная версия для обратной совместимости (блокирующая)"""
-    global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_INITIALIZED, CACHE_LOADED_AT
+    global CACHE_DEVELOPERS, CACHE_PROJECTS, CACHE_UNITS, CACHE_UNITS_SECONDARY, CACHE_INITIALIZED, CACHE_LOADED_AT
     if not force and not cache_is_stale():
         return
-    base = get_base()
-    if not base:
+    developer_table = get_table('Developer')
+    projects_table = get_table('Projects')
+    units_table = get_table('Units')
+    if not all((developer_table, projects_table, units_table)):
+        logger.error("Airtable cache not initialized because one or more table IDs are unavailable.")
         return
     logger.info("Initializing Airtable cache (minimal fields)...")
 
-    CACHE_DEVELOPERS = base.table('Developer').all()
-    CACHE_PROJECTS = base.table('Projects').all()
-    CACHE_UNITS = base.table('Units').all()
+    CACHE_DEVELOPERS = developer_table.all()
+    CACHE_PROJECTS = projects_table.all()
+    CACHE_UNITS = units_table.all()
+
+    # Отдельный кэш для вторички: upsert_unit(is_secondary=True) обязан
+    # матчиться только против записей своей таблицы. Раньше матчинг шёл по
+    # CACHE_UNITS (только первичка) независимо от is_secondary — при
+    # совпадении Key апдейт вторички уходил на ID из Units, но через
+    # эндпоинт Units (Secondary), и Airtable тихо переписывал ПЕРВИЧНУЮ
+    # запись данными вторички (найдено живым тестом 05.08.2026, K-Village).
+    units_secondary_table = get_table('Units (Secondary)')
+    if units_secondary_table:
+        try:
+            CACHE_UNITS_SECONDARY = units_secondary_table.all()
+        except Exception as exc:
+            logger.warning("Could not load Units (Secondary) cache: %s", exc)
+            CACHE_UNITS_SECONDARY = []
+    else:
+        CACHE_UNITS_SECONDARY = []
 
     CACHE_INITIALIZED = True
     CACHE_LOADED_AT = time.time()
-    logger.info(f"Cache initialized: {len(CACHE_DEVELOPERS)} devs, {len(CACHE_PROJECTS)} projects, {len(CACHE_UNITS)} units.")
+    logger.info(
+        f"Cache initialized: {len(CACHE_DEVELOPERS)} devs, {len(CACHE_PROJECTS)} projects, "
+        f"{len(CACHE_UNITS)} units, {len(CACHE_UNITS_SECONDARY)} secondary units."
+    )
 
 async def init_cache_async(force: bool = False):
     """Асинхронная инициализация в отдельном потоке (не блокирует event loop)"""
@@ -259,6 +344,238 @@ BUKIT_HINTS = ('букит', 'bukit', 'south kuta', 'badung selatan')
 VALID_STAGES = {"Off-plan / Pre-sales", "Foundation", "Structure", "Finishing", "Completed"}
 VALID_POOL_VALUES = {"No", "Yes(Private)", "Yes(Shared)"}
 
+# Поля, которые заполняет ТОЛЬКО человек. Код их не пишет — ни при создании,
+# ни при обновлении записи.
+#
+# 'Active' — признак ручной проверки и ворота видимости в интерфейсе
+# (владелец, 06.08.2026). Отдельное поле нужно потому, что Status для этого не
+# годится: он производный, целиком считается из gaps, и любой следующий прогон
+# затёр бы человеческий вердикт. Отсюда же и запрет на запись: галочка, которую
+# бот может снять, ничего не гарантирует.
+#
+# Верно и обратное направление: Status='Verified' означает лишь «пропусков не
+# найдено», это утверждение машины о полноте, а не проверка человеком. На
+# 06.08.2026 бот сам проставил его 451 юниту и 57 проектам.
+HUMAN_ONLY_FIELDS = frozenset({'Active'})
+
+# Возвращается вместо record id, когда запись пропущена ОСОЗНАННО (проект
+# отмечен Active) — в отличие от None, который означает сбой записи.
+# Значение ИСТИННОЕ: все вызывающие сейчас проверяют результат только как
+# `if not unit_id: <считать сбоем>` и не используют его как ссылку на запись
+# (field_processor.py, app/sync_job.py, tools_manual_intake.py) — с обычным
+# None это превращало Active-проект в "сбой записи": в field_processor
+# карточка Field Staging навсегда оставалась непривязанной и переобрабатывалась
+# каждые 30 секунд, в sync_job сжигала все ретраи и уходила в failed.
+class _Skipped(str):
+    def __bool__(self):
+        return True
+
+SKIPPED_ACTIVE = _Skipped('skipped: project is Active')
+
+
+def is_project_active(proj_id: str) -> bool:
+    """Для отчётов вызывающего кода: стоит ли Active у проекта с этим id в кэше."""
+    record = next((p for p in CACHE_PROJECTS if p['id'] == proj_id), None)
+    return bool(record and record.get('fields', {}).get('Active'))
+
+
+def _is_empty(value) -> bool:
+    """Пусто ли поле Airtable: None, пустая строка/список/словарь."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict, tuple)):
+        return len(value) == 0
+    return False
+
+
+def keep_only_new_values(fields: dict, existing_fields: dict) -> dict:
+    """Оставляет из payload только то, что ЗАПОЛНЯЕТ пустое, не трогая заполненное.
+
+    Правило защиты Active (владелец, 08.08.2026): галочка запрещает МЕНЯТЬ уже
+    заполненные значения, но не запрещает дописывать недостающее. Прежний
+    вариант блокировал запись целиком, и это стоило дорого: у Axis One и Y-WAY
+    юнитов не существовало вовсе, защищать было нечего, а создание всё равно
+    отклонялось — проекты простояли пустыми, пока владелец не снял галочки
+    вручную (08.08.2026). Запрет на создание отсутствующего ничего не
+    защищает, он только копит работу.
+    """
+    return {
+        k: v for k, v in fields.items()
+        if _is_empty(existing_fields.get(k))
+    }
+
+# Значение Source, когда источник неизвестен. Исторически этой строкой
+# подписывались ВСЕ записи независимо от группы, поэтому она осталась только
+# как честная заглушка "источник не записан", а не как описание источника.
+UNKNOWN_SOURCE = "TG: Rise Real Bali Chat"
+
+# Каналы попадания материалов в базу. Список закрытый и короткий, потому что
+# путей ровно три (владелец, 06.08.2026): либо ссылку присылает владелец, либо
+# её вытаскивает прослушка Telegram, либо - когда будет готово - WhatsApp.
+#
+# Notion, сайт застройщика, агентский кабинет каналами НЕ являются: парсер сам
+# туда не попадает, ссылка на них всегда приходит одним из трёх путей. Писать в
+# Source адрес материала - значит потерять, кто его дал. Пять записей в базе
+# подписаны так ошибочно (URL вместо канала).
+#
+# Внутри TG и WA это может быть и группа, и личный чат - в папке Telegram лежит
+# и то и то. Поэтому подпись не утверждает "группа", а называет сам чат.
+CHANNEL_TG = "TG"
+CHANNEL_WA = "WA"
+CHANNEL_MANUAL = "Manual"
+KNOWN_CHANNELS = (CHANNEL_TG, CHANNEL_WA, CHANNEL_MANUAL)
+
+
+SOURCE_SEPARATOR = " | "
+# Сколько чатов держим в Source. Связей может быть много, но поле читает
+# человек: список из десяти чатов перестаёт отвечать на вопрос "где у нас
+# контакт по этому проекту".
+MAX_SOURCE_CHATS = 3
+
+
+def _source_rank(value: Optional[str]) -> int:
+    """
+    Насколько источник ценен: 1 - живая связь с чатом, 0 - связи нет.
+
+    UNKNOWN_SOURCE считается нулём, хотя выглядит как TG-подпись: это
+    историческая заглушка "источник не записан", которой помечены ~700 записей.
+    Благодаря этому она вытесняется настоящим названием чата, а не соседствует
+    с ним. Старые значения вида URL - тоже ноль: адрес материала не говорит,
+    через кого он к нам попал.
+    """
+    text = (value or "").strip()
+    if not text or text == CHANNEL_MANUAL or text == UNKNOWN_SOURCE:
+        return 0
+    return 1 if text.split(":")[0].strip() in (CHANNEL_TG, CHANNEL_WA) else 0
+
+
+def source_move_gap(new_source: str) -> str:
+    """Человекочитаемая пометка о переезде проекта в новый чат."""
+    return (f"Проект появился в новом чате ({new_source}) — проверьте, "
+            f"не сменился ли застройщик и куда переехали продажи")
+
+
+def is_source_move(existing: Optional[str], incoming: Optional[str]) -> bool:
+    """
+    Проект всплыл в ЕЩЁ ОДНОМ чате при уже известной связи.
+
+    Обычно у проекта один чат, поэтому это не рядовое событие: продажи
+    переехали в новую группу либо застройщик перепродал проект. Молча
+    дописывать такое в Source нельзя - на запись должен посмотреть человек,
+    не сменился ли застройщик.
+
+    Повышение с "Manual" и вытеснение заглушки сюда НЕ попадают: там связи
+    раньше не было, ничего не переезжало.
+    """
+    old, new = (existing or "").strip(), (incoming or "").strip()
+    if not old or not new:
+        return False
+    if _source_rank(old) != 1 or _source_rank(new) != 1:
+        return False
+    return new not in [c.strip() for c in old.split(SOURCE_SEPARATOR)]
+
+
+def resolve_source(existing: Optional[str], incoming: Optional[str]) -> str:
+    """
+    Новое значение Source с учётом уже записанного.
+
+    Правило одностороннее (владелец, 06.08.2026): "Manual" повышается до
+    названия чата, когда проект находится в прослушке, но обратно НЕ
+    понижается. Иначе ручной импорт по уже найденному проекту затирал бы
+    связь, ради которой всё и делается: агенту нужно видеть, через какой чат
+    у нас есть контакт по этому объекту.
+
+    Разные чаты одного ранга не вытесняют друг друга, а складываются. Обычно у
+    проекта один верный чат: агентство - это мы, а в чатах сидят застройщики,
+    поэтому дублировать связи незачем. Но если проект всплыл в чате с другим
+    названием, это само по себе факт: продажи переехали в новую группу либо
+    застройщик перепродал проект. Затирать прежний чат тогда нельзя - теряется
+    история. Порядок в поле хронологический: левее - откуда пришли, правее -
+    где проект сейчас.
+    """
+    old, new = (existing or "").strip(), (incoming or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new
+
+    old_rank, new_rank = _source_rank(old), _source_rank(new)
+    if new_rank > old_rank:
+        return new
+    if new_rank < old_rank:
+        return old
+
+    # Одинаковый ранг. У связей копим список, у "Manual"/заглушки копить нечего.
+    if new_rank == 0:
+        return old
+    chats = [c.strip() for c in old.split(SOURCE_SEPARATOR) if c.strip()]
+    if new in chats:
+        return old
+    chats.append(new)
+    return SOURCE_SEPARATOR.join(chats[:MAX_SOURCE_CHATS])
+
+
+def source_label(chat_title: Optional[str] = None, channel: str = CHANNEL_TG) -> str:
+    """
+    Подпись источника в формате "канал: чат".
+
+    Manual идёт без уточнения: ссылку прислал владелец, имя человека в базе не
+    хранится (решение владельца, 06.08.2026).
+    """
+    if channel == CHANNEL_MANUAL:
+        return CHANNEL_MANUAL
+    if channel not in KNOWN_CHANNELS:
+        logger.warning("Неизвестный канал источника %r, пишу как %s", channel, CHANNEL_TG)
+        channel = CHANNEL_TG
+    title = (chat_title or "").strip()
+    return f"{channel}: {title}" if title else UNKNOWN_SOURCE
+
+
+# Типы полей Airtable, в которые физически нельзя писать. Держим здесь же, где
+# и запись: schema_check только предупреждает о таких полях, а отсеивать их
+# нужно до отправки. Список совпадает с schema_check.COMPUTED_FIELD_TYPES,
+# который его и проверяет на согласованность.
+COMPUTED_FIELD_TYPES = frozenset({
+    'formula', 'rollup', 'count', 'lookup', 'multipleLookupValues',
+    'autoNumber', 'createdTime', 'lastModifiedTime',
+    'createdBy', 'lastModifiedBy', 'button',
+})
+
+
+def strip_computed_fields(table: str, fields: dict, where: str = "") -> dict:
+    """
+    Убирает поля, которые Airtable считает вычисляемыми. Правит dict на месте.
+
+    Нужен потому, что 422 роняет ВСЮ запись, а не отбрасывает одно поле: один
+    лишний ключ - и проект с юнитами не сохраняется целиком. Полагаться на
+    статические списки тут нельзя (rules.md §3): поле становится формулой или
+    lookup в интерфейсе Airtable, без единой правки в коде. Так уже случилось
+    с 'Unit ID' (02.08.2026), с Units.'Area' и Units.'Stage', а в схеме ответа
+    модели до 06.08.2026 лежал Projects.'Developer Link' - lookup имени
+    застройщика, который модель имела право вернуть в любой момент.
+
+    Тип берём из живой схемы. Если схему прочитать не удалось, get_field_type
+    вернёт None и поле останется - предохранитель не должен молча вычищать
+    данные из-за недоступности метаданных.
+    """
+    for name in list(fields):
+        if get_field_type(table, name) in COMPUTED_FIELD_TYPES:
+            fields.pop(name)
+            logger.warning("Поле %s.%r вычисляемое — значение отброшено до записи%s",
+                           table, name, f" ({where})" if where else "")
+    return fields
+
+
+def strip_human_only_fields(fields: dict, where: str = "") -> dict:
+    """Убирает из payload поля ручной проверки. Возвращает тот же dict."""
+    for name in HUMAN_ONLY_FIELDS & fields.keys():
+        fields.pop(name)
+        logger.warning("Поле %r заполняется только вручную — значение отброшено%s",
+                       name, f" ({where})" if where else "")
+    return fields
+
 def sanitize_area(raw_area, valid_areas, is_project=False):
     if not raw_area:
         return None
@@ -317,6 +634,12 @@ UNIT_TYPE_ALIASES = {
     'bungalow': 'Villa',
 }
 
+# Значения, которые код отдаёт в Projects.Property Type. Это ДРУГОЙ селект,
+# чем Units.Unit type: брать для него UNIT_TYPE_ALIASES нельзя — там нет
+# 'Apartment'/'Studio', а именно отсутствие значения в этом селекте уронило
+# запись The Heights на 422 (02.08.2026).
+VALID_PROPERTY_TYPES = ['Villa', 'Apartment', 'Studio', 'Penthouse']
+
 # Запасной список типов юнитов. Боевой источник — селект Units.Unit type,
 # см. get_valid_unit_types(). Значения 'Hotel' и 'Hotel room' раньше жестко
 # возвращались отсюда, хотя из базы их убрали: такой юнит Airtable отвергал.
@@ -366,6 +689,49 @@ def sanitize_unit_type(raw_type):
         logger.warning(f"Unit type '{raw_type}' is unknown, stripping it.")
     return None
 
+# Живые опции Land Zoning Color (проверено 03.08.2026): 'Red/Commercial',
+# 'Tourism/Mixed', 'Residential', 'Brown', 'Green'. У поля НЕ было sanitize-
+# функции вовсе - ни gemini_parser.SYSTEM_PROMPT (жёстко перечислял 4 из 5
+# опций, без 'Red/Commercial'), ни upsert_project не проверяли значение перед
+# записью. schema_check.py уже документировал один такой инцидент задним
+# числом ("промпт требовал 'Commercial', где база знает 'Brown'") - без
+# постоянной защиты тот же класс бага повторился с 'Red' против
+# 'Red/Commercial'.
+LAND_ZONING_ALIASES = {
+    'red': 'Red/Commercial', 'red/commercial': 'Red/Commercial',
+    'commercial': 'Red/Commercial', 'trades & services': 'Red/Commercial',
+    'trades and services': 'Red/Commercial',
+    'yellow': 'Tourism/Mixed', 'pink': 'Tourism/Mixed',
+    'tourism': 'Tourism/Mixed', 'tourism/mixed': 'Tourism/Mixed',
+    'mixed': 'Tourism/Mixed', 'mixed use': 'Tourism/Mixed',
+    'residential': 'Residential', 'white': 'Residential',
+    'brown': 'Brown', 'agriculture': 'Brown', 'agricultural': 'Brown',
+    'green': 'Green',
+}
+
+
+def sanitize_land_zoning(raw_zoning):
+    """Нормализует Land Zoning Color до одной из живых опций базы."""
+    if not raw_zoning:
+        return None
+    raw_lower = str(raw_zoning).strip().lower()
+
+    valid = set(get_select_options('Projects', 'Land Zoning Color')) or set(LAND_ZONING_ALIASES.values())
+    for value in valid:
+        if value.lower() == raw_lower:
+            return value
+
+    canonical = LAND_ZONING_ALIASES.get(raw_lower)
+    if canonical and canonical in valid:
+        return canonical
+    for alias, mapped in LAND_ZONING_ALIASES.items():
+        if alias in raw_lower and mapped in valid:
+            return mapped
+
+    logger.warning(f"Land Zoning Color '{raw_zoning}' не опознан, поле очищено.")
+    return None
+
+
 def sanitize_pool(raw_pool):
     """Нормализует Pool до одного из валидных: Yes(Private), Yes(Shared), No"""
     if not raw_pool:
@@ -404,14 +770,33 @@ def safe_float(val):
     except (ValueError, TypeError):
         return val
 
+# Поля, которые разрешено ОЧИЩАТЬ явной пустой строкой.
+#
+# Обычную пустоту обёртка вырезает: разбор с полупустым результатом не должен
+# затирать уже накопленные данные. Но Gaps живёт по обратному правилу —
+# upsert_project и upsert_unit специально ставят его в "", когда пропусков не
+# осталось, и эта запись обязана дойти. Пока Gaps резался наравне со всеми,
+# очистить его было нельзя ни при каких данных: заполнив последний пробел,
+# карточка получала Status='Verified' и продолжала показывать старый список
+# вопросов, который по регламенту уходит застройщику.
+#
+# None по-прежнему режется у всех: это «нечего сказать», а не «очистить».
+CLEARABLE_FIELDS = frozenset({'Gaps'})
+
+
+def _drop_empty(fields: dict) -> dict:
+    return {k: v for k, v in fields.items()
+            if v is not None and (str(v).strip() != "" or k in CLEARABLE_FIELDS)}
+
+
 def robust_airtable_op(func, *args, fields=None, **kwargs):
     """Синхронная обертка для безопасного выполнения с детальной диагностикой ошибок"""
     try:
         if 'fields' in kwargs:
-            kwargs['fields'] = {k: v for k, v in kwargs['fields'].items() if v is not None and str(v).strip() != ""}
+            kwargs['fields'] = _drop_empty(kwargs['fields'])
         elif fields:
-            kwargs['fields'] = {k: v for k, v in fields.items() if v is not None and str(v).strip() != ""}
-        
+            kwargs['fields'] = _drop_empty(fields)
+
         return func(*args, **kwargs)
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else None
@@ -563,6 +948,30 @@ def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev
             # вторая приносила настоящего застройщика, иерархия видела
             # несовпадение и создавала вторую запись того же проекта.
             if not _linked_to_placeholder_developer(r_devs):
+                # Ослаблять эту проверку нельзя: она же защищает от слияния
+                # ДЕЙСТВИТЕЛЬНО разных проектов с похожим именем у разных
+                # застройщиков (см. 'Serenity' у ADVA против 'Serenity
+                # Villas' у PT Global BALI HOME, 08.08.2026 — оба реальны).
+                # Но у неё есть обратная сторона: если у существующей записи
+                # застройщик ИСПРАВЛЕН (не заглушка, а ошибочное настоящее
+                # имя вроде 'Badung' вместо 'OCTO Bali Group', Villa UNU,
+                # 08.08.2026), апсерт молча создаёт дубль вместо обновления.
+                # Раньше это обнаруживалось только постфактум, по строке
+                # 'Creating project' в логе для заведомо существующего имени.
+                # Громкое предупреждение — не решение, а страховка: если имя
+                # почти дословно совпадает, есть шанс, что это тот самый
+                # случай, и его стоит увидеть раньше, чем плодится дубль.
+                existing_clean = re.sub(r'[^\w\s]', '', str(p_name)).lower().strip()
+                name_ratio = difflib.SequenceMatcher(None, existing_clean, name_clean).ratio()
+                if name_ratio >= 0.95:
+                    logger.warning(
+                        "Проект %r почти дословно совпадает с существующим %r (%.2f), "
+                        "но у записи другой застройщик (%s, не заглушка) — апсерт создаст "
+                        "ДУБЛЬ, а не обновление. Если застройщик недавно исправлен, перецепи "
+                        "Projects.Developer напрямую по id ПЕРЕД записью payload (см. память "
+                        "changing-developer-creates-duplicate-project).",
+                        name, p_name, name_ratio, r_devs,
+                    )
                 continue
 
         # Разные фазы — разные проекты. Запрет срабатывает, только если фаза
@@ -703,15 +1112,32 @@ def fuzzy_match_developer(name: str, existing_records: list):
         dev_words = set(dev_clean.split())
         
         # Убрано слабое сравнение через 'in'
-        
+
         # Все значимые слова застройщика содержатся в искомом имени. Это
         # отношение вложенности, а не размытое сходство, поэтому оценка выше
         # порога 0.90. Раньше здесь стояло 0.85 — ветка отрабатывала и не
         # проходила гейт, то есть не могла сработать никогда. Ровно этот
         # случай она и обслуживает: название чата 'Rise Development Official
         # Bali' против записи 'Rise Development' в базе.
+        # Проверяем вложенность ПОЛНОГО имени записи, а не только значащих
+        # слов. Вычитание шума нужно лишь для того, чтобы запись не матчилась
+        # одним шумом ('Bali Real Estate' против любого чата со словом Bali),
+        # но САМИ слова записи отбрасывать нельзя: шум бывает в названии
+        # чата, а не в имени компании из нашей базы.
+        #
+        # Регресс 08.08.2026: 'villas' у записи 'Alpha Villas' отбрасывалось
+        # как шумовое, оставалось {'alpha'} — и запись «входила» в чужое
+        # 'ALPHA DEVELOPMENT GROUP' со score 0.95. upsert_developer
+        # ПЕРЕПИСАЛ ей имя: две разные компании (alphavillasbali.com в
+        # Улувату против alphadevelopment.notion.site в Чангу) слились в одну.
+        # При проверке полного имени случай отсекается сам: слова 'villas' в
+        # запросе нет вовсе.
+        #
+        # Законные случаи проходят, потому что название чата содержит имя
+        # компании целиком плюс хвосты: 'Tamora Group Bali Official' ⊇
+        # {tamora, group}, 'OXO Living Bali' ⊇ {oxo}.
         meaningful_dev_words = dev_words - ignore_words
-        if meaningful_dev_words and meaningful_dev_words.issubset(name_words):
+        if meaningful_dev_words and dev_words.issubset(name_words):
             score = 0.95
             if score > best_score:
                 best_score = score
@@ -734,11 +1160,9 @@ async def upsert_developer(dev_data: dict) -> str:
     if cache_is_stale():
         await init_cache_async()
         
-    base = get_base()
-    if not base:
+    table = get_table('Developer')
+    if not table:
         return None
-
-    table = base.table('Developer')
     existing = CACHE_DEVELOPERS
     
     dev_name = dev_data.get('Developer')
@@ -806,18 +1230,24 @@ async def upsert_developer(dev_data: dict) -> str:
             return record['id']
         return None
 
-async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
-    """Создает или обновляет Project. Возвращает Record ID."""
+async def upsert_project(proj_data: dict, dev_id: str, gaps: list,
+                         chat_title: Optional[str] = None,
+                         channel: str = CHANNEL_TG) -> str:
+    """
+    Создает или обновляет Project. Возвращает Record ID.
+
+    chat_title - название чата-источника. Раньше Source был константой
+    "TG: Rise Real Bali Chat" на КАЖДОЙ записи, поэтому ни один проект не знал,
+    из какой группы пришёл, и восстановить это задним числом уже нельзя.
+    """
     global CACHE_PROJECTS
     
     if cache_is_stale():
         await init_cache_async()
         
-    base = get_base()
-    if not base:
+    table = get_table('Projects')
+    if not table:
         return None
-
-    table = base.table('Projects')
     proj_name = proj_data.get('Project Name')
 
     # Названия нет или вместо него общее слово ('VILLA', 'Unknown Project',
@@ -886,9 +1316,31 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
             fields.pop('District')
             gaps = list(gaps or [])
             gaps.append(f"Район не распознан: {raw_area}")
-        
+
+    if 'Land Zoning Color' in fields:
+        raw_zoning = fields['Land Zoning Color']
+        s_zoning = sanitize_land_zoning(raw_zoning)
+        if s_zoning:
+            fields['Land Zoning Color'] = s_zoning
+        else:
+            # Как и с District: без сверки со списком селекта неверное значение
+            # роняло бы весь апдейт записи на 422, а не игнорировалось.
+            fields.pop('Land Zoning Color')
+            gaps = list(gaps or [])
+            gaps.append(f"Зонирование не распознано: {raw_zoning}")
+
     existing = CACHE_PROJECTS
     match, score = fuzzy_match_project(proj_name, existing, area=fields.get('District'), dev_id=dev_id)
+
+    # 'Active' — ручная пометка «проверено человеком», и по просьбе владельца
+    # (06.08.2026) она теперь означает именно защиту: пока галочка стоит, ни
+    # проект, ни его юниты не перезаписываются следующим прогоном. Раньше
+    # HUMAN_ONLY_FIELDS запрещал коду только САМ писать эту галочку — запись
+    # проекта проверку не читала вообще, и Active была витриной без функции.
+    # Active больше не отменяет запись целиком: он защищает ЗАПОЛНЕННЫЕ значения,
+    # но пустые поля дозаполняются, а юниты создаются как обычно (владелец,
+    # 08.08.2026). Флаг ставится ниже и читается в upsert_unit через кэш.
+    active_guard = bool(match and match.get('fields', {}).get('Active'))
 
     # Map field names from JSON schema to Airtable schema
     if 'Link to Dev Kit (Rus)' in fields:
@@ -930,29 +1382,50 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
         except (ValueError, TypeError):
             pass
 
+    strip_human_only_fields(fields, f"project {proj_name!r}")
+
+    # Source не перезаписываем слепо: связь с чатом ценнее ручного импорта.
+    old_source = (match or {}).get('fields', {}).get('Source')
+    new_source = source_label(chat_title, channel)
+    # Переезд в новый чат уходит в gaps, а не в Status напрямую: Status здесь
+    # производный от gaps и на следующем прогоне пересчитался бы, затерев
+    # пометку. Заодно человек видит причину, а не просто "Needs data".
+    if is_source_move(old_source, new_source):
+        gaps = list(gaps or []) + [source_move_gap(new_source)]
+        logger.warning("Проект %r появился в новом чате %s — нужна проверка застройщика",
+                       proj_name, new_source)
     fields['Status'] = "Needs data" if gaps else "Verified"
-    fields['Source'] = "TG: Rise Real Bali Chat"
+    fields['Source'] = resolve_source(old_source, new_source)
     fields['Last updated'] = datetime.now().isoformat()
     if gaps:
         fields['Gaps'] = ", ".join(gaps)
     else:
         fields['Gaps'] = "" # Очищаем gaps если их нет
 
+    # Последним, вплотную к записи: см. тот же комментарий в upsert_unit.
+    strip_computed_fields('Projects', fields, f"project {proj_name!r}")
+
     if match:
         rec_id = match['id']
         old_price = match.get('fields', {}).get('Price From (USD)')
         new_price = fields.get('Price From (USD)')
-        if old_price is not None and new_price is not None and safe_float(old_price) != safe_float(new_price):
-            try:
-                from app.database import save_fact
-                await save_fact(
-                    project_recid=rec_id,
-                    old_value=str(old_price),
-                    new_value=str(new_price),
-                    fact_type="price_change"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to record price change fact: {e}")
+        price_changed = (
+            old_price is not None and new_price is not None
+            and safe_float(old_price) != safe_float(new_price)
+        )
+
+        if active_guard:
+            # Служебные поля тоже не должны перетирать человеческую карточку:
+            # Status/Gaps/Last updated считаются из payload и затёрли бы вердикт.
+            protected = keep_only_new_values(fields, match.get('fields', {}))
+            for service_field in ('Status', 'Gaps', 'Last updated', 'Source'):
+                protected.pop(service_field, None)
+            skipped = sorted(set(fields) - set(protected))
+            logger.info("Проект %r отмечен Active — дозаполняю только пустые поля %s; "
+                        "не трогаю заполненные %s", proj_name, sorted(protected), skipped)
+            fields = protected
+            if not fields:
+                return match['id']
 
         logger.info(f"Updating project '{proj_name}' matched to '{match['fields'].get('Project Name')}' (ID: {rec_id}, Score: {score:.2f})")
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
@@ -970,7 +1443,21 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list) -> str:
             else:
                 logger.error(f"❌ Failed to update Project '{proj_name}' (ID: {rec_id}) [{err_code}]: {err_details}")
                 return None
-        
+
+        # Факт пишем ТОЛЬКО после успешного апдейта: иначе 422/404 оставлял бы
+        # в истории цен изменение, которого в Airtable не произошло.
+        if price_changed:
+            try:
+                from app.database import save_fact
+                await save_fact(
+                    project_recid=rec_id,
+                    old_value=str(old_price),
+                    new_value=str(new_price),
+                    fact_type="price_change"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record price change fact: {e}")
+
         # Обновляем кэш
         for i, c in enumerate(CACHE_PROJECTS):
             if c['id'] == rec_id:
@@ -998,12 +1485,15 @@ async def mark_project_units_sold(proj_id: str):
         return
     if cache_is_stale():
         await init_cache_async()
-    base = get_base()
-    if not base:
+
+    if is_project_active(proj_id):
+        logger.info("Проект %r отмечен Active — юниты не помечены Sold", proj_id)
         return
-        
-    table_primary = base.table('Units')
-    table_secondary = base.table('Units (Secondary)')
+
+    table_primary = get_table('Units')
+    table_secondary = get_table('Units (Secondary)')
+    if not table_primary or not table_secondary:
+        return
     
     for u in list(CACHE_UNITS):
         p_links = u.get('fields', {}).get('Project Name', [])
@@ -1023,19 +1513,93 @@ async def mark_project_units_sold(proj_id: str):
 
             await robust_airtable_op_async(table_secondary.create, fields=sec_fields)
 
-async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list, is_secondary: bool = False) -> str:
+_LOT_CODE_WORDS = {'unit', 'row', 'lot', 'block', 'villa', 'floor', 'nbr', 'apt', 'no'}
+
+
+def looks_like_lot_code(unit_no) -> bool:
+    """'Unit Number' — номер физического лота (a4, alt220, unit 12, row a 3),
+    а не название отдельного продукта (topaz, jade-pool-1st-floor)?
+
+    Эвристика: после вычитания цифр и служебных слов (unit/row/block/villa/
+    floor...) от каждого слова остаётся не больше 3 букв. Настоящее имя
+    продукта всегда оставляет более длинное слово ('topaz', 'signature').
+    Используется на записи (find_typology_violations, ниже) и при уборке
+    задним числом (см. память unit-dedup-check-key-token-not-just-price) —
+    одна и та же проверка, чтобы поведение не расходилось.
+    """
+    words = re.findall(r'[a-z]+', str(unit_no or '').lower())
+    return all(w in _LOT_CODE_WORDS or len(w) <= 3 for w in words)
+
+
+def find_typology_violations(units: list) -> list:
+    """Прогон payload'а ПЕРЕД записью: не пытается ли он завести один и тот
+    же тип юнита несколько раз под видом разных физических лотов.
+
+    07.08.2026 обнаружено постфактум: в Units скопилось 250+ таких дублей
+    (COCO Hills — 49 записей на одну типологию, AZORIA — 45). Канон таблицы —
+    типология, не лот (см. .agent/rules/rules.md, «Units holds TYPOLOGY»).
+    Эта проверка ловит саму ошибку на входе, а не чистит её потом.
+
+    Возвращает читаемые сообщения об ошибке, по одному на найденную группу
+    дублей; пустой список — писать можно.
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for u in units or []:
+        if not isinstance(u, dict):
+            continue
+        sig = (
+            sanitize_unit_type(u.get('Unit type')),
+            u.get('Bedrooms'),
+            u.get('Price from(USD)'),
+            u.get('Area from (m²)'),
+        )
+        groups[sig].append(u)
+
+    errors = []
+    for sig, group in groups.items():
+        if len(group) < 2:
+            continue
+        unit_nos = [g.get('Unit Number') for g in group]
+        if all(looks_like_lot_code(n) for n in unit_nos):
+            utype, beds, price, area = sig
+            errors.append(
+                f"{len(group)} записей одного типа ({utype}, {beds} спален, цена {price}) "
+                f"различаются только номером лота ({unit_nos[:5]}...) — это одна типология, "
+                f"не {len(group)}. Оставь ОДНУ запись (можно без 'Unit Number'), "
+                f"а число физических юнитов укажи в Projects.Total Units."
+            )
+    return errors
+
+
+async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
+                      is_secondary: bool = False, chat_title: Optional[str] = None,
+                      channel: str = CHANNEL_TG) -> str:
     """Создает или обновляет Unit (в первичном 'Units' или во вторичном 'Units (Secondary)')."""
-    global CACHE_UNITS
-    
+    global CACHE_UNITS, CACHE_UNITS_SECONDARY
+
     if cache_is_stale():
         await init_cache_async()
-        
-    base = get_base()
-    if not base:
-        return None
 
     table_name = 'Units (Secondary)' if is_secondary else 'Units'
-    table = base.table(table_name)
+    table = get_table(table_name)
+    if not table:
+        return None
+
+    # Юнит наследует защиту проекта: если проект отмечен Active человеком,
+    # его юниты тоже не перезаписываются, независимо от того, кто вызывает
+    # upsert_unit (ручной ввод или, в будущем, автоматический разбор). Ищем
+    # проект по id, а не по имени — оно уже разрешено вызывающим кодом.
+    project_record = next((p for p in CACHE_PROJECTS if p['id'] == proj_id), None)
+    unit_active_guard = bool(project_record and project_record.get('fields', {}).get('Active'))
+
+    # Первичка и вторичка - РАЗНЫЕ таблицы Airtable с независимой нумерацией
+    # записей. Матчинг по Key обязан идти против кэша своей же таблицы -
+    # иначе апдейт по ID из чужой таблицы уходит на эндпоинт этой таблицы
+    # и тихо переписывает чужую запись (живой инцидент 05.08.2026, см.
+    # комментарий у CACHE_UNITS_SECONDARY).
+    unit_cache = CACHE_UNITS_SECONDARY if is_secondary else CACHE_UNITS
     
     # Нормализуем Unit type ДО генерации ключа, чтобы ключи были стабильными
     raw_unit_type = unit_data.get('Unit type')
@@ -1044,26 +1608,37 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     # Генерация ключа для юнита. Канон: project__unitno__Nbr при наличии номера; иначе project__type__Nbr__views БЕЗ цены
     u_type = str(clean_unit_type or 'none').lower()
     beds = str(unit_data.get('Bedrooms', '0'))
-    unit_no = unit_data.get('Unit Number') 
-    
+    unit_no = unit_data.get('Unit Number')
+
     view_raw = unit_data.get('View', '')
     if isinstance(view_raw, list):
         view = '-'.join(str(v).lower() for v in view_raw)
     else:
         view = str(view_raw).lower()
-    
+
     proj_slug = re.sub(r'[^a-z0-9-]', '', str(proj_name).lower().replace(' ', '-'))[:15]
-    
+
+    # 0 спален не бывает - это всегда "не извлекли", а не реальная величина
+    # (владелец, 05.08.2026; тот же паттерн уже приводил к браку 25.07).
+    # Studio получает свой явный токен; у остальных типов отсутствие числа
+    # спален помечается 'nbr', а не выдаётся за настоящий 'Nbr'.
+    if u_type == 'studio':
+        bed_token = 'studio'
+    elif beds in ('0', '0.0'):
+        bed_token = 'nbr'
+    else:
+        bed_token = f"{beds}br"
+
     if unit_no:
-        key = f"{proj_slug}__{str(unit_no).lower()}__{beds}br"
+        key = f"{proj_slug}__{str(unit_no).lower()}__{bed_token}"
     else:
         view_slug = re.sub(r'[^a-z0-9]+', '-', view).strip('-')
         if view_slug and view_slug != 'none':
-            key = f"{proj_slug}__{u_type}__{beds}br__{view_slug}"
+            key = f"{proj_slug}__{u_type}__{bed_token}__{view_slug}"
         else:
-            key = f"{proj_slug}__{u_type}__{beds}br"
+            key = f"{proj_slug}__{u_type}__{bed_token}"
     
-    existing = [u for u in CACHE_UNITS if u.get('fields', {}).get('Key') == key]
+    existing = [u for u in unit_cache if u.get('fields', {}).get('Key') == key]
 
     # Сохраняем все значения, кроме None и пустых строк
     fields = {k: v for k, v in unit_data.items() if v is not None and str(v).strip() != ""}
@@ -1138,28 +1713,60 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
             fields[f] = safe_float(fields[f])
 
     fields['Key'] = key
+    strip_human_only_fields(fields, f"unit {key}")
+    # 'Group with agency' здесь НЕ заполняется: с 06.08.2026 это lookup на
+    # Source, то есть группа подтягивается сама. Достаточно правильного Source.
+    old_source = existing[0]['fields'].get('Source') if existing else None
+    new_source = source_label(chat_title, channel)
+    if is_source_move(old_source, new_source):
+        gaps = list(gaps or []) + [source_move_gap(new_source)]
+        logger.warning("Юнит %r появился в новом чате %s — нужна проверка застройщика",
+                       key, new_source)
     fields['Status'] = "Needs data" if gaps else "Verified"
-    fields['Source'] = "TG: Rise Real Bali Chat"
+    fields['Source'] = resolve_source(
+        existing[0]['fields'].get('Source') if existing else None,
+        source_label(chat_title, channel),
+    )
     fields['Last updated'] = datetime.now().isoformat()
     if gaps:
         fields['Gaps'] = ", ".join(gaps)
     else:
         fields['Gaps'] = ""
 
+    # Предохранитель стоит последним, вплотную к записи: любое поле, добавленное
+    # в payload выше, тоже должно через него пройти. Когда он стоял раньше по
+    # тексту, запись 'Group with agency' проскакивала мимо и роняла юнит с 422.
+    strip_computed_fields(table_name, fields, f"unit {key}")
+
     if existing:
         rec_id = existing[0]['id']
+        # Active защищает только то, что уже заполнено. Создание нового юнита
+        # (ветка else ниже) под защиту не попадает вовсе: отсутствующая запись
+        # ничего не хранит, и запрещать её создание нечего.
+        if unit_active_guard:
+            protected = keep_only_new_values(fields, existing[0].get('fields', {}))
+            for service_field in ('Status', 'Gaps', 'Last updated', 'Source', 'Key'):
+                protected.pop(service_field, None)
+            skipped = sorted(set(fields) - set(protected))
+            logger.info("Проект %r отмечен Active — у юнита %r дозаполняю только пустые "
+                        "поля %s; не трогаю заполненные %s",
+                        proj_name, key, sorted(protected), skipped)
+            fields = protected
+            if not fields:
+                return SKIPPED_ACTIVE
+
         logger.info(f"Updating unit '{key}' (ID: {rec_id})")
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
         if not record or not record.get('id'):
             logger.error(f"Failed to update Unit {key}")
-            return rec_id
-        
-        # Обновляем кэш
-        for i, c in enumerate(CACHE_UNITS):
+            return None
+
+        # Обновляем кэш (своей таблицы)
+        for i, c in enumerate(unit_cache):
             if c['id'] == rec_id:
-                CACHE_UNITS[i] = record
+                unit_cache[i] = record
                 break
-                
+
         return rec_id
     else:
         logger.info(f"Creating unit '{key}'")
@@ -1167,5 +1774,5 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
         if not record or not record.get('id'):
             logger.error(f"Failed to create Unit {key}")
             return None
-        CACHE_UNITS.append(record)
+        unit_cache.append(record)
         return record['id']

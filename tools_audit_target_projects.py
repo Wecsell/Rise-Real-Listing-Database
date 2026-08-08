@@ -7,8 +7,8 @@
 Прогон 2: Финальная сверка — убеждаемся, что не осталось ни одной ошибки или дрейфа.
 
 Запуск:
-    python tools_audit_target_projects.py          # Аудит с авто-исправлением (--apply)
-    python tools_audit_target_projects.py --check  # Только отчёт без записи
+    python tools_audit_target_projects.py          # Только отчёт, ничего не пишет
+    python tools_audit_target_projects.py --apply  # Аудит с авто-исправлением в Airtable
 """
 import os
 import sys
@@ -180,10 +180,15 @@ def audit_pass(pass_number: int, apply: bool = True) -> Tuple[int, int, List[str
 
 def main():
     parser = argparse.ArgumentParser(description="Двукратный аудит целевых проектов и юнитов")
-    parser.add_argument("--check", action="store_true", help="Только аудит без внесения изменений")
+    parser.add_argument("--apply", action="store_true",
+                        help="Вносить исправления в Airtable (по умолчанию — только отчёт)")
+    parser.add_argument("--check", action="store_true",
+                        help="Совместимость: то же, что запуск без флагов — только отчёт")
     args = parser.parse_args()
 
-    apply_changes = not args.check
+    # Запись — только по явному флагу. Прежний `apply_changes = not args.check`
+    # означал, что запуск без аргументов молча правит живую базу.
+    apply_changes = args.apply and not args.check
 
     # 0. Интеграционная проверка дрейфа схемы
     logger.info("1. Проверка дрейфа схемы (app.schema_check)...")

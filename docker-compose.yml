@@ -1,38 +1,172 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:16-alpine
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: rise
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-
-  redis:
-    image: redis:7-alpine
-    restart: always
-    volumes:
-      - redis_data:/data
+      # PostgreSQL runs this only for a new data volume. Existing deployments
+      # retain their schema and app/database.py keeps additive migrations.
+      - type: bind
+        source: ./init.sql
+        target: /docker-entrypoint-initdb.d/init.sql
+        read_only: true
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: &default-logging
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   listener:
-    build: .
-    restart: always
-    stdin_open: true
-    tty: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    init: true
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
     env_file:
       - .env
+    # This is the directory used by listener.py and content_cache.py. It
+    # persists the Telegram session and cache without mounting application code.
     volumes:
-      - ./app:/usr/src/app/app
-      - ./data:/data
-    command: python -u -m app.listener
+      - ./data:/usr/src/app/data
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    command: ["python", "-u", "-m", "app.listener"]
+    healthcheck:
+      # python:slim intentionally has no curl, so use the standard library.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthcheck', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+
+  # Field services are opt-in: `docker compose --profile field up -d`.
+  # Fixed names make Compose reject attempts to scale either Telegram polling
+  # worker beyond one replica.
+  field_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    profiles: ["field"]
+    container_name: rise-field-bot
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    # GPX uploads, the generated heatmap and the shared parser cache are
+    # intentionally persistent. Application source remains immutable.
+    volumes:
+      - ./data:/usr/src/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    command: ["python", "-u", "field_bot.py"]
+    logging: *default-logging
+
+  field_processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    profiles: ["field"]
+    container_name: rise-field-processor
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    # gemini_parser's cache and an OAuth token refresh use the project data
+    # directory; keep that writable while leaving source read-only.
+    volumes:
+      - ./data:/usr/src/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    command: ["python", "-u", "field_processor.py"]
+    logging: *default-logging
+
+  # A one-shot, explicitly requested Airtable export. It is not started by
+  # the default compose project and has no restart policy.
+  sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    profiles: ["maintenance"]
+    restart: "no"
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-u", "-m", "app.sync_job"]
+    logging: *default-logging
+
+  # Isolated, opt-in test runner. It receives no .env secrets, uses the
+  # Dockerfile test target, and has no network access to live services.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    profiles: ["test"]
+    restart: "no"
+    init: true
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    environment:
+      PYTEST_ADDOPTS: "-p no:cacheprovider"
+      GEMINI_CACHE_DB_PATH: /tmp/gemini_cache.db
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["pytest", "-q"]
+    logging: *default-logging
 
 volumes:
   postgres_data:
-  redis_data:

@@ -2,14 +2,14 @@ import os
 import json
 import asyncio
 import logging
-import requests
-import tempfile
 from dotenv import load_dotenv
-from pyairtable import Api
 from google import genai
 from google.genai import types
 
-load_dotenv(override=True)
+# Runtime-provided environment variables must take precedence over a local
+# development .env file.  In particular, a production container must not be
+# redirected to a test Airtable base by an accidental local file.
+load_dotenv(override=False)
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # httpx и telethon на уровне INFO пишут полный URL запроса, а токены стоят
@@ -19,11 +19,14 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 logger = logging.getLogger("FieldProcessor")
 
-airtable_api = Api(os.environ.get('AIRTABLE_TOKEN'))
-base = airtable_api.base(os.environ.get('AIRTABLE_BASE_ID'))
-staging_table = base.table('Field Staging')
+from app import llm_gate
 
-gemini_client = genai.Client(api_key=os.environ.get('GEMINI_API_KEY'))
+# Клиент создаётся только через общий рубильник, как в gemini_parser. Раньше
+# здесь стояла проверка на один лишь GEMINI_API_KEY — из-за неё LLM_BACKEND=off
+# на этот процесс не действовал, а при пустом ключе каждая находка помечалась
+# Status='Error' вместо честного "разбор не выполнялся" (найдено 07.08.2026).
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if llm_gate.llm_enabled() else None
 
 from app.gemini_parser import SYSTEM_PROMPT, resolve_model_name
 from app.priority_parser import build_update_fields
@@ -34,7 +37,53 @@ from app.naming import swap_coordinates
 from app.dedup import (build_contact_notice, classify_contact_match,
                        describe_contact_match, extract_phones, find_matches,
                        notify_lister)
-from app.airtable_client import field_exists
+from app.airtable_client import field_exists, get_table
+from app.url_safety import stream_response_to_tempfile, stream_safe_url
+
+
+def _staging_table():
+    """Resolve Field Staging through Airtable metadata, never its display name.
+
+    The active token can access records only by table ID.  Resolving lazily
+    keeps import-time tests offline and fails before any read or write if the
+    schema cannot be verified.
+    """
+    table = get_table("Field Staging")
+    if table is None:
+        raise RuntimeError("Field Staging table ID is unavailable from Airtable metadata")
+    return table
+
+
+def _positive_int_env(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, os.environ.get(name), default)
+        return default
+
+
+# Attachments in Field Staging are produced by Airtable's CDN.  ``api.telegram.org``
+# is retained only so pre-existing staging rows created by earlier versions can
+# still be processed.  Any other host is rejected before a connection is made.
+FIELD_ATTACHMENT_HOSTS = frozenset({
+    "airtable.com",
+    "*.airtable.com",
+    "airtableusercontent.com",
+    "*.airtableusercontent.com",
+    "api.telegram.org",
+})
+FIELD_ATTACHMENT_MAX_BYTES = _positive_int_env(
+    "FIELD_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024
+)
+FIELD_ATTACHMENT_TIMEOUT_SECONDS = _positive_int_env(
+    "FIELD_ATTACHMENT_TIMEOUT_SECONDS", 30
+)
+FIELD_GEMINI_TIMEOUT_SECONDS = _positive_int_env(
+    "FIELD_GEMINI_TIMEOUT_SECONDS", 120
+)
+FIELD_PARSED_JSON_MAX_CHARS = _positive_int_env(
+    "FIELD_PARSED_JSON_MAX_CHARS", 95_000
+)
 
 FIELD_PROMPT = SYSTEM_PROMPT + """
 
@@ -55,14 +104,44 @@ FIELD_PROMPT = SYSTEM_PROMPT + """
 4. Свести все это в единый JSON, включив верхнеуровневое поле 'Priority': "Высокий" | "Средний" | "Низкий".
 """
 
-def download_file(url: str, suffix: str) -> str:
-    """Скачивает файл во временную директорию и возвращает путь."""
-    resp = requests.get(url)
-    resp.raise_for_status()
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    temp.write(resp.content)
-    temp.close()
-    return temp.name
+
+def _serialize_parsed_finding(parsed: dict) -> str:
+    """Serialize a staging parse without ever storing malformed JSON.
+
+    Airtable's long-text limit is finite.  Truncating serialized JSON halfway
+    through a string made a record look ``Processed`` while making it
+    impossible to promote later.  A too-large result is now a visible error
+    that can be retried or reviewed with its source material intact.
+    """
+    serialized = json.dumps(parsed, ensure_ascii=False)
+    if len(serialized) > FIELD_PARSED_JSON_MAX_CHARS:
+        raise ValueError(
+            "Parsed JSON exceeds Field Staging capacity "
+            f"({len(serialized)} > {FIELD_PARSED_JSON_MAX_CHARS} characters)"
+        )
+    return serialized
+
+async def download_file(url: str, suffix: str) -> str:
+    """Stream one trusted staging attachment into a bounded temporary file.
+
+    Field records are data supplied by users, even if they live in Airtable.
+    The common URL guard therefore validates scheme, allow-listed host, DNS,
+    every redirect and response size before Gemini is given the file.
+    """
+    async with stream_safe_url(
+        url,
+        timeout=float(FIELD_ATTACHMENT_TIMEOUT_SECONDS),
+        allowed_hosts=FIELD_ATTACHMENT_HOSTS,
+    ) as response:
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Attachment download returned HTTP {response.status_code}"
+            )
+        return await stream_response_to_tempfile(
+            response,
+            suffix=suffix,
+            max_bytes=FIELD_ATTACHMENT_MAX_BYTES,
+        )
 
 async def process_staging_records():
     """Полный цикл: разбор новых находок, затем перенос подтвержденных."""
@@ -83,7 +162,7 @@ async def promote_confirmed_findings():
     from app.airtable_client import (init_cache_async, upsert_developer,
                                      upsert_project, upsert_unit)
 
-    records = await asyncio.to_thread(staging_table.all, formula="{Confirmed} = 1")
+    records = await asyncio.to_thread(_staging_table().all, formula="{Confirmed} = 1")
     pending = [r for r in records if should_promote(r)]
 
     for rec in records:
@@ -111,6 +190,8 @@ async def promote_confirmed_findings():
             if not dev_data.get('Developer'):
                 dev_data['Developer'] = 'Unknown'
             dev_id = await upsert_developer(dev_data)
+            if not dev_id:
+                raise RuntimeError("Developer upsert failed; Field Staging record remains unlinked")
 
             if fields.get('Coordinates'):
                 # В Field Staging координаты лежат как их прислал Telegram:
@@ -125,12 +206,22 @@ async def promote_confirmed_findings():
             logger.info(f"[{rec_id}] незаполненных полей: {len(proj_gaps)} -> {proj_gaps}")
 
             proj_id = await upsert_project(proj_data, dev_id, gaps=proj_gaps)
+            if not proj_id:
+                raise RuntimeError("Project upsert failed; Field Staging record remains unlinked")
 
-            for u in units:
-                await upsert_unit(u, proj_id, proj_data.get('Project Name', 'None'), unit_gaps(u))
+            for unit_index, u in enumerate(units, start=1):
+                unit_id = await upsert_unit(
+                    u, proj_id, proj_data.get('Project Name', 'None'), unit_gaps(u)
+                )
+                if not unit_id:
+                    raise RuntimeError(
+                        f"Unit {unit_index} upsert failed; Field Staging record remains unlinked"
+                    )
 
             final_proj_id = proj_id[0] if isinstance(proj_id, list) and proj_id else (
                 proj_id if isinstance(proj_id, str) else None)
+            if not final_proj_id:
+                raise RuntimeError("Project upsert returned no record ID")
 
             # Связи проставляем последним шагом — именно они помечают запись
             # как перенесенную и не дают обработать ее второй раз.
@@ -140,7 +231,7 @@ async def promote_confirmed_findings():
             if final_proj_id:
                 links['Project'] = [final_proj_id]
             if links:
-                await asyncio.to_thread(staging_table.update, rec_id, links)
+                await asyncio.to_thread(_staging_table().update, rec_id, links)
 
             logger.info(f"[{rec_id}] перенесена в основную базу (проект {final_proj_id})")
 
@@ -149,11 +240,20 @@ async def promote_confirmed_findings():
 
 
 async def parse_new_findings():
+    # Разбор выключен рубильником — находки ОСТАЮТСЯ в статусе 'New' и ждут
+    # включения. Прежний код доходил до gemini_client=None, падал на upload и
+    # ставил Status='Error': находка выглядела бракованной, хотя её просто
+    # никто не смотрел, и после включения модели она бы уже не подхватилась
+    # фильтром {Status}='New'.
+    if gemini_client is None:
+        llm_gate.note_manual_mode("parse_new_findings (Field Staging)")
+        return
+
     logger.info("Проверяем новые записи в Field Staging...")
     # Берем все записи со Status = New
     # Формула — первичный фильтр, needs_parsing — страховка на случай, если
     # статус изменился между запросом и обработкой.
-    records = [r for r in await asyncio.to_thread(staging_table.all, formula="{Status} = 'New'")
+    records = [r for r in await asyncio.to_thread(_staging_table().all, formula="{Status} = 'New'")
                if needs_parsing(r)]
 
     if not records:
@@ -164,7 +264,7 @@ async def parse_new_findings():
 
     # Для поиска дублей нужны все находки, а не только новые: совпадение
     # ищется с тем, что уже лежит в базе.
-    all_findings = await asyncio.to_thread(staging_table.all, fields=['Contact', 'Submitted By', 'Id'])
+    all_findings = await asyncio.to_thread(_staging_table().all, fields=['Contact', 'Submitted By', 'Id'])
 
     for rec in records:
         rec_id = rec['id']
@@ -185,7 +285,7 @@ async def parse_new_findings():
                     url = item.get('url')
                     if url:
                         logger.info(f"Скачиваем фото #{idx}...")
-                        path = await asyncio.to_thread(download_file, url, ".jpg")
+                        path = await download_file(url, ".jpg")
                         temp_files.append(path)
                         logger.info(f"Грузим фото #{idx} в Gemini API...")
                         uploaded = await asyncio.to_thread(gemini_client.files.upload, file=path)
@@ -196,7 +296,7 @@ async def parse_new_findings():
                     url = item.get('url')
                     if url:
                         logger.info(f"Скачиваем аудио #{idx}...")
-                        path = await asyncio.to_thread(download_file, url, ".ogg")
+                        path = await download_file(url, ".ogg")
                         temp_files.append(path)
                         logger.info(f"Грузим аудио #{idx} в Gemini API...")
                         uploaded = await asyncio.to_thread(gemini_client.files.upload, file=path)
@@ -208,17 +308,22 @@ async def parse_new_findings():
             
             model_name = resolve_model_name()
             logger.info(f"Ждем ответа от {model_name}...")
-            response = await gemini_client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1
-                )
+            response = await asyncio.wait_for(
+                gemini_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1
+                    ),
+                ),
+                timeout=float(FIELD_GEMINI_TIMEOUT_SECONDS),
             )
             
-            text_resp = response.text.strip()
-            logger.info(f"Raw Gemini response: {text_resp}")
+            text_resp = (response.text or "").strip()
+            # Model output may contain contact details and source text.  Keep
+            # logs operationally useful without persisting that sensitive data.
+            logger.info("Received Gemini JSON response (%s characters).", len(text_resp))
             if text_resp.startswith("```"):
                 import re
                 text_resp = re.sub(r"^```(?:json)?\n?|```$", "", text_resp).strip()
@@ -281,7 +386,7 @@ async def parse_new_findings():
                 land_zoning=proj_data.get('Land Zoning Color'),
                 handover_permits=proj_data.get('Handover Permits'),
             )
-            update_fields[PARSED_JSON_FIELD] = json.dumps(parsed, ensure_ascii=False)[:95000]
+            update_fields[PARSED_JSON_FIELD] = _serialize_parsed_finding(parsed)
 
             # Дубль ищем по телефону с баннера: у одного застройщика мы берем
             # все проекты разом, поэтому второй баннер с тем же номером новой
@@ -307,7 +412,7 @@ async def parse_new_findings():
                         by_kind, contact_field, incoming_project)
                 dup_notice = build_contact_notice(by_kind, contact_field, incoming_project)
 
-            await asyncio.to_thread(staging_table.update, rec_id, update_fields)
+            await asyncio.to_thread(_staging_table().update, rec_id, update_fields)
             logger.info(
                 f"Запись {rec_id} разобрана (Status=Processed). "
                 f"Для переноса в основную базу поставьте галочку Confirmed."
@@ -319,19 +424,31 @@ async def parse_new_findings():
         except Exception as e:
             logger.error(f"Ошибка при обработке: {e}")
             try:
-                await asyncio.to_thread(staging_table.update, rec_id, {'Status': 'Error', 'Notes': f"SYSTEM ERROR: {str(e)}"})
-            except:
-                await asyncio.to_thread(staging_table.update, rec_id, {'Status': 'Error'})
+                await asyncio.to_thread(_staging_table().update, rec_id, {'Status': 'Error', 'Notes': f"SYSTEM ERROR: {str(e)}"})
+            except Exception as update_exc:
+                logger.error(
+                    "Could not persist error status for staging record %s: %s",
+                    rec_id,
+                    update_exc,
+                )
             
         finally:
             # Cleanup temp files
             for p in temp_files:
-                if os.path.exists(p): os.remove(p)
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError as cleanup_exc:
+                        logger.warning("Could not remove temporary attachment %s: %s", p, cleanup_exc)
             for f in uploaded_files:
                 try:
                     await asyncio.to_thread(gemini_client.files.delete, name=f.name)
-                except:
-                    pass
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Could not delete temporary Gemini file for staging record %s: %s",
+                        rec_id,
+                        cleanup_exc,
+                    )
 
 from app.single_instance import acquire
 

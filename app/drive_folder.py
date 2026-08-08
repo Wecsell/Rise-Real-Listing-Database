@@ -8,6 +8,7 @@ with the link" - для чтения (в отличие от записи) OAuth
 app/drive_auth.py подходит без дополнительной настройки.
 """
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from googleapiclient.errors import HttpError
@@ -18,6 +19,33 @@ logger = logging.getLogger("DriveFolder")
 
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+
+# Предел вложенности обхода. Не константа в коде, потому что зависит от того,
+# как застройщик разложил свои материалы, а не от нашей логики: у Y-WAY папка
+# рендеров уходит на шесть уровней, и лимит 5 обрезал листинг молча.
+# Верхняя граница удерживает обход от разрастания на битой структуре.
+_MAX_DEPTH_CEILING = 12
+
+
+def _bounded_depth_env(name: str, default: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r не число, беру %s", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%s меньше 1, беру %s", name, value, default)
+        return default
+    if value > maximum:
+        logger.warning("%s=%s больше предела %s, беру предел", name, value, maximum)
+        return maximum
+    return value
+
+
+DEFAULT_MAX_DEPTH = _bounded_depth_env("GDRIVE_MAX_DEPTH", 8, _MAX_DEPTH_CEILING)
 
 _FIELDS = "nextPageToken, files(id, name, mimeType, size, shortcutDetails)"
 
@@ -70,8 +98,8 @@ def download_drive_file(file_id: str, dest_path: str) -> bool:
 
 
 def list_drive_folder_recursive(
-    folder_id: str, max_depth: int = 5, _depth: int = 0, _visited: Optional[set] = None,
-    _path: str = "",
+    folder_id: str, max_depth: Optional[int] = None, _depth: int = 0,
+    _visited: Optional[set] = None, _path: str = "",
 ) -> List[Dict[str, Any]]:
     """
     Разворачивает папку рекурсивно, разыменовывая ярлыки ("Shortcut to Shared
@@ -85,8 +113,13 @@ def list_drive_folder_recursive(
     структуру источника и сваливает все картинки в одну кучу.
 
     Кап на глубину и visited-set по id папки - защита от циклов, папка не
-    должна ссылаться сама на себя через цепочку ярлыков.
+    должна ссылаться сама на себя через цепочку ярлыков. Значение по умолчанию
+    берётся из GDRIVE_MAX_DEPTH: у застройщиков встречаются папки глубже пяти
+    уровней (кит Y-WAY - шесть), и прежний жёсткий лимит 5 молча обрезал
+    листинг, оставляя часть рендеров незеркалированными.
     """
+    if max_depth is None:
+        max_depth = DEFAULT_MAX_DEPTH
     if _visited is None:
         _visited = set()
     if folder_id in _visited or _depth > max_depth:

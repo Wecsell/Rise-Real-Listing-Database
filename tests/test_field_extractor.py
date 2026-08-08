@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -206,10 +207,57 @@ class TestPageSlicing(unittest.TestCase):
         out = select_relevant_pages(doc, "Handover Permits", max_pages=1)
         self.assertIn("A", out)
 
+    def test_construction_stage_percent_page_beats_unrelated_percent_page(self):
+        """
+        Регрессия 03.08.2026 (Mångata): голый '\\d{1,3}\\s*%' ловил ЛЮБОЙ
+        процент - страница доходности (комиссия УК 25%, заполняемость 80%,
+        ROI 11.5%) набирала больше совпадений, чем настоящая страница
+        готовности объекта с единственным '~83%', и побеждала при отборе.
+        """
+        doc = (
+            "--- Страница 1 ---\nОбщее описание проекта.\n\n"
+            "--- Страница 2 ---\n"
+            "ДОХОДНОСТЬ ПРИ СДАЧЕ В АРЕНДУ. Комиссия УК 25%. Заполняемость 80%. "
+            "ROI при владении в год 11.5%.\n\n"
+            "--- Страница 3 ---\nПРОГРЕСС ~83% ДЕКАБРЬ 2025 Г.\n"
+        )
+        out = select_relevant_pages(doc, "Construction stage", max_pages=1)
+        self.assertIn("83%", out)
+        self.assertNotIn("ROI", out)
+
+    def test_construction_stage_matches_cyrillic_progress(self):
+        """Латинское 'progress' не покрывает кириллическое 'ПРОГРЕСС'."""
+        doc = (
+            "--- Страница 1 ---\nКонтакты.\n\n"
+            "--- Страница 2 ---\nПРОГРЕСС ~83% ДЕКАБРЬ 2025 Г.\n"
+        )
+        out = select_relevant_pages(doc, "Construction stage", max_pages=1)
+        self.assertIn("83%", out)
+
 
 class TestExtractFieldWiring(unittest.TestCase):
+    """
+    Все тесты класса зовут extract_field на ОДНОМ И ТОМ ЖЕ SRC + поле, с
+    разными ответами модели - именно поэтому extract_field() кэшируется по
+    (текст, поле, вопрос, модель, версия промпта), а не по ответу. Без
+    изоляции кэш-БД первый прогон записал бы результат в реальный
+    data/gemini_cache.db, и все следующие тесты (в этом файле или в другом
+    прогоне) получали бы чужой закэшированный ответ вместо своего мока
+    (03.08.2026, тот же класс проблемы, что и в test_doc_parser.TestGraphicPdfPath).
+    """
 
     SRC = "--- Страница 1 ---\nThe lease period is 35 years starting 2023."
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = patch.dict(
+            os.environ, {'GEMINI_CACHE_DB_PATH': os.path.join(self._tmpdir.name, 'cache.db')}
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
 
     def _run(self, model_json):
         async def run_test():
@@ -254,6 +302,50 @@ class TestExtractFieldWiring(unittest.TestCase):
         self.assertFalse(res["accepted"])
         self.assertIsNone(res["value"])
 
+    def test_second_identical_call_skips_the_model(self):
+        """
+        Регрессия 03.08.2026: extract_field не кэшировал вообще ничего -
+        каждый повторный прогон одного документа (и вся ручная отладка вроде
+        "проверить 5 раз подряд") был новым оплаченным вызовом, даже когда
+        текст, поле и вопрос совпадали дословно.
+        """
+        async def run_test():
+            fake_resp = MagicMock(
+                text='{"answer": "35", "quotes": ["The lease period is 35 years"], "confidence": 0.9}'
+            )
+            fake_client = MagicMock()
+            fake_client.aio.models.generate_content = AsyncMock(return_value=fake_resp)
+            with patch('app.field_extractor.client', fake_client):
+                first = await extract_field(self.SRC, "Lease Term (years)")
+                second = await extract_field(self.SRC, "Lease Term (years)")
+            return first, second, fake_client.aio.models.generate_content.await_count
+
+        first, second, call_count = asyncio.run(run_test())
+        self.assertEqual(call_count, 1, "второй идентичный вызов должен взяться из кэша")
+        self.assertEqual(first, second)
+
+    def test_different_text_is_not_confused_with_cached_entry(self):
+        async def run_test():
+            fake_client = MagicMock()
+            fake_client.aio.models.generate_content = AsyncMock(
+                return_value=MagicMock(
+                    text='{"answer": "35", "quotes": ["The lease period is 35 years"]}'
+                )
+            )
+            with patch('app.field_extractor.client', fake_client):
+                await extract_field(self.SRC, "Lease Term (years)")
+                fake_client.aio.models.generate_content = AsyncMock(
+                    return_value=MagicMock(
+                        text='{"answer": "40", "quotes": ["the term runs for 40 years total"]}'
+                    )
+                )
+                other_src = "--- Страница 1 ---\nThe term runs for 40 years total."
+                res = await extract_field(other_src, "Lease Term (years)")
+            return res
+
+        res = asyncio.run(run_test())
+        self.assertEqual(res["value"], "40", "другой текст не должен получить чужой кэш")
+
     def test_api_error_is_reported_not_raised(self):
         async def run_test():
             fake_client = MagicMock()
@@ -264,6 +356,23 @@ class TestExtractFieldWiring(unittest.TestCase):
         res = asyncio.run(run_test())
         self.assertFalse(res["accepted"])
         self.assertIn("quota", res["reason"])
+
+    def test_transient_error_is_not_cached(self):
+        """Сетевой сбой не должен залипать в кэше на CACHE_TTL_DAYS - на следующий прогон стоит попробовать снова."""
+        async def run_test():
+            fake_client = MagicMock()
+            fake_client.aio.models.generate_content = AsyncMock(side_effect=Exception("network blip"))
+            with patch('app.field_extractor.client', fake_client):
+                await extract_field(self.SRC, "Lease Term (years)")
+                fake_client.aio.models.generate_content = AsyncMock(
+                    return_value=MagicMock(
+                        text='{"answer": "35", "quotes": ["The lease period is 35 years"]}'
+                    )
+                )
+                return await extract_field(self.SRC, "Lease Term (years)")
+
+        res = asyncio.run(run_test())
+        self.assertTrue(res["accepted"], "ошибка не должна была закэшироваться и заблокировать реальный ответ")
 
     def test_unknown_field_without_question_is_refused(self):
         async def run_test():

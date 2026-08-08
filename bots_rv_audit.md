@@ -1,8 +1,15 @@
 # 🤖 Bots RV — Полный аудит системы листинга
 
-> **Стек:** Python 3.12 · Telethon · Gemini 3.5 Flash · Airtable · PostgreSQL · Redis · Docker  
-> **Тесты:** 647 passed · **База:** `appsAbRs7DnYYWFt6` (Test) / `app2IEMPr6R3GelVP` (Prod)  
-> **Стоимость:** ~$30-70/мес (Gemini API + Airtable)
+> **Стек:** Python 3.12 · Telethon · Gemini 3.5 Flash · Airtable · PostgreSQL · Docker (Redis больше не используется, см. README.md)
+> **Тесты:** 784 passed (0 failed), обновлено 05.08.2026 · **База сейчас в работе:** `appsAbRs7DnYYWFt6` (Test) — `.env`. Прод (`app2IEMPr6R3GelVP`) ещё не подключён, финальный перенос не сделан (см. §7)
+> **Стоимость:** цифра ~$30-70/мес не подтверждена — источник (`RUKOVODSTVO.md.txt`) называет "Claude API", хотя код использует Gemini; реальный счёт нужно смотреть в биллинге, не в этом документе
+
+> [!NOTE]
+> Этот раздел актуализирован по итогам синка по статусу с владельцем
+> 05.08.2026 (ревью 79f6bde: fail-closed доступ, атомарная синхронизация,
+> SSRF-защита, immutable Docker — все закрыты и закоммичены). Остальной
+> документ ниже — из более ранней сессии и местами устарел; помечаю точечно,
+> где именно.
 
 ---
 
@@ -60,9 +67,11 @@ flowchart LR
 - ✅ Gemini `3.5-flash-lite` парсит сообщения → Developer / Project / Units JSON
 - ✅ Буферизация в PostgreSQL со статусом `pending`
 - ✅ Автоматический парсинг ссылок (Notion, Drive, Sheets, PDF, Dropbox)
-- ✅ Backfill истории при подключении к новой группе
-- ✅ `/card` — генерация карточки проекта прямо в чате
-- ✅ Healthcheck HTTP :8080 (TG RPC ping + PG `SELECT 1`)
+- ✅ Backfill истории при подключении к новой группе — **не инкрементально**: при каждом рестарте перечитывает последние `SCAN_HISTORY_LIMIT` сообщений заново, курсор "докуда долистали" нигде не хранится
+- ✅ `/card` — генерация карточки проекта прямо в чате, только для авторизованного отправителя
+- ✅ Healthcheck HTTP :8080 (TG RPC ping + PG `SELECT 1`) + фоновый монитор переходов unhealthy → алерт в Telegram (`monitor_health_transitions`, добавлено 05.08.2026 — раньше Docker просто помечал контейнер нездоровым молча)
+- ✅ **05.08.2026:** выбор чата и `/card` переведены на fail-closed (пустая конфигурация = ни один чат, не все); внешние ссылки идут через `app/url_safety.py` (allow-list хостов, блокировка приватных IP, лимит байт на скачивание); очередь разбора сообщений ограничена `maxsize`
+- ⚠️ WhatsApp не подключён — `app/whatsapp_client.py` написан под Green-API, инстанс не активирован, нужна отдельная SIM
 
 ---
 
@@ -87,15 +96,22 @@ flowchart LR
 - ✅ Транскрипция голоса + извлечение баннера (цены, BR, девелопер)
 - ✅ Приоритизация: `Hight` если агент хвалит, `Low` если Green zone / нет PBG
 - ✅ Дедупликация контактов по базе `Agencies`
-- ✅ **Confirmed gate** → upsert Developer → Project → Units в основные таблицы
+- ✅ **Confirmed gate** → upsert Developer → Project → Units в основные таблицы (автоматически, человеку нужно только поставить галку)
+- ⚠️ Gemini возвращает `confidence` в ответе, но код его нигде не читает — нет метрики качества извлечения, доля записей с ручной правкой не измеряется
+- ⚠️ `Units (Secondary)` — таблица и код `mark_project_units_sold()` есть, но эта функция нигде не вызывается; вторичка сейчас никак не наполняется
+- ✅ **05.08.2026:** ключ юнита для Studio больше не содержит `__0br` — используется явный токен `__studio` (см. §6); 5 живых записей в Test-базе исправлены
 
 ---
 
-### Sync Job — пакетная выгрузка
+### Sync Job — пакетная выгрузка ("сортировщик")
 **Файл:** `app/sync_job.py` · **Порт:** 48213
 
-- ✅ PostgreSQL `pending` → Airtable через fuzzy match + upsert
+- ✅ PostgreSQL `pending` → Airtable через fuzzy match (Projects/Developer, >85%) + точное совпадение по `Key` (Units), затем upsert
 - ✅ Retry до 3 раз, `DRY_RUN` режим
+- ✅ **05.08.2026, было P0:** `DRY_RUN` раньше помечал записи `synced`, хотя реально в Airtable ничего не уходило — данные тихо терялись из очереди. Теперь при DRY_RUN запись валидируется и остаётся `pending`
+- ✅ **05.08.2026, было P1:** атомарный захват `FOR UPDATE SKIP LOCKED` + отдельное соединение на воркер вместо общего asyncpg-коннекта на `gather()`; файловый мьютекс не даёт запустить два `sync_job.py` параллельно
+- ✅ В Airtable уходят только записи с `needs_human IS FALSE`. Подтвердить запись сейчас можно **только из консоли** (`python -m app.sync_job --approve ID`) — команды в Telegram нет. Временный флаг `MVP_SKIP_HUMAN_REVIEW` (выключен по умолчанию) обходит эту очередь целиком для MVP-этапа
+- ⚠️ `upsert_*` не удаляет записи никогда (весь репозиторий проверен на `.delete(` — совпадений в живом коде нет) и не затирает поля при обновлении (PATCH, не PUT) — но полноценного лога изменений по каждой записи нет: `save_fact()` пишет историю только для изменения цены на Projects, не для Units и не для остальных полей
 
 ---
 
@@ -147,6 +163,7 @@ flowchart LR
 | Модуль | Что делает | ✅/⚠️ |
 |---|---|---|
 | `whatsapp_client.py` | Green-API WhatsApp (НЕ подключён, симуляция) | ⚠️ |
+| `url_safety.py` | SSRF-защита внешних ссылок: allow-list хостов, ручная проверка редиректов, блокировка приватных IP, потоковое чтение с лимитом байт (добавлено 05.08.2026) | ✅ |
 | `access.py` | ACL + 60-мин human-pause | ✅ |
 | `card_generator.py` | TG-пост + PDF-карточка | ✅ |
 | `healthcheck.py` | HTTP :8080 | ✅ |
@@ -169,6 +186,7 @@ flowchart LR
 | `tools_fix_agency_phones.py` | Форматирование +62 в `Agencies` |
 | `tools_fix_developer_phones.py` | Форматирование +62 в `Developer` |
 | `tools_fix_coordinates.py` | lat,lng → lng,lat для карты |
+| `tools_fix_studio_keys.py` | Бэкфилл Key юнитов Studio: `__0br` → `__studio` (05.08.2026, применено к 5 живым записям Test-базы) |
 | `tools_fix_lease_terms.py` | Разделение Lease / Extension / Ownership |
 | `tools_full_migration.py` | Полная миграция между базами |
 | `tools_migrate_bases.py` | Валидированная миграция base→base |
@@ -297,7 +315,10 @@ flowchart LR
 > - `Price from(USD)` — **без пробела** перед скобкой
 > - `Area from (m²)` — **Unicode `m²`**, не `m2`
 > - `Link to Developer's Kit` — **curly apostrophe `'`**, не прямой `'`
-> - `Projects.District` ≠ `Units.Area` — разные списки выбора!
+> - `Projects.District` ≠ `Units.Area` — разные списки выбора! (`Units.Area` — lookup из связанной таблицы, не обычный select)
+> - Координаты: полевой бот пишет `"lat, lng"` (широта первой — так их отдаёт Telegram), карта в `Coordinates(for Map)` ждёт `"lng, lat"`. Конвертация уже сделана правильно — `swap_coordinates()` в `app/naming.py`, вызывается при переносе в Projects (`field_processor.py`). Отдельный `tools_fix_coordinates.py` — разовый инструмент для уже накопившихся плохих записей, не часть live-пайплайна
+> - Ключ юнита (`Key`) для Studio — **исправлено 05.08.2026**: раньше всегда `__0br` (Bedrooms у Studio не заполняется), теперь `__studio`. Остальные типы юнитов без указанных спален по-прежнему получают `__0br` — это сознательно не менялось, отдельная конвенция для "число спален не заполнено" не введена
+> - `Projects` содержит **два** поля с именем «Units copy» (один `singleLineText` — похоже на мусорный дубль, второй `multipleRecordLinks` → `Units (Secondary)` — недопереименованная ссылка на вторичку). Ни одно, ни другое код не трогает
 
 ---
 
@@ -310,22 +331,29 @@ flowchart LR
 | 1 | **E3 — Вопросы агентам** | Собрать пустые поля → сформировать вопрос → отправить в TG/WA → напоминания 1/3/7 дн | Нет кода |
 | 2 | **E4 — Ответы → поля** | Парсить ответы агентов и заполнять Airtable | Нет кода |
 | 3 | **WhatsApp канал** | `whatsapp_client.py` написан, но Green-API инстанс **не активирован** | Нужна SIM |
+| 4 | **Human review UI** | Подтверждение находок listener'а возможно только консольной командой (`sync_job.py --approve ID`), Telegram-команды нет. На MVP-этапе обходится флагом `MVP_SKIP_HUMAN_REVIEW` | Нет UI |
 
 ### Важные (улучшение качества)
 
 | # | Задача | Описание |
 |---|---|---|
-| 4 | **E5 — Карточка в тред** | Готовая карточка проекта в тред TG при полном заполнении |
-| 5 | **Notion bare-link** | `domain.notion.site/?pvs=73` без UUID — Playwright fallback |
-| 6 | **Dual-model для сканов** | PDF без текстового слоя → двойная верификация моделями |
-| 7 | **Docker/asyncpg локально** | PG-слой не работает на текущей машине (нет Docker/asyncpg) |
+| 5 | **E5 — Карточка в тред** | Готовая карточка проекта в тред TG при полном заполнении |
+| 6 | **Notion bare-link** | `domain.notion.site/?pvs=73` без UUID — Playwright fallback |
+| 7 | **Dual-model для сканов** | PDF без текстового слоя → двойная верификация моделями |
+| 8 | **Confidence не читается** | Gemini возвращает `confidence` для находок Field Staging, `field_processor.py` его не сохраняет — метрики качества извлечения нет |
+| 9 | **Units (Secondary) не наполняется** | `mark_project_units_sold()` есть в коде, но нигде не вызывается |
+| 10 | **XLSX-вложения не парсятся** | Только Google Sheets по ссылке; прикреплённый .xlsx-файл текст не извлекает |
+| 11 | **История чата — не инкрементальная** | Каждый рестарт listener'а перечитывает последние N сообщений заново, нет сохранённого "докуда долистали" |
 
 ### Housekeeping
 
 | # | Задача | Описание |
 |---|---|---|
-| 8 | **7 осиротевших проектов** | Alaya Residences, Seven Oceans, The Heights, UV, CASA OASIS, LASALAHORA, Rent Hub — без Developer |
-| 9 | **PROD-синхронизация** | Test base `appsAbRs7DnYYWFt6` → Prod `app2IEMPr6R3GelVP` финальная миграция |
+| 12 | **7 осиротевших проектов** | Alaya Residences, Seven Oceans, The Heights, UV, CASA OASIS, LASALAHORA, Rent Hub — без Developer |
+| 13 | **PROD-синхронизация** | Test base `appsAbRs7DnYYWFt6` → Prod `app2IEMPr6R3GelVP` — финальная миграция, конкретного плана (что переносим/чистим) ещё нет |
+| 14 | **Projects: два поля «Units copy»** | Один похоже на мусорный текстовый дубль, второй — недопереименованная ссылка на Units (Secondary) |
+| 15 | **~100 некоммиченных файлов в корне репо** | Разовый пайплайн дедупа Developer/Projects (сессия Antigravity, 01-03.08.2026) уже применён к живой базе и подтверждён завершённым, но сами файлы/скрипты никуда не сведены |
+| 16 | **133 проекта без юнитов, заполненность &lt;65%** | Диагностика найдена (`underfilled_v2.json`), не обработана; 13 девелоперов с именем = имени проекта (`suspicious_devs.json`), тоже не обработано |
 
 ---
 
@@ -339,9 +367,11 @@ flowchart LR
 
 ---
 
-## 9. Тесты — 647 passed
+## 9. Тесты — 784 passed (обновлено 05.08.2026)
 
-Покрыты: wiring, live schema sync, Notion API, Drive folder/mirror, field extraction, citation validation, contact matching, dedup, single instance, staging FSM, doc pipeline, doc router.
+Покрыты: wiring, live schema sync, Notion API, Drive folder/mirror, field extraction, citation validation, contact matching, dedup, single instance, staging FSM, doc pipeline, doc router, а также (добавлено 05.08.2026) ingress security / SSRF, атомарность sync_job, deployment config, healthcheck-алерты на переходах.
+
+`docker build --target test` собирается и реально прогонялся вживую: 769 passed, 7 skipped внутри образа без единого секрета (7 пропущенных — тесты, которые намеренно ходят в живой Airtable/схему, помечены `skipif` без `AIRTABLE_TOKEN`).
 
 ```bash
 python -m pytest tests/ -q          # Все тесты

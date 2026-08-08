@@ -8,8 +8,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.doc_pipeline import (
     GAPS_SECTION_START,
+    _readable_csv,
+    collect_project_links,
+    combine_findings,
     empty_required_fields,
     fill_fields_from_drive_files,
+    fill_project_fields_from_text,
     format_findings_block,
     merge_into_gaps,
     save_findings_to_gaps,
@@ -166,6 +170,30 @@ class TestPipelineWiring(unittest.TestCase):
         self.assertEqual(res["_calls"], [])
         self.assertEqual(res["opened"], 0)
 
+    def test_exclude_fields_are_not_searched_in_drive_documents(self):
+        """
+        Владелец, 02.08.2026: «шахматка сканируется первой... в других
+        материалах ищем то, чего нет, и не смотрим туда, где не найдём то,
+        что нужно». District уже закрыт шахматкой (exclude_fields) - документ,
+        закрывающий ТОЛЬКО District, не должен открываться вовсе.
+        """
+        async def run_test():
+            with patch('app.drive_folder.download_drive_file', return_value=True), \
+                 patch('app.doc_pipeline._extract_text', new=AsyncMock(return_value="text")), \
+                 patch('app.doc_pipeline.extract_field',
+                       new=AsyncMock(side_effect=lambda t, f: _accepted(f))) as mock_extract:
+                res = await fill_fields_from_drive_files(
+                    _only_empty("District", "Handover Permits"),
+                    [_f("location map.pdf")],  # doc_router: 'location' -> {District, Location Link}
+                    exclude_fields={"District"},
+                )
+                res["_calls"] = [c.args[1] for c in mock_extract.await_args_list]
+                return res
+
+        res = asyncio.run(run_test())
+        self.assertEqual(res["_calls"], [], "файл закрывает только District - открывать незачем")
+        self.assertEqual(res["opened"], 0)
+
 
 def _only_empty(*empty_keys):
     """
@@ -284,6 +312,132 @@ class TestUnknownFileClassificationFallback(unittest.TestCase):
         self.assertEqual(res["_save_args"], [], "без file_id сохранять некуда")
 
 
+class TestCollectProjectLinks(unittest.TestCase):
+    """Порядок обработки ссылок карточки и защита от повторов одного URL."""
+
+    SHEET = "https://docs.google.com/spreadsheets/d/abc123/edit?gid=0#gid=0"
+    FOLDER = "https://drive.google.com/drive/folders/xyz789"
+
+    def test_sheet_is_processed_before_documents(self):
+        """Владелец, 02.08.2026: шахматка - первый приоритет на сканирование."""
+        links = collect_project_links({
+            "Link to Developer’s Kit (Eng)": self.FOLDER,
+            "Availability Chart": self.SHEET,
+        })
+        self.assertEqual([u for _, u in links], [self.SHEET, self.FOLDER])
+
+    def test_same_url_in_two_fields_is_processed_once(self):
+        """
+        Регрессия 02.08.2026: у Mangata одна таблица указана и в DevKit (Rus),
+        и в Availability Chart - извлечение полей отрабатывало по ней дважды и
+        клало в Gaps два одинаковых предложения Land Zoning Color.
+        """
+        links = collect_project_links({
+            "Link to Developer’s Kit (Rus)": self.SHEET,
+            "Availability Chart": self.SHEET,
+            "Link to Developer’s Kit (Eng)": self.FOLDER,
+        })
+        self.assertEqual([u for _, u in links], [self.SHEET, self.FOLDER])
+
+    def test_non_http_and_empty_values_are_ignored(self):
+        links = collect_project_links({
+            "Link to Developer’s Kit (Rus)": "resale",
+            "Availability Chart": "",
+            "Link to Developer’s Kit (Eng)": self.FOLDER,
+        })
+        self.assertEqual([u for _, u in links], [self.FOLDER])
+
+
+class TestFillProjectFieldsFromText(unittest.TestCase):
+    """
+    Владелец, 02.08.2026: «шахматка - первый приоритет на сканирование, из неё
+    заполняется та часть полей, которую можно». Один текстовый источник целиком,
+    без роутера и бюджета - в отличие от fill_fields_from_drive_files.
+    """
+
+    def _run(self, project_fields, text, extract_side_effect):
+        async def run_test():
+            with patch('app.doc_pipeline.extract_field',
+                       new=AsyncMock(side_effect=extract_side_effect)) as mock_extract:
+                res = await fill_project_fields_from_text(project_fields, text, "шахматка")
+                res["_calls"] = sorted(c.args[1] for c in mock_extract.await_args_list)
+                return res
+
+        return asyncio.run(run_test())
+
+    def test_asks_only_about_empty_fields(self):
+        res = self._run(
+            _only_empty("District", "Handover Date"),
+            "Sanur, delivery July 2026",
+            lambda t, f: _accepted(f, "Sanur" if f == "District" else "July 2026"),
+        )
+        self.assertEqual(res["_calls"], ["District", "Handover Date"])
+        self.assertEqual(len(res["proposals"]), 2)
+        self.assertEqual(res["opened"], 1)
+
+    def test_accepted_and_rejected_fields_both_labelled(self):
+        res = self._run(
+            _only_empty("District", "Construction stage"),
+            "table content",
+            lambda t, f: _accepted(f) if f == "District" else _rejected(f),
+        )
+        self.assertEqual(len(res["proposals"]), 1)
+        self.assertEqual(res["proposals"][0]["field"], "District")
+        self.assertTrue(any("Construction stage" in g for g in res["gaps"]))
+
+    def test_nothing_empty_means_no_model_call(self):
+        from app.gaps import REQUIRED_PROJECT_FIELDS
+        full = {k: "filled" for k in REQUIRED_PROJECT_FIELDS}
+        res = self._run(full, "irrelevant text", lambda t, f: _accepted(f))
+        self.assertEqual(res["_calls"], [])
+        self.assertEqual(res["opened"], 0)
+
+    def test_empty_text_means_no_model_call(self):
+        res = self._run(_only_empty("District"), "   ", lambda t, f: _accepted(f))
+        self.assertEqual(res["_calls"], [])
+        self.assertEqual(res["opened"], 0)
+
+    def test_proposal_carries_the_sheet_as_source(self):
+        res = self._run(
+            _only_empty("District"), "Sanur", lambda t, f: _accepted(f, "Sanur")
+        )
+        self.assertEqual(res["proposals"][0]["source_file"], "шахматка")
+
+    def test_csv_gaps_are_readable_when_shown_to_model(self):
+        """
+        Регрессия 03.08.2026: CSV-текст шахматки шёл в модель как есть, и
+        дословные цитаты выглядели как «Sanur,,Available units» - технически
+        верно, но нечитаемо человеку, подтверждающему предложение.
+        """
+        seen_text = {}
+
+        def capture(t, f):
+            seen_text["text"] = t
+            return _accepted(f, "Sanur")
+
+        self._run(_only_empty("District"), "Sanur,,Available units", capture)
+        self.assertNotIn(",,", seen_text["text"])
+        self.assertIn("Sanur | Available units", seen_text["text"])
+
+
+class TestReadableCsv(unittest.TestCase):
+
+    def test_collapses_empty_cell_commas(self):
+        self.assertEqual(_readable_csv("Sanur,,Available units"), "Sanur | Available units")
+        self.assertEqual(
+            _readable_csv("Land color,,,,Red,,Trades & services city area"),
+            "Land color | Red | Trades & services city area",
+        )
+
+    def test_single_comma_in_prose_is_untouched(self):
+        prose = "The lease period is 35 years, starting 2023."
+        self.assertEqual(_readable_csv(prose), prose)
+
+    def test_none_and_empty_are_safe(self):
+        self.assertEqual(_readable_csv(""), "")
+        self.assertEqual(_readable_csv(None), "")
+
+
 class TestGapsMerging(unittest.TestCase):
     """
     В Gaps уже лежат рукописные разборы (у Four Palms - отчёт с номерами
@@ -338,6 +492,88 @@ class TestGapsMerging(unittest.TestCase):
         block = format_findings_block({"proposals": [], "gaps": [], "opened": 0})
         self.assertIn("не дал ни предложений", block)
 
+    def test_accepts_result_shape_from_process_generic_link(self):
+        """
+        Регрессия 02.08.2026: пакетный прогон отдаёт СЫРОЙ результат
+        process_generic_link, где разбор лежит внутри 'doc_findings', а gaps
+        уже домержены на верхний уровень. Писатель читал только верхний
+        уровень, поэтому proposals превращались в [], а opened - в 0:
+        46 карточек получили секцию AUTO без единого предложения.
+        """
+        docs = self._summary()
+        outer = {
+            "doc_findings": docs,
+            "gaps": list(docs["gaps"]),          # link_fetcher домерживает их сюда
+            "drive_mirror": {"dest_folder_id": "folder_1", "results": []},
+        }
+        block = format_findings_block(outer)
+
+        self.assertIn("Handover Permits = PBG", block)
+        self.assertIn("ПРЕДЛОЖЕНО", block)
+        self.assertIn("(открыто документов: 1)", block)
+        self.assertNotIn("не дал ни предложений", block)
+
+    def test_flat_shape_still_works(self):
+        """Плоскую форму run_for_project() ломать нельзя."""
+        block = format_findings_block(self._summary())
+        self.assertIn("Handover Permits = PBG", block)
+        self.assertIn("(открыто документов: 1)", block)
+
+
+class TestCombineFindings(unittest.TestCase):
+    """
+    Регрессия 02.08.2026 на Mangata: проект закрыт двумя ссылками (папка Drive
+    с находками + таблица без doc_findings). save_findings_to_gaps по разу на
+    ссылку означало, что вторая запись стирала находки первой - "открыто
+    документов: 5" из папки исчезало без следа. Пакетные скрипты обязаны
+    собрать результаты всех ссылок и записать один раз этой сводкой.
+    """
+
+    def test_merges_proposals_and_sums_opened_across_links(self):
+        drive_folder_result = {
+            "doc_findings": {
+                "proposals": [{"field": "District", "value": "Sanur", "citation": "ok",
+                               "quotes": [], "needs_human": False, "source_file": "brochure.pdf"}],
+                "gaps": ["Handover Date: not stated"],
+                "opened": 5,
+            },
+            "gaps": ["Handover Date: not stated"],
+            "drive_mirror": {"dest_folder_id": "folder_1", "results": []},
+        }
+        sheet_result = {"gaps": [], "proposals": [], "opened": 0}
+
+        combined = combine_findings([drive_folder_result, sheet_result])
+
+        self.assertEqual(len(combined["proposals"]), 1)
+        self.assertEqual(combined["proposals"][0]["field"], "District")
+        self.assertEqual(combined["opened"], 5)
+        self.assertEqual(combined["gaps"], ["Handover Date: not stated"])
+
+    def test_deduplicates_identical_gaps_from_different_links(self):
+        a = {"proposals": [], "gaps": ["Land Zoning Color: not stated"], "opened": 1}
+        b = {"proposals": [], "gaps": ["Land Zoning Color: not stated"], "opened": 2}
+
+        combined = combine_findings([a, b])
+
+        self.assertEqual(combined["gaps"], ["Land Zoning Color: not stated"])
+        self.assertEqual(combined["opened"], 3)
+
+    def test_empty_results_list_is_safe(self):
+        combined = combine_findings([])
+        self.assertEqual(combined["proposals"], [])
+        self.assertEqual(combined["opened"], 0)
+
+    def test_first_source_wins_for_mirror_fields(self):
+        a = {"drive_mirror": {"dest_folder_id": "folder_A", "results": []}}
+        b = {"drive_mirror": {"dest_folder_id": "folder_B", "results": []}}
+
+        combined = combine_findings([a, b])
+
+        self.assertEqual(
+            combined["mirror_airtable_fields"].get("Renders"),
+            "https://drive.google.com/drive/folders/folder_A",
+        )
+
 
 class TestGapsWriteSafety(unittest.TestCase):
 
@@ -357,7 +593,7 @@ class TestGapsWriteSafety(unittest.TestCase):
                 return FakeTable()
 
         async def run_test():
-            with patch('app.airtable_client.get_base', return_value=FakeBase()):
+            with patch('app.airtable_client.get_table', return_value=FakeTable()):
                 return await save_findings_to_gaps("rec1", {
                     "proposals": [{"field": "District", "value": "Badung", "citation": "ok",
                                    "quotes": [], "needs_human": False, "source_file": "x.pdf"}],

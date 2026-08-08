@@ -12,10 +12,10 @@ if sys.platform == 'win32':
         except Exception:
             pass
 
+import asyncio
 import time
 import logging
 from dotenv import load_dotenv
-from pyairtable import Api
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 import glob
@@ -32,10 +32,12 @@ except ImportError:
     folium = None
 
 from app.access import describe_user, is_allowed
-from app.airtable_client import field_exists
+from app.airtable_client import field_exists, get_table
 from app.single_instance import acquire
 
-load_dotenv(override=True)
+# Preserve deployment-provided credentials and base selection.  A local .env
+# file is a development default, never an authority over the runtime.
+load_dotenv(override=False)
 
 # Настройки логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -48,10 +50,12 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('telegram.ext.Updater').setLevel(logging.WARNING)
 
-# Airtable
-airtable_api = Api(os.environ.get('AIRTABLE_TOKEN'))
-base = airtable_api.base(os.environ.get('AIRTABLE_BASE_ID'))
-staging_table = base.table('Field Staging')
+def _staging_table():
+    """Use the Airtable table ID resolved from metadata, never a display name."""
+    table = get_table("Field Staging")
+    if table is None:
+        raise RuntimeError("Field Staging table ID is unavailable from Airtable metadata")
+    return table
 
 # In-memory хранилище для сбора данных "в поле"
 # Структура: {chat_id: {'photos': [], 'audios': [], 'location': 'lat, lng'}}
@@ -158,12 +162,15 @@ async def save_finding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fields['Telegram Chat ID'] = str(chat_id)
         
     try:
-        await asyncio.to_thread(staging_table.create, fields)
+        await asyncio.to_thread(_staging_table().create, fields)
         # Очищаем сессию
         sessions[chat_id] = {'photos': [], 'audios': [], 'location': None}
         await update.message.reply_text("🎉 Успешно сохранено в Field Staging! Можно ехать к следующему билборду.", reply_markup=KEYBOARD)
     except Exception as e:
-        logger.error(f"Ошибка Airtable: {e}")
+        # exc_info обязателен: без трейсбека сообщение "Ошибка Airtable" врёт про
+        # источник сбоя. Так отсутствие `import asyncio` полгода выглядело отказом
+        # Airtable, хотя запрос до сети не доходил вообще (найдено 07.08.2026).
+        logger.error("Не удалось сохранить находку в Field Staging: %s", e, exc_info=True)
         await update.message.reply_text(f"❌ Ошибка при сохранении в Airtable: {e}", reply_markup=KEYBOARD)
 
 async def handle_gpx(update: Update, context: ContextTypes.DEFAULT_TYPE):

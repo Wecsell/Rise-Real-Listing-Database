@@ -111,5 +111,45 @@ class TestOversizePdfFallback(unittest.TestCase):
             os.remove(path)
 
 
+class TestTextExtractionBackends(unittest.TestCase):
+    """
+    PyMuPDF - основной экстрактор, pypdf - запасной. Замер 03.08.2026 на
+    реальной презентации Mangata: pypdf рвал разрядку шрифта ("ПРОГРЕ СС
+    ~8 3%" вместо "ПРОГРЕСС ~83%"), из-за чего стадия готовности не
+    находилась, а найденные значения не проходили сверку цитат.
+    """
+
+    def test_pymupdf_is_used_first(self):
+        with patch.object(doc_parser, '_pages_via_pymupdf', return_value=["целый текст"]) as mupdf, \
+             patch.object(doc_parser, '_pages_via_pypdf', return_value=["рва ный те кст"]) as pypdf_mock:
+            out = doc_parser.extract_text_from_pdf("любой.pdf")
+
+        mupdf.assert_called_once()
+        pypdf_mock.assert_not_called()
+        self.assertIn("целый текст", out)
+        self.assertIn("--- Страница 1 ---", out)
+
+    def test_falls_back_to_pypdf_when_pymupdf_unavailable(self):
+        """Отсутствие PyMuPDF не должно терять документ целиком."""
+        with patch.object(doc_parser, '_pages_via_pymupdf', side_effect=ImportError("no fitz")), \
+             patch.object(doc_parser, '_pages_via_pypdf', return_value=["запасной текст"]):
+            out = doc_parser.extract_text_from_pdf("любой.pdf")
+
+        self.assertIn("запасной текст", out)
+
+    def test_both_backends_failing_returns_empty_not_raises(self):
+        with patch.object(doc_parser, '_pages_via_pymupdf', side_effect=RuntimeError("broken")), \
+             patch.object(doc_parser, '_pages_via_pypdf', side_effect=RuntimeError("broken too")):
+            self.assertEqual(doc_parser.extract_text_from_pdf("любой.pdf"), "")
+
+    def test_blank_pages_are_not_numbered_into_output(self):
+        with patch.object(doc_parser, '_pages_via_pymupdf', return_value=["первая", "   ", "третья"]):
+            out = doc_parser.extract_text_from_pdf("любой.pdf")
+
+        self.assertIn("--- Страница 1 ---", out)
+        self.assertNotIn("--- Страница 2 ---", out)
+        self.assertIn("--- Страница 3 ---", out)
+
+
 if __name__ == '__main__':
     unittest.main()

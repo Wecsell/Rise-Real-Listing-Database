@@ -1,7 +1,9 @@
 import unittest
 import asyncio
+import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from unittest.mock import patch, AsyncMock, MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -18,7 +20,39 @@ from app.link_fetcher import (
     fetch_notion_content,
     _notion_rich_text_to_text_and_links,
     _walk_notion_blocks,
+    _normalise_sheet_availability,
+    _sheet_payload_for_sync,
 )
+
+
+def _fake_response(payload_bytes, status_code=200, url="https://x.notion.site/slug", headers=None):
+    """Build a minimal stand-in for the httpx.Response yielded by stream_safe_url."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.url = url
+    resp.headers = headers or {}
+
+    async def aiter_bytes():
+        yield payload_bytes
+
+    resp.aiter_bytes = aiter_bytes
+    return resp
+
+
+def _fake_stream_safe_url(response_factory):
+    """Replace app.link_fetcher.stream_safe_url with a network-free stub.
+
+    ``response_factory(url, method, json_body)`` returns the fake response for
+    that call; tests only fake the transport, not the allow-list/redirect
+    logic, which is covered separately by tests/test_ingress_security.py.
+    """
+
+    @asynccontextmanager
+    async def _stub(url, *, method="GET", json_body=None, headers=None, timeout=20.0,
+                     allowed_hosts=None, max_redirects=5, client=None):
+        yield response_factory(url, method, json_body)
+
+    return _stub
 
 
 class TestLinkFetcher(unittest.TestCase):
@@ -625,27 +659,14 @@ class TestFetchNotionContentPagination(unittest.TestCase):
 
             call_log = []
 
-            class FakeResponse:
-                def __init__(self, payload):
-                    self.status_code = 200
-                    self._payload = payload
-                def json(self):
-                    return self._payload
+            payloads = [first_response, second_response, third_response_empty]
 
-            class FakeAsyncClient:
-                async def __aenter__(self):
-                    return self
-                async def __aexit__(self, *a):
-                    return False
-                async def post(self, url, json=None):
-                    call_log.append(json)
-                    if len(call_log) == 1:
-                        return FakeResponse(first_response)
-                    if len(call_log) == 2:
-                        return FakeResponse(second_response)
-                    return FakeResponse(third_response_empty)
+            def _response_factory(url, method, json_body):
+                call_log.append(json_body)
+                idx = min(len(call_log) - 1, len(payloads) - 1)
+                return _fake_response(json.dumps(payloads[idx]).encode("utf-8"))
 
-            with patch('app.link_fetcher.httpx.AsyncClient', return_value=FakeAsyncClient()):
+            with patch('app.link_fetcher.stream_safe_url', _fake_stream_safe_url(_response_factory)):
                 text, nested, is_private = await fetch_notion_content(
                     f"https://fourpalmsvillaskedungu.notion.site/Four-Palms-{self.ROOT_ID.replace('-', '')}"
                 )
@@ -725,12 +746,8 @@ class TestNotionPageIdFromHtml(unittest.TestCase):
 
     def _run_with_html(self, html, status=200):
         async def run_test():
-            fake_res = MagicMock(status_code=status, text=html)
-            fake_client = MagicMock()
-            fake_client.get = AsyncMock(return_value=fake_res)
-            fake_client.__aenter__ = AsyncMock(return_value=fake_client)
-            fake_client.__aexit__ = AsyncMock(return_value=False)
-            with patch('httpx.AsyncClient', return_value=fake_client):
+            response = _fake_response(html.encode("utf-8"), status_code=status)
+            with patch('app.link_fetcher.stream_safe_url', _fake_stream_safe_url(lambda *a: response)):
                 return await resolve_notion_page_id_from_html("https://x.notion.site/slug")
 
         return asyncio.run(run_test())
@@ -784,6 +801,52 @@ class TestAllNestedNotionLinksAreVisited(unittest.TestCase):
                 self.assertIn(url, visited, f"{url} не был посещён - действует ли ещё break?")
 
         asyncio.run(run_test())
+
+
+class TestSheetAvailabilityNormalisation(unittest.TestCase):
+    """
+    Регрессия 05.08.2026 (живой тест на шахматке K-Village, 36 юнитов):
+    'Blocked' - валидная опция базы, но нормализатор её не узнавал; 'Resale'
+    в базе вообще нет, юнит всё ещё реально продаётся (владелец, кейс
+    Villa 12A), но статус тихо терялся вместо явной пометки.
+    """
+
+    def test_blocked_maps_to_the_live_select_option(self):
+        self.assertEqual(_normalise_sheet_availability('Blocked'), 'Blocked')
+        self.assertEqual(_normalise_sheet_availability('blocked'), 'Blocked')
+
+    def test_resale_maps_to_on_sale(self):
+        self.assertEqual(_normalise_sheet_availability('Resale'), 'On sale')
+
+    def test_sold_and_on_sale_still_work(self):
+        self.assertEqual(_normalise_sheet_availability('Sold'), 'Sold')
+        self.assertEqual(_normalise_sheet_availability('On sale'), 'On sale')
+
+    def test_unrecognised_status_still_returns_none(self):
+        self.assertIsNone(_normalise_sheet_availability('Held for negotiation'))
+
+    def test_resale_unit_keeps_its_origin_visible_in_gaps(self):
+        """Обновляем Availability, но не тихо - происхождение остаётся в Gaps."""
+        parsed_sheet = {
+            'project_name': 'K-Village',
+            'units': [
+                {'unit_id': '1BR Villa 12A', 'status': 'Resale',
+                 'area_sqm': 86, 'price_usd': 245000},
+            ],
+        }
+        payload, _, gaps = _sheet_payload_for_sync(parsed_sheet, 'K-Village')
+        unit = payload['Units'][0]
+        self.assertEqual(unit['Availability'], 'On sale')
+        self.assertTrue(any('resale' in g.lower() for g in gaps))
+
+    def test_blocked_unit_produces_no_gap(self):
+        parsed_sheet = {
+            'project_name': 'K-Village',
+            'units': [{'unit_id': '1BR Villa 15A', 'status': 'Blocked'}],
+        }
+        payload, _, gaps = _sheet_payload_for_sync(parsed_sheet, 'K-Village')
+        self.assertEqual(payload['Units'][0]['Availability'], 'Blocked')
+        self.assertEqual(gaps, [])
 
 
 if __name__ == '__main__':

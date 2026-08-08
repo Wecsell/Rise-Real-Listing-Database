@@ -129,3 +129,27 @@ class TestPlaceholdersNeverMatch:
 
     def test_two_real_names_are_allowed(self):
         assert placeholders_never_match('Leo Villas', 'Lumea Villas') is False
+
+
+class TestNumericBrandIsNotPlaceholder:
+    """
+    Имя, начинающееся с числа, — бренд, а не описание.
+
+    Регресс 08.08.2026: застройщик «618» (618 Development, кластер Nuanu)
+    попадал под общее правило «цифры несодержательны» и подменялся заглушкой
+    'Unknown N'. Его проекты разъехались по двум пустым карточкам — Flower
+    Estates оказался под 'Unknown 10', Luna Residences под 'Unknown 13'.
+    """
+
+    def test_numeric_brand_is_kept(self):
+        assert is_placeholder_name('618') is False
+        assert is_placeholder_name('618 Development') is False
+
+    def test_ordinal_after_generic_word_is_still_placeholder(self):
+        """Число ПОСЛЕ родового слова остаётся порядковым номером."""
+        assert is_placeholder_name('вилла 3') is True
+        assert is_placeholder_name('unit 12') is True
+        assert is_placeholder_name('Villa') is True
+
+    def test_single_digit_is_not_a_brand(self):
+        assert is_placeholder_name('7') is True

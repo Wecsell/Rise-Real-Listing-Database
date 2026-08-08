@@ -10,10 +10,12 @@
 1. Выкачивает содержимое ссылки (Notion API, Google Sheets CSV, Drive folder, PDF).
 2. Анализирует документ с помощью Gemini под пропуски полей (Gaps).
 3. Зеркалирует рендеры на личный Google Drive (если настроен).
-4. Записывает блок предложений и отзеркалированные ссылки в карточку проекта в Airtable (`Gaps`, `Img`, `Link to Developer’s Kit (Rus)`).
+4. Записывает блок предложений в `Gaps` и обложку в `Img`. Ссылка застройщика
+   (`Link to Developer’s Kit`) не перезаписывается: адрес зеркала уходит текстом
+   в секцию Gaps, отдельного поля под него в Projects нет.
 
 Запуск:
-    python tools_batch_process_links.py                   # По умолчанию dry-run / лимит 5
+    python tools_batch_process_links.py                   # dry-run, без записи и без зеркалирования
     python tools_batch_process_links.py --apply --limit 20 # Обработать 20 проектов
     python tools_batch_process_links.py --apply --all      # Обработать ВСЕ 125 проектов
     python tools_batch_process_links.py --project "Mangata" # Только для одного проекта
@@ -30,8 +32,8 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(override=True)
 
-from app.link_fetcher import process_generic_link
-from app.doc_pipeline import save_findings_to_gaps
+from app.link_fetcher import extract_gsheet_id, process_generic_link
+from app.doc_pipeline import collect_project_links, combine_findings, save_findings_to_gaps
 import app.airtable_client as ac
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -42,35 +44,67 @@ async def process_project_links(project_record: Dict[str, Any], apply: bool = Tr
     fields = project_record.get('fields', {})
     project_name = fields.get('Project Name', 'Unknown')
     
-    links = []
-    for k in ['Link to Developer’s Kit (Rus)', 'Link to Developer’s Kit (Eng)', 'Availability Chart']:
-        val = fields.get(k)
-        if val and str(val).strip().startswith('http'):
-            links.append((k, str(val).strip()))
-            
-    if not links:
+    # Порядок (шахматки первыми) и дедуп по URL - в collect_project_links.
+    ordered_links = collect_project_links(fields)
+    if not ordered_links:
         return False
-        
-    logger.info(f"🚀 Обработка проекта '{project_name}' ({len(links)} ссылок)")
-    
-    any_updated = False
-    for field_name, url in links:
+
+    sheet_count = sum(1 for _, u in ordered_links if extract_gsheet_id(u))
+    logger.info(
+        f"🚀 Обработка проекта '{project_name}' ({len(ordered_links)} ссылок, "
+        f"{sheet_count} шахматок)"
+    )
+
+    # Копим результаты ВСЕХ ссылок и пишем в Gaps ОДИН раз в конце: запись
+    # заменяет секцию бота целиком, и запись по разу на ссылку означала, что в
+    # Gaps оставались только находки последней ссылки - находки по остальным
+    # молча стирались (Mangata, 02.08.2026: 5 открытых документов пропали,
+    # когда следом обработалась ссылка на таблицу).
+    results = []
+    already_found: set = set()
+    for field_name, url in ordered_links:
         try:
             logger.info(f"   ➜ [{field_name}]: {url}")
-            res = await process_generic_link(url, project_name=project_name)
-            
+            # project_name включает зеркалирование файлов на личный Drive внутри
+            # process_generic_link. Без apply это была бы запись мимо "сухого"
+            # прогона: копии гигабайтов уезжали на Drive при формально dry-run.
+            res = await process_generic_link(
+                url,
+                project_name=project_name if apply else None,
+                exclude_fields=already_found if apply else None,
+            )
+            results.append(res)
+
+            # Поля, закрытые уже обработанными ссылками (в первую очередь -
+            # шахматкой), исключаем из поиска в следующих ссылках того же
+            # проекта: "не смотрим туда, где не найдём то, что нужно".
             if apply:
-                saved = await save_findings_to_gaps(rec_id, res)
-                if saved:
-                    any_updated = True
-                    logger.info(f"   ✅ Записано в Airtable для '{project_name}'")
-            else:
+                closed = combine_findings([res])
+                already_found |= {p["field"] for p in closed["proposals"]}
+
+            if not apply:
                 findings_count = len(res.get("doc_findings", {}).get("proposals", [])) if res.get("doc_findings") else 0
                 logger.info(f"   [DRY-RUN] Найдено предложений: {findings_count}")
         except Exception as e:
             logger.error(f"   ❌ Ошибка при обработке {url}: {e}")
-            
-    return any_updated
+
+    if not apply or not results:
+        return False
+
+    combined = combine_findings(results)
+    # save_findings_to_gaps возвращает False и тогда, когда писать было нечего:
+    # промежуточная запись run_for_project (внутри process_generic_link) уже
+    # содержала тот же текст. Это не сбой - считаем проект обработанным, если
+    # разбор дал хоть что-то (opened/proposals), независимо от факта записи.
+    saved = await save_findings_to_gaps(rec_id, combined)
+    processed = saved or combined["opened"] > 0 or combined["proposals"]
+    if processed:
+        logger.info(
+            f"   ✅ Обработано '{project_name}' "
+            f"(предложений: {len(combined['proposals'])}, открыто документов: {combined['opened']}, "
+            f"запись в Airtable: {'да' if saved else 'без изменений'})"
+        )
+    return processed
 
 TARGET_30_PROJECTS = [
     "Aster Apartment", "Mangata", "Umalas Oasis", "Horizon", "Kiara Beachfront",

@@ -13,10 +13,12 @@ import pytest
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.airtable_client import (
+    LAND_ZONING_ALIASES,
     format_drive_link,
     fuzzy_match_developer,
     fuzzy_match_project,
     safe_float,
+    sanitize_land_zoning,
     sanitize_pool,
     sanitize_unit_type,
 )
@@ -144,6 +146,38 @@ class TestChatTitleMatching:
         match, _ = fuzzy_match_developer('Nuanu Development Group', existing)
         assert match is None
 
+    def test_single_common_word_does_not_rename_a_different_company(self):
+        """
+        Регресс 08.08.2026: 'Alpha Villas' сматчился на входящее 'ALPHA
+        DEVELOPMENT GROUP' (0.95), и upsert_developer ПЕРЕПИСАЛ имя
+        существующей записи — это разные компании (alphavillasbali.com в
+        Улувату против alphadevelopment.notion.site в Чангу), общее только
+        слово 'alpha'.
+
+        Причина была в том, что шум вычитался ИЗ ЗАПИСИ: 'villas' у
+        'Alpha Villas' отбрасывалось, оставалось {'alpha'}, и запись
+        «входила» в любое имя с тем же словом. Теперь проверяется вложенность
+        полного имени записи — слова 'villas' в запросе нет, матча нет.
+        """
+        existing = [developer('Alpha Villas')]
+        match, score = fuzzy_match_developer('ALPHA DEVELOPMENT GROUP', existing)
+        assert match is None
+        assert score == 0.0
+
+    def test_short_company_name_still_matches_inside_noisy_title(self):
+        """
+        Обратная сторона того же фикса: настоящие короткие имена (OXO, BREIG,
+        PCE, HQC, IJI) — это всё имя целиком, а не остаток после вычитания
+        шума. Они обязаны находиться в длинном названии чата.
+        """
+        for name, title in (('OXO', 'OXO Living Bali'),
+                            ('BREIG', 'BREIG Development Group'),
+                            ('Tamora Group', 'Tamora Group Bali Official')):
+            existing = [developer(name)]
+            match, score = fuzzy_match_developer(title, existing)
+            assert match is existing[0], f'{name} не найден в {title!r}'
+            assert score >= MATCH_THRESHOLD
+
 
 class TestPhasesNeverMerge:
     """
@@ -204,14 +238,33 @@ class TestUnitType:
     """
     Раньше функция могла вернуть 'Hotel' и 'Hotel room', которых в селекте
     Units.Unit type нет — Airtable отвергал такую запись целиком.
+
+    monkeypatch держит тесты офлайн, тем же способом, что и TestLandZoning
+    ниже: без него sanitize_unit_type ходит в живую базу через
+    get_valid_unit_types(), и тест плывёт при любом дрейфе живой схемы
+    (например, когда 'Mini Villa' стала отдельной опцией 03.08.2026).
     """
+
+    @pytest.fixture(autouse=True)
+    def _offline_schema(self, monkeypatch):
+        import app.airtable_client as ac
+        live_unit_types = [
+            'Villa', 'Apartment', 'Loft', 'Studio', 'Townhouse', 'Penthouse',
+            'Mini Villa', '-', "Developer's stock",
+        ]
+        monkeypatch.setattr(
+            ac, 'get_select_options',
+            lambda table, field, fallback=None: live_unit_types
+        )
 
     @pytest.mark.parametrize("raw,expected", [
         ('Villa', 'Villa'),
         ('villa', 'Villa'),
         ('  Studio  ', 'Studio'),
         ('2BR villa with pool', 'Villa'),
-        ('mini villa', 'Villa'),
+        # 'Mini Villa' — отдельная живая опция Units.Unit type: exact-match
+        # со схемой приоритетнее alias-свёртки к 'Villa', см. sanitize_unit_type().
+        ('mini villa', 'Mini Villa'),
         ('bungalow', 'Villa'),
         ('residence', 'Villa'),
         ('villa 2br', 'Villa'),
@@ -256,6 +309,43 @@ class TestPool:
     @pytest.mark.parametrize("raw", [None, '', 'maybe'])
     def test_unknown_is_dropped(self, raw):
         assert sanitize_pool(raw) is None
+
+
+class TestLandZoning:
+    """
+    Регрессия 03.08.2026: у поля не было sanitize-функции вовсе, в отличие от
+    District/Unit type/Pool - raw-значение модели шло прямо в fields без
+    сверки со списком селекта. Живая опция базы - 'Red/Commercial', её не
+    было ни в промпте gemini_parser.py, ни где-либо в коде. monkeypatch
+    держит тесты офлайн: без него sanitize_land_zoning ходит в живую базу.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _offline_schema(self, monkeypatch):
+        import app.airtable_client as ac
+        monkeypatch.setattr(
+            ac, 'get_select_options',
+            lambda table, field, fallback=None: list(LAND_ZONING_ALIASES.values())
+        )
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('Red/Commercial', 'Red/Commercial'),
+        ('red', 'Red/Commercial'),
+        ('Red', 'Red/Commercial'),
+        ('Commercial', 'Red/Commercial'),
+        ('yellow', 'Tourism/Mixed'),
+        ('pink', 'Tourism/Mixed'),
+        ('Tourism/Mixed', 'Tourism/Mixed'),
+        ('Residential', 'Residential'),
+        ('Brown', 'Brown'),
+        ('Green', 'Green'),
+    ])
+    def test_normalises_to_canonical_form(self, raw, expected):
+        assert sanitize_land_zoning(raw) == expected
+
+    @pytest.mark.parametrize("raw", [None, '', 'purple', 'unknown zone'])
+    def test_unknown_is_dropped_not_written_raw(self, raw):
+        assert sanitize_land_zoning(raw) is None
 
 
 class TestDriveLink:

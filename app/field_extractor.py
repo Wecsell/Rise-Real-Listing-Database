@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from google.genai import types
 
+from app import content_cache
 from app.citations import check_quotes, is_verifiable_source, normalize, BAD, OK, SPLICED
 from app.gemini_parser import client, resolve_model_name
 
@@ -28,6 +29,13 @@ logger = logging.getLogger("FieldExtractor")
 # Уровень T2 из плана: документы, низкий объём вызовов. Единственная модель со
 # 100% на обоих наборах замера и чистыми цитатами. Дороже за токен, но объём мал.
 DOC_MODEL = "gemini-3.5-flash"
+
+# Версия промпта/логики выбора страниц. Бампится при значимой правке
+# SYSTEM_PROMPT, FIELD_QUESTIONS или FIELD_PAGE_KEYWORDS - иначе кэш молча
+# отдавал бы результаты по СТАРОЙ логике (03.08.2026: в один день поправлены
+# и промпт про контекстную цитату, и весь FIELD_PAGE_KEYWORDS для
+# Construction stage - без версии кэш замаскировал бы оба улучшения).
+_PROMPT_VERSION = "2026-08-03a"
 
 # Юридические и рисковые поля модель не заполняет сама (план, п.6): её ответ -
 # только предложение, которое подтверждает человек через Confirmed.
@@ -49,6 +57,9 @@ Rules:
   item in the list. If your answer rests on two documents or two rows, give one quote per source.
 - If the document does not state the answer, set answer to "not stated" and quotes to [].
 - Beware of numbers that appear in a different context than the one asked about.
+- If your answer itself is a single short word (a place name, a number, a status
+  word), ALSO include a second verbatim quote with the surrounding context (a
+  nearby label, heading or sentence) - not just the bare word by itself.
 
 Return strictly this JSON:
 {"answer": "<short answer>", "quotes": ["<verbatim fragment>", "..."], "confidence": <0.0-1.0>}
@@ -211,6 +222,45 @@ async def classify_document_content(text: str, model: str = DOC_MODEL) -> Option
     return doc_type
 
 
+# Ключевые слова для поиска СТРАНИЦЫ, на которой факт может быть написан.
+#
+# Это принципиально не то же самое, что DOC_TYPE_PATTERNS: те опознают документ
+# по ИМЕНИ файла ("PBG", "brochure", "devkit", "presentation") и в тексте
+# брошюры не встречаются почти никогда. Пока страницы скорились ими, выбор
+# вырождался в "первые 2 страницы" для любой презентации.
+#
+# Замер 03.08.2026 на RUS_Mangata residence_2_3BR.pdf: 32 страницы, 10857
+# символов, модели показывалось 366 символов (страницы 1-2, 3.4% документа).
+# Срок сдачи и стадия готовности написаны на странице 12 ("ПРОГРЕСС ~83%
+# ДЕКАБРЬ 2025 Г."), латинское "Sanur" - на 9. Ни один из этих фактов модель
+# не видела ни разу, и все они ушли в Gaps как "not stated in document".
+#
+# ВАЖНО про Construction stage: голый "\d{1,3}\s*%" ловит ЛЮБОЙ процент на
+# странице, а в презентациях процентов много - комиссия УК, заполняемость,
+# ROI. На той же Mångata страница 28 (таблица доходности: 25% комиссии, 80%
+# заполняемость, 11.5% ROI) набирала score=6 против score=1 у настоящей
+# страницы прогресса (только "~83%") - и побеждала. Дошло даже после починки
+# tie-break по файлам: правильный файл открылся, а страница внутри него была
+# выбрана неверно. Слово "прогресс" тоже отсутствовало - в паттерне было
+# только латинское "progress", а в документе кириллица "ПРОГРЕСС".
+FIELD_PAGE_KEYWORDS: Dict[str, str] = {
+    "Lease Term (years)": r"аренд|lease|sewa|leasehold|срок|\byears\b|\bлет\b|hgb|hak\s*pakai",
+    "Ownership Type": r"leasehold|freehold|hak\s*milik|владени|собственност|ownership|аренд",
+    "Land Zoning Color": r"зон|zoning|\bitr\b|\bpkkpr\b|\bkkpr\b|tata\s*ruang|green|yellow|pink|\bred\b|зелён|жёлт",
+    "Handover Permits": r"\bpbg\b|\bslf\b|\bimb\b|simbg|разрешен|permit|izin",
+    "Developer": r"\bpt\b|девелоп|developer|компан|company|застройщик",
+    "Price From (USD)": r"\$|\busd\b|цена|price|harga|стоимост|прайс",
+    "District": r"район|локац|адрес|location|district|\barea\b|расположен|located|situated",
+    "Property Type": r"вилл|villa|апартамент|apartment|townhouse|таунхаус|студи|studio|пентхаус|penthouse|loft",
+    "Construction stage": (
+        r"готовн|стади(?:я|и|ю)?|прогресс|строительств|construction\s*stage|"
+        r"under\s*construction|complet(?:ed|ion)?|off[\s-]*plan|ready\s*to\s*move|сдан[оа]?\b"
+    ),
+    "Handover Date": r"сдач|сдан|delivery|handover|completion|20\d\d|квартал|\bQ[1-4]\b",
+    "Location Link": r"maps\.|goo\.gl|адрес|address|локац|location|координат|coordinates",
+}
+
+
 def select_relevant_pages(text: str, field: str, max_pages: int = 2) -> str:
     """
     Нарезка входа (план, п.4): не отдавать модели 10 страниц. Ищем страницы по
@@ -220,19 +270,16 @@ def select_relevant_pages(text: str, field: str, max_pages: int = 2) -> str:
     заголовком "--- Страница N ---". Если разметки страниц нет (обычный текст),
     возвращаем как есть.
     """
-    from app.doc_router import DOC_TYPE_PATTERNS, DOC_TYPE_TO_FIELDS
-
     pages = re.split(r"(?=--- Страница \d+ ---)", text or "")
     pages = [p for p in pages if p.strip()]
     if len(pages) <= max_pages:
         return text or ""
 
-    patterns = [pat for doc_type, pat in DOC_TYPE_PATTERNS
-                if field in DOC_TYPE_TO_FIELDS.get(doc_type, set())]
-    if not patterns:
+    pattern = FIELD_PAGE_KEYWORDS.get(field)
+    if not pattern:
         return "\n\n".join(pages[:max_pages])
 
-    combined = re.compile("|".join(patterns), re.IGNORECASE)
+    combined = re.compile(pattern, re.IGNORECASE)
     scored = [(len(combined.findall(p)), i, p) for i, p in enumerate(pages)]
     scored.sort(key=lambda t: (-t[0], t[1]))
 
@@ -298,6 +345,12 @@ async def extract_field(
                                 подтверждает человек через Confirmed (план, п.6)
       citation                - 'ok' | 'spliced' | 'bad' | 'n/a'
       quotes, confidence, reason
+
+    Кэшируется по (показанный модели текст, поле, вопрос, модель, версия
+    промпта) - до 03.08.2026 кэша не было вовсе, и повторный прогон одного и
+    того же документа (или ручная отладка вроде "проверить 5 раз подряд")
+    каждый раз был новым оплаченным вызовом, включая нестабильные ответы на
+    ИДЕНТИЧНОМ входе (temperature=0.0 не гарантирует детерминизм у Gemini).
     """
     question = question or question_for(field)
     if not question:
@@ -309,10 +362,19 @@ async def extract_field(
                 "reason": "Gemini API client not initialized"}
 
     source = select_relevant_pages(text, field)
+    used_model = model or resolve_model_name()
+
+    cache_key = content_cache.hash_text(
+        f"{question}{content_cache.SEPARATOR}{source}",
+        context=f"field:{field}:{used_model}:{_PROMPT_VERSION}",
+    )
+    cached = content_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         resp = await client.aio.models.generate_content(
-            model=model or resolve_model_name(),
+            model=used_model,
             contents=f"DOCUMENT:\n{source}\n\nQUESTION: {question}",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -323,6 +385,8 @@ async def extract_field(
         data = _parse_model_json(resp.text)
     except Exception as e:
         logger.error(f"Ошибка извлечения поля {field}: {e}")
+        # Не кэшируется: временный сбой (сеть, лимит) не должен залипать на
+        # CACHE_TTL_DAYS - на следующий прогон стоит попробовать снова.
         return {"field": field, "value": None, "accepted": False, "reason": str(e)[:200]}
 
     answer = str(data.get("answer", ""))
@@ -334,7 +398,7 @@ async def extract_field(
         f"🔍 {field}: {'принято' if accepted else 'отклонено'} "
         f"({verdict['reason'] or verdict['citation']}) -> {answer[:60]}"
     )
-    return {
+    result = {
         "field": field,
         "value": answer if accepted else None,
         "accepted": accepted,
@@ -344,6 +408,9 @@ async def extract_field(
         "confidence": data.get("confidence"),
         "reason": verdict["reason"],
     }
+    if content_cache.is_cacheable(result):
+        content_cache.put(cache_key, "field_extraction", result)
+    return result
 
 
 def gaps_from_results(results: List[Dict[str, Any]]) -> List[str]:
