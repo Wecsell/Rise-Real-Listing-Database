@@ -221,10 +221,50 @@ Field targets:
   are used only when there is nothing else. Keywords are matched against the **folder path**, not the
   file name: developers name files `1.jpg`, `4.jpg`, `Бомба.jpg`, and only the folder carries meaning.
 
+**`Active` protects filled values, not the whole record** (owner, 08.08.2026). While the box is
+ticked, an existing value is never overwritten and the service fields (`Status`, `Gaps`,
+`Last updated`, `Source`) are not written at all — but empty fields are still filled in and missing
+units are still created. Blocking creation protected nothing: Axis One and Y-WAY had no units at all,
+so there was nothing to overwrite, yet every run skipped them and both sat empty until the boxes were
+cleared by hand. Only a human may set or clear the box (`HUMAN_ONLY_FIELDS`) — a lock the bot can open
+guarantees nothing.
+
+**The availability chart wins, and the latest handover date wins** (owner, 08.08.2026). When sources
+disagree on a figure, the developer's availability chart beats the brochure, the SUMMARY sheet and the
+financial model — model tabs named `2BR_430k / 450k / 500k` are yield SCENARIOS, not a price list, and
+reading the lowest as "the price" understated Flower Estates by $70 000. Handover dates are the one
+exception to "chart wins": construction slips, never accelerates, so take the **latest** date any source
+gives — Flower Estates read Q1 2027 in the SUMMARY, Q2 2027 in the chart and Q3 2027 in the Nuanu
+catalog, and Q3 2027 is what goes in the record.
+
 ### Step 4 — Sort into the tables, then close the gaps
 Records are written in dependency order — **Developer → Projects → Units / Units (Secondary)** — so links
-resolve (`airtable_client`). Off-plan inventory goes to `Units`, resale to `Units (Secondary)`; a
-secondary record must never overwrite a primary one.
+resolve (`airtable_client`). The split between the two unit tables is **who sells**, not what stage the
+building is at (owner, 08.08.2026): `Units` is the primary market — stock sold by the developer, a unit
+that has never had an owner. `Units (Secondary)` is the resale market — the same typology, the same
+unit, but one that somebody already bought and is now reselling. "Off-plan" is not the test: a finished
+project's unsold stock is still primary, and a resold unit in an unfinished project is still secondary.
+A secondary record must never overwrite a primary one.
+
+Both tables hold TYPOLOGY, not physical lots (see "Units holds TYPOLOGY" above) — the market is what
+differs between them, not the granularity.
+
+**A sold-out typology stays in `Units`** with `Availability = Sold`; it is not moved anywhere (owner,
+08.08.2026). It is still primary-market data — it records what the project is made of, and the
+developer's price is the baseline a later resale ask is judged against. Moving it to
+`Units (Secondary)` would assert a resale that nobody is offering. The interface hides `Sold`
+typologies by **status**, not by removing the record. When an owner does resell, a record is
+**added** to `Units (Secondary)` with the new asking price, and the primary record stays as history.
+
+Known limitation, accepted for now (owner, 08.08.2026): a secondary record is still a typology, not a
+concrete offer — one physical lot with its own price, floor and terms. Representing real offers needs
+a separate mechanism (likely per-offer records, possibly marked by hand). Not a priority yet, but do
+not design around the assumption that a secondary row equals one lot.
+
+Prices are "from" values, so one typology absorbs a spread across lots. Keep it one record and write
+down why: Y-WAY's Deluxe appears as 57.69 m² and 69.51 m², but the difference is terrace size — the
+internal area is identical, so it is a single typology whose `Area from` and `Price from` are the
+minimums (owner, 08.08.2026).
 
 Then `gaps.compute_project_gaps()` recomputes what is still empty **from the record**, not from the
 model's own account of what it missed, writes the list to `Gaps` and sets `Status = Needs data`. Every

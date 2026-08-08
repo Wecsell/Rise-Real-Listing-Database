@@ -378,6 +378,34 @@ def is_project_active(proj_id: str) -> bool:
     record = next((p for p in CACHE_PROJECTS if p['id'] == proj_id), None)
     return bool(record and record.get('fields', {}).get('Active'))
 
+
+def _is_empty(value) -> bool:
+    """Пусто ли поле Airtable: None, пустая строка/список/словарь."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict, tuple)):
+        return len(value) == 0
+    return False
+
+
+def keep_only_new_values(fields: dict, existing_fields: dict) -> dict:
+    """Оставляет из payload только то, что ЗАПОЛНЯЕТ пустое, не трогая заполненное.
+
+    Правило защиты Active (владелец, 08.08.2026): галочка запрещает МЕНЯТЬ уже
+    заполненные значения, но не запрещает дописывать недостающее. Прежний
+    вариант блокировал запись целиком, и это стоило дорого: у Axis One и Y-WAY
+    юнитов не существовало вовсе, защищать было нечего, а создание всё равно
+    отклонялось — проекты простояли пустыми, пока владелец не снял галочки
+    вручную (08.08.2026). Запрет на создание отсутствующего ничего не
+    защищает, он только копит работу.
+    """
+    return {
+        k: v for k, v in fields.items()
+        if _is_empty(existing_fields.get(k))
+    }
+
 # Значение Source, когда источник неизвестен. Исторически этой строкой
 # подписывались ВСЕ записи независимо от группы, поэтому она осталась только
 # как честная заглушка "источник не записан", а не как описание источника.
@@ -920,6 +948,30 @@ def fuzzy_match_project(name: str, existing_records: list, area: str = None, dev
             # вторая приносила настоящего застройщика, иерархия видела
             # несовпадение и создавала вторую запись того же проекта.
             if not _linked_to_placeholder_developer(r_devs):
+                # Ослаблять эту проверку нельзя: она же защищает от слияния
+                # ДЕЙСТВИТЕЛЬНО разных проектов с похожим именем у разных
+                # застройщиков (см. 'Serenity' у ADVA против 'Serenity
+                # Villas' у PT Global BALI HOME, 08.08.2026 — оба реальны).
+                # Но у неё есть обратная сторона: если у существующей записи
+                # застройщик ИСПРАВЛЕН (не заглушка, а ошибочное настоящее
+                # имя вроде 'Badung' вместо 'OCTO Bali Group', Villa UNU,
+                # 08.08.2026), апсерт молча создаёт дубль вместо обновления.
+                # Раньше это обнаруживалось только постфактум, по строке
+                # 'Creating project' в логе для заведомо существующего имени.
+                # Громкое предупреждение — не решение, а страховка: если имя
+                # почти дословно совпадает, есть шанс, что это тот самый
+                # случай, и его стоит увидеть раньше, чем плодится дубль.
+                existing_clean = re.sub(r'[^\w\s]', '', str(p_name)).lower().strip()
+                name_ratio = difflib.SequenceMatcher(None, existing_clean, name_clean).ratio()
+                if name_ratio >= 0.95:
+                    logger.warning(
+                        "Проект %r почти дословно совпадает с существующим %r (%.2f), "
+                        "но у записи другой застройщик (%s, не заглушка) — апсерт создаст "
+                        "ДУБЛЬ, а не обновление. Если застройщик недавно исправлен, перецепи "
+                        "Projects.Developer напрямую по id ПЕРЕД записью payload (см. память "
+                        "changing-developer-creates-duplicate-project).",
+                        name, p_name, name_ratio, r_devs,
+                    )
                 continue
 
         # Разные фазы — разные проекты. Запрет срабатывает, только если фаза
@@ -1060,15 +1112,32 @@ def fuzzy_match_developer(name: str, existing_records: list):
         dev_words = set(dev_clean.split())
         
         # Убрано слабое сравнение через 'in'
-        
+
         # Все значимые слова застройщика содержатся в искомом имени. Это
         # отношение вложенности, а не размытое сходство, поэтому оценка выше
         # порога 0.90. Раньше здесь стояло 0.85 — ветка отрабатывала и не
         # проходила гейт, то есть не могла сработать никогда. Ровно этот
         # случай она и обслуживает: название чата 'Rise Development Official
         # Bali' против записи 'Rise Development' в базе.
+        # Проверяем вложенность ПОЛНОГО имени записи, а не только значащих
+        # слов. Вычитание шума нужно лишь для того, чтобы запись не матчилась
+        # одним шумом ('Bali Real Estate' против любого чата со словом Bali),
+        # но САМИ слова записи отбрасывать нельзя: шум бывает в названии
+        # чата, а не в имени компании из нашей базы.
+        #
+        # Регресс 08.08.2026: 'villas' у записи 'Alpha Villas' отбрасывалось
+        # как шумовое, оставалось {'alpha'} — и запись «входила» в чужое
+        # 'ALPHA DEVELOPMENT GROUP' со score 0.95. upsert_developer
+        # ПЕРЕПИСАЛ ей имя: две разные компании (alphavillasbali.com в
+        # Улувату против alphadevelopment.notion.site в Чангу) слились в одну.
+        # При проверке полного имени случай отсекается сам: слова 'villas' в
+        # запросе нет вовсе.
+        #
+        # Законные случаи проходят, потому что название чата содержит имя
+        # компании целиком плюс хвосты: 'Tamora Group Bali Official' ⊇
+        # {tamora, group}, 'OXO Living Bali' ⊇ {oxo}.
         meaningful_dev_words = dev_words - ignore_words
-        if meaningful_dev_words and meaningful_dev_words.issubset(name_words):
+        if meaningful_dev_words and dev_words.issubset(name_words):
             score = 0.95
             if score > best_score:
                 best_score = score
@@ -1268,10 +1337,10 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list,
     # проект, ни его юниты не перезаписываются следующим прогоном. Раньше
     # HUMAN_ONLY_FIELDS запрещал коду только САМ писать эту галочку — запись
     # проекта проверку не читала вообще, и Active была витриной без функции.
-    if match and match.get('fields', {}).get('Active'):
-        logger.info("Проект %r отмечен Active — обновление и юниты пропущены (ID: %s)",
-                    proj_name, match['id'])
-        return match['id']
+    # Active больше не отменяет запись целиком: он защищает ЗАПОЛНЕННЫЕ значения,
+    # но пустые поля дозаполняются, а юниты создаются как обычно (владелец,
+    # 08.08.2026). Флаг ставится ниже и читается в upsert_unit через кэш.
+    active_guard = bool(match and match.get('fields', {}).get('Active'))
 
     # Map field names from JSON schema to Airtable schema
     if 'Link to Dev Kit (Rus)' in fields:
@@ -1344,6 +1413,19 @@ async def upsert_project(proj_data: dict, dev_id: str, gaps: list,
             old_price is not None and new_price is not None
             and safe_float(old_price) != safe_float(new_price)
         )
+
+        if active_guard:
+            # Служебные поля тоже не должны перетирать человеческую карточку:
+            # Status/Gaps/Last updated считаются из payload и затёрли бы вердикт.
+            protected = keep_only_new_values(fields, match.get('fields', {}))
+            for service_field in ('Status', 'Gaps', 'Last updated', 'Source'):
+                protected.pop(service_field, None)
+            skipped = sorted(set(fields) - set(protected))
+            logger.info("Проект %r отмечен Active — дозаполняю только пустые поля %s; "
+                        "не трогаю заполненные %s", proj_name, sorted(protected), skipped)
+            fields = protected
+            if not fields:
+                return match['id']
 
         logger.info(f"Updating project '{proj_name}' matched to '{match['fields'].get('Project Name')}' (ID: {rec_id}, Score: {score:.2f})")
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
@@ -1510,10 +1592,7 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
     # upsert_unit (ручной ввод или, в будущем, автоматический разбор). Ищем
     # проект по id, а не по имени — оно уже разрешено вызывающим кодом.
     project_record = next((p for p in CACHE_PROJECTS if p['id'] == proj_id), None)
-    if project_record and project_record.get('fields', {}).get('Active'):
-        logger.info("Проект %r отмечен Active — юнит %r пропущен",
-                    proj_name, unit_data.get('Unit type'))
-        return SKIPPED_ACTIVE
+    unit_active_guard = bool(project_record and project_record.get('fields', {}).get('Active'))
 
     # Первичка и вторичка - РАЗНЫЕ таблицы Airtable с независимой нумерацией
     # записей. Матчинг по Key обязан идти против кэша своей же таблицы -
@@ -1661,6 +1740,21 @@ async def upsert_unit(unit_data: dict, proj_id: str, proj_name: str, gaps: list,
 
     if existing:
         rec_id = existing[0]['id']
+        # Active защищает только то, что уже заполнено. Создание нового юнита
+        # (ветка else ниже) под защиту не попадает вовсе: отсутствующая запись
+        # ничего не хранит, и запрещать её создание нечего.
+        if unit_active_guard:
+            protected = keep_only_new_values(fields, existing[0].get('fields', {}))
+            for service_field in ('Status', 'Gaps', 'Last updated', 'Source', 'Key'):
+                protected.pop(service_field, None)
+            skipped = sorted(set(fields) - set(protected))
+            logger.info("Проект %r отмечен Active — у юнита %r дозаполняю только пустые "
+                        "поля %s; не трогаю заполненные %s",
+                        proj_name, key, sorted(protected), skipped)
+            fields = protected
+            if not fields:
+                return SKIPPED_ACTIVE
+
         logger.info(f"Updating unit '{key}' (ID: {rec_id})")
         record = await robust_airtable_op_async(table.update, rec_id, fields=fields)
         if not record or not record.get('id'):

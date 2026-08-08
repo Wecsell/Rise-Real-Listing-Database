@@ -42,12 +42,40 @@ DEFAULT_TRUSTED_HOST_PATTERNS = frozenset({
     "*.yandex.ru",
 })
 NOTION_HOST_PATTERNS = frozenset({"notion.so", "*.notion.so", "notion.site", "*.notion.site"})
+
+# Хосты Google Maps. Держатся ОТДЕЛЬНО от общего списка провайдеров и
+# передаются явно только тем вызовом, который раскрывает короткую ссылку на
+# карту (app.maps_link): расширять доверие всему коду ради одной задачи не
+# нужно. Короткие ссылки живут на goo.gl, полные — на google.com/maps, причём
+# домен может быть локальным (google.co.id), поэтому нужен шаблон.
+MAPS_HOST_PATTERNS = frozenset({
+    "maps.app.goo.gl",
+    "goo.gl",
+    "maps.google.com",
+    "google.com",
+    "www.google.com",
+    "*.google.com",
+})
 GOOGLE_HOST_PATTERNS = frozenset({
     "drive.google.com",
     "docs.google.com",
     "accounts.google.com",
     "*.googleusercontent.com",
 })
+
+# Явный признак «хост может быть любым публичным» для вызовов, которые по
+# смыслу не ограничены списком провайдеров. Решение владельца (08.08.2026):
+# рендеры бот вправе качать откуда угодно — они лежат на CDN самого
+# застройщика, и allow-list молча выбрасывал целые галереи (BREIG/unitbox.ai,
+# 10 из 10 картинок Garden Villa I).
+#
+# Снимается ТОЛЬКО проверка имени хоста. Всё остальное продолжает работать и
+# на этом пути: HTTPS без логина-пароля и нестандартного порта, отказ на
+# приватные и не-глобальные IP в ответе DNS (это и есть защита от SSRF),
+# повторная проверка КАЖДОГО редиректа, а на месте скачивания — разрешённый
+# content-type изображения и потолок размера. Поэтому «откуда угодно»
+# не означает «что угодно»: во внутреннюю сеть такой запрос всё равно не уйдёт.
+ANY_PUBLIC_HOST = frozenset({"<any-public-host>"})
 
 MAX_URL_LENGTH = 4096
 DEFAULT_MAX_REDIRECTS = 5
@@ -158,6 +186,11 @@ def validate_url_origin(url: str, allowed_hosts: Optional[Iterable[str]] = None)
         hostname = _normalise_host(hostname)
     except ValueError as exc:
         raise UnsafeUrlError("URL hostname is invalid") from exc
+
+    # Сверяем по тождеству, а не по содержимому: обычный список хостов,
+    # случайно совпавший по значению, не должен отключать проверку.
+    if allowed_hosts is ANY_PUBLIC_HOST:
+        return parsed
 
     patterns = set(allowed_hosts) if allowed_hosts is not None else configured_trusted_hosts()
     if not host_matches_allowed_pattern(hostname, patterns):

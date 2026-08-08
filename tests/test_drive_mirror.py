@@ -698,3 +698,46 @@ class TestDriveDepthLimitIsConfigurable(unittest.TestCase):
             self.assertEqual(_bounded_depth_env("GDRIVE_MAX_DEPTH", 8, _MAX_DEPTH_CEILING), 8)
         with patch.dict(os.environ, {"GDRIVE_MAX_DEPTH": "0"}):
             self.assertEqual(_bounded_depth_env("GDRIVE_MAX_DEPTH", 8, _MAX_DEPTH_CEILING), 8)
+
+
+class TestRendersMayComeFromAnyPublicHost(unittest.TestCase):
+    """
+    Решение владельца (08.08.2026): рендеры бот вправе качать откуда угодно —
+    они лежат на CDN застройщика, а allow-list молча выбрасывал целые галереи
+    (unitbox.ai у BREIG, 10 из 10 картинок Garden Villa I).
+
+    Послабление касается ТОЛЬКО имени хоста и только этого пути. Всё
+    остальное обязано продолжать отсекать ссылку, иначе «откуда угодно»
+    превращается в «что угодно», включая внутреннюю сеть.
+    """
+
+    def test_arbitrary_https_host_is_accepted(self):
+        from app.url_safety import validate_url_origin, ANY_PUBLIC_HOST
+        parsed = validate_url_origin(
+            "https://unitbox.ai/uploads/1/render.jpg", allowed_hosts=ANY_PUBLIC_HOST
+        )
+        self.assertEqual(parsed.hostname, "unitbox.ai")
+
+    def test_same_host_still_rejected_without_the_sentinel(self):
+        from app.url_safety import validate_url_origin, UnsafeUrlError
+        with self.assertRaises(UnsafeUrlError):
+            validate_url_origin("https://unitbox.ai/uploads/1/render.jpg")
+
+    def test_transport_checks_survive_the_sentinel(self):
+        from app.url_safety import validate_url_origin, ANY_PUBLIC_HOST, UnsafeUrlError
+        for url in (
+            "http://unitbox.ai/render.jpg",           # не HTTPS
+            "https://user:pass@unitbox.ai/r.jpg",     # логин-пароль в URL
+            "https://unitbox.ai:8443/render.jpg",     # нестандартный порт
+        ):
+            with self.subTest(url=url), self.assertRaises(UnsafeUrlError):
+                validate_url_origin(url, allowed_hosts=ANY_PUBLIC_HOST)
+
+    def test_sentinel_is_matched_by_identity_not_value(self):
+        """Обычный список хостов, совпавший по значению, не отключает проверку."""
+        from app.url_safety import validate_url_origin, ANY_PUBLIC_HOST, UnsafeUrlError
+        lookalike = frozenset(set(ANY_PUBLIC_HOST))
+        self.assertEqual(lookalike, ANY_PUBLIC_HOST)
+        self.assertIsNot(lookalike, ANY_PUBLIC_HOST)
+        with self.assertRaises(UnsafeUrlError):
+            validate_url_origin("https://unitbox.ai/render.jpg", allowed_hosts=lookalike)

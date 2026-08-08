@@ -112,7 +112,16 @@ def is_placeholder_name(name: Optional[str]) -> bool:
         junk |= _DISTRICT_WORDS
 
     meaningful = [w for w in words if w not in junk and not w.isdigit()]
-    return not meaningful
+    if meaningful:
+        return False
+
+    # Цифры отбрасываются как несодержательные, и для описания это верно:
+    # в "вилла 3" и "unit 12" число — порядковый номер при родовом слове.
+    # Но если имя НАЧИНАЕТСЯ с числа, это бренд: «618», «618 Development»
+    # (застройщик в Nuanu). Из-за общей проверки он становился заглушкой
+    # 'Unknown N', и его проекты разъезжались по разным пустым карточкам —
+    # поймано 08.08.2026 на Flower Estates и Luna Residences.
+    return not re.match(r'^\d{2,6}\b', text)
 
 
 def is_generated_placeholder(name: Optional[str]) -> bool:

@@ -146,6 +146,38 @@ class TestChatTitleMatching:
         match, _ = fuzzy_match_developer('Nuanu Development Group', existing)
         assert match is None
 
+    def test_single_common_word_does_not_rename_a_different_company(self):
+        """
+        Регресс 08.08.2026: 'Alpha Villas' сматчился на входящее 'ALPHA
+        DEVELOPMENT GROUP' (0.95), и upsert_developer ПЕРЕПИСАЛ имя
+        существующей записи — это разные компании (alphavillasbali.com в
+        Улувату против alphadevelopment.notion.site в Чангу), общее только
+        слово 'alpha'.
+
+        Причина была в том, что шум вычитался ИЗ ЗАПИСИ: 'villas' у
+        'Alpha Villas' отбрасывалось, оставалось {'alpha'}, и запись
+        «входила» в любое имя с тем же словом. Теперь проверяется вложенность
+        полного имени записи — слова 'villas' в запросе нет, матча нет.
+        """
+        existing = [developer('Alpha Villas')]
+        match, score = fuzzy_match_developer('ALPHA DEVELOPMENT GROUP', existing)
+        assert match is None
+        assert score == 0.0
+
+    def test_short_company_name_still_matches_inside_noisy_title(self):
+        """
+        Обратная сторона того же фикса: настоящие короткие имена (OXO, BREIG,
+        PCE, HQC, IJI) — это всё имя целиком, а не остаток после вычитания
+        шума. Они обязаны находиться в длинном названии чата.
+        """
+        for name, title in (('OXO', 'OXO Living Bali'),
+                            ('BREIG', 'BREIG Development Group'),
+                            ('Tamora Group', 'Tamora Group Bali Official')):
+            existing = [developer(name)]
+            match, score = fuzzy_match_developer(title, existing)
+            assert match is existing[0], f'{name} не найден в {title!r}'
+            assert score >= MATCH_THRESHOLD
+
 
 class TestPhasesNeverMerge:
     """

@@ -30,7 +30,7 @@ from googleapiclient.http import MediaFileUpload
 from app.drive_auth import get_drive_service
 from app.url_safety import (
     UnsafeUrlError,
-    configured_trusted_hosts,
+    ANY_PUBLIC_HOST,
     redact_url,
     stream_response_to_tempfile,
     stream_safe_url,
@@ -205,10 +205,20 @@ async def mirror_external_image(
     по имени в целевой папке перед загрузкой.
     """
     try:
-        validate_url_origin(url, allowed_hosts=configured_trusted_hosts())
+        validate_url_origin(url, allowed_hosts=ANY_PUBLIC_HOST)
     except UnsafeUrlError as exc:
         logger.warning("Rejected unsafe external image URL %s: %s", redact_url(url), exc)
-        return {"status": "skipped", "name": name or "image", "reason": "unsafe URL"}
+        return {
+            "status": "skipped",
+            "name": name or "image",
+            "reason": str(exc),
+            # Отличаем «ссылку отвергли» от безобидных пропусков (видео,
+            # паспорт): это НЕ норма, а несобранные рендеры, и об этом обязан
+            # узнать Gaps. Хост тут уже не ограничен (ANY_PUBLIC_HOST), так что
+            # отказ означает реальную небезопасность: не HTTPS, логин-пароль в
+            # URL, нестандартный порт или приватный IP в ответе DNS.
+            "unsafe_url": True,
+        }
 
     url_path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
     filename = name or os.path.basename(url_path.rstrip("/")) or "image"
@@ -229,7 +239,7 @@ async def mirror_external_image(
             url,
             timeout=30.0,
             headers=_DOWNLOAD_HEADERS,
-            allowed_hosts=configured_trusted_hosts(),
+            allowed_hosts=ANY_PUBLIC_HOST,
         ) as response:
             if response.status_code != 200:
                 return {
@@ -437,15 +447,27 @@ async def mirror_project_external_images(
     image_urls: List[str],
     unit_type: Optional[str] = None,
     root_id: Optional[str] = None,
+    developer: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Точка входа Э6 для изображений не с Drive (найдены как ссылки, например
     внутри содержимого Notion). Та же целевая папка, что и у Drive-файлов
     того же проекта - зеркало не различает происхождение на выходе.
+
+    developer обязателен по тому же канону, что и в mirror_project_drive_files:
+    зеркало повторяет структуру базы Developer -> Project -> Unit. Без него
+    внешние картинки ложились в корень зеркала вперемешку от всех застройщиков,
+    хотя Drive-файлы того же проекта уходили в /{Developer}/{Project}/ - один
+    проект оказывался разорван на две папки (поймано 08.08.2026 на Garden
+    Villa I, галерея BREIG).
     """
     resolved_root_id = require_mirror_root_id(root_id)
     service = get_drive_service()
-    path_parts = [project_name] + ([unit_type] if unit_type else [])
+    path_parts = (
+        ([developer] if developer else [])
+        + [project_name]
+        + ([unit_type] if unit_type else [])
+    )
     dest_folder_id = await asyncio.to_thread(
         get_or_create_folder_path, service, path_parts, resolved_root_id
     )
@@ -466,6 +488,16 @@ async def mirror_project_external_images(
         f"Drive mirror failed for {r['name']}: {r['reason']}"
         for r in results if r["status"] == "error"
     ]
+    # Отвергнутая ссылка раньше терялась: она приходит как "skipped", а в gaps
+    # попадали только "error". Целая галерея могла быть отвергнута, а прогон
+    # рапортовал успех с пустым зеркалом (Garden Villa I, 10 из 10, 08.08.2026).
+    unsafe = [r for r in results if r.get("unsafe_url")]
+    if unsafe:
+        reasons = sorted({r["reason"] for r in unsafe})
+        gaps.append(
+            f"External images not mirrored: {len(unsafe)} of {len(unique_urls)} "
+            f"rejected as unsafe ({'; '.join(reasons)})"
+        )
     if len(unique_urls) > MAX_EXTERNAL_IMAGES_PER_PROJECT:
         gaps.append(
             f"External image limit reached: processed {MAX_EXTERNAL_IMAGES_PER_PROJECT} of {len(unique_urls)}"
